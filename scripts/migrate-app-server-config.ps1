@@ -16,12 +16,12 @@ $parent = [IO.Path]::GetDirectoryName($resolved)
 $stored.schemaVersion = '4.0'
 $stored.modelProvider = 'codex-app-server'
 $stored.codexModel = 'gpt-5.6-sol'
-$stored.codexReasoningEffort = 'max'
+$stored.codexReasoningEffort = 'medium'
 if ($stored.PSObject.Properties.Name -contains 'modelTimeoutMs') { $stored.PSObject.Properties.Remove('modelTimeoutMs') }
 if ($stored.PSObject.Properties.Name -contains 'modelEndpoint') { $stored.PSObject.Properties.Remove('modelEndpoint') }
 if ($stored.PSObject.Properties.Name -contains 'modelName') { $stored.PSObject.Properties.Remove('modelName') }
 if ($stored.PSObject.Properties.Name -contains 'modelApiKeyDpapi') { throw 'External model API key config cannot be migrated. Run configure-bot.ps1.' }
-if ($stored.PSObject.Properties.Name -contains 'agentTurnTimeoutMs') { $stored.agentTurnTimeoutMs = 900000 } else { $stored | Add-Member -NotePropertyName agentTurnTimeoutMs -NotePropertyValue 900000 }
+if ($stored.PSObject.Properties.Name -contains 'agentTurnTimeoutMs') { $stored.agentTurnTimeoutMs = 300000 } else { $stored | Add-Member -NotePropertyName agentTurnTimeoutMs -NotePropertyValue 300000 }
 $statePath = [IO.Path]::GetFullPath((Join-Path $parent 'agent-state.json'))
 if ($stored.PSObject.Properties.Name -contains 'agentStatePath') { $stored.agentStatePath = $statePath } else { $stored | Add-Member -NotePropertyName agentStatePath -NotePropertyValue $statePath }
 $statusLogPath = [IO.Path]::GetFullPath((Join-Path $parent 'status.jsonl'))

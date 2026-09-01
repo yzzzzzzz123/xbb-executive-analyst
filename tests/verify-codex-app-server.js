@@ -136,7 +136,7 @@ class FakeAppServerClient extends EventEmitter {
       agentStatePath: statePath,
       agentTurnTimeoutMs: 30000,
       codexModel: "gpt-5.6-sol",
-      codexReasoningEffort: "max"
+      codexReasoningEffort: "medium"
     };
     fs.rmSync(statePath, { force: true });
     const agent = new PersistentCodexAgent(config, {
@@ -164,8 +164,9 @@ class FakeAppServerClient extends EventEmitter {
     assert.equal(fakeClient.startThreadCalls[0].dynamicTools[0].name, "query_xbb");
     assert.equal(fakeClient.startTurnCalls[0].params.input[0].type, "skill");
     assert.deepEqual(fakeClient.startTurnCalls[0].params.sandboxPolicy, { type: "readOnly", networkAccess: false });
-    fakeClient.complete("thread-1", "turn-1", "你好，我是销帮帮经营分析助手。你可以直接问经营问题。");
-    assert.match(await greetingPromise, /经营分析助手/);
+    assert.deepEqual(fakeClient.startTurnCalls[0].params.outputSchema.required, ["answer", "chart"]);
+    fakeClient.complete("thread-1", "turn-1", JSON.stringify({ answer: "你好，我是销帮帮经营分析助手。你可以直接问经营问题。", chart: null }));
+    assert.match((await greetingPromise).answer, /经营分析助手/);
     assert.equal(queryCalls.length, 0);
 
     const progress = [];
@@ -182,18 +183,27 @@ class FakeAppServerClient extends EventEmitter {
     assert.equal(fakeClient.responses[0].id, 77);
     assert.equal(fakeClient.responses[0].result.success, true);
     assert.match(progress.join("\n"), /正在查询销帮帮实时只读数据/);
-    fakeClient.complete("thread-1", "turn-2", "9月集团业绩排名结论（MTD）。");
-    assert.match(await businessPromise, /MTD/);
+    fakeClient.complete("thread-1", "turn-2", JSON.stringify({
+      answer: "9月集团业绩排名结论（MTD）。",
+      chart: { type: "bar", title: "公司排名 13800138000", categories: ["公司A", "公司B"], series: [{ name: "业绩", values: [123, 80] }], items: [], points: [], valueFormat: "money", unit: "", subtitle: "MTD", note: "", centerLabel: "", xLabel: "", yLabel: "", xFormat: "number", yFormat: "number", xUnit: "", yUnit: "" }
+    }));
+    const businessResult = await businessPromise;
+    assert.match(businessResult.answer, /MTD/);
+    assert.equal(businessResult.chart.type, "bar");
+    assert.doesNotMatch(businessResult.chart.title, /13800138000/);
 
-    const first = agent.answer({ question: "继续分析商机", access, principalKey: principal, messageId: "msg-steer-1" });
+    const activities = [];
+    agent.on("activity", (value) => activities.push(value));
+    const first = agent.answer({ question: "继续分析商机", access, principalKey: principal, messageId: "msg-busy-1" });
     await nextImmediate();
-    const second = agent.answer({ question: "同时看跟进质量", access, principalKey: principal, messageId: "msg-steer-2" });
+    const second = agent.answer({ question: "同时看跟进质量", access, principalKey: principal, messageId: "msg-busy-2" });
+    const secondRejection = assert.rejects(second, /仍在处理中/);
     await nextImmediate();
-    assert.equal(fakeClient.steerTurnCalls.length, 1);
-    assert.equal(fakeClient.steerTurnCalls[0].expectedTurnId, "turn-3");
-    fakeClient.complete("thread-1", "turn-3", "商机与跟进质量合并结论。");
-    assert.equal(await first, "商机与跟进质量合并结论。");
-    assert.equal(await second, "商机与跟进质量合并结论。");
+    await secondRejection;
+    assert.equal(fakeClient.steerTurnCalls.length, 0);
+    assert.equal(activities.some((value) => value.status === "agent_busy"), true);
+    fakeClient.complete("thread-1", "turn-3", JSON.stringify({ answer: "商机分析结论。", chart: null }));
+    assert.equal((await first).answer, "商机分析结论。");
 
     await agent.close();
     assert.equal(fakeClient.connected, false);

@@ -4,7 +4,7 @@ interface:
   icon_small: "../assets/xbb-skill-icon.svg"
   icon_large: "../assets/xbb-skill-icon.svg"
   brand_color: "#F15A24"
-  default_prompt: "Use $xbb-executive-analyst to answer this executive operating question from configured live, read-only销帮帮 data. Return only the minimum decision-useful conclusions, generate at most one supporting SVG chart when it materially helps, and never use sample data, fixed analysis, HTML, dashboards, or CRM writes."
+  default_prompt: "Use $xbb-executive-analyst to answer this executive question from live read-only销帮帮 data in simple boss-friendly Chinese, and include one truthful supporting chart whenever the data can be compared without misleading."
 
 policy:
   allow_implicit_invocation: true

@@ -21,15 +21,16 @@ class MessageStore {
       if (existing.userId !== userId) throw new Error("企业微信消息标识发生用户冲突。");
       return { state: existing, isNew: false };
     }
-    const state = { messageId, userId, streamId, content, finish: false, updatedAt: this.now() };
+    const state = { messageId, userId, streamId, content, msgItem: [], finish: false, updatedAt: this.now() };
     this.messages.set(messageId, state);
     return { state, isNew: true };
   }
 
-  complete(messageId, content) {
+  complete(messageId, content, msgItem = []) {
     const state = this.messages.get(messageId);
     if (!state) return;
     state.content = content;
+    state.msgItem = Array.isArray(msgItem) ? msgItem : [];
     state.finish = true;
     state.updatedAt = this.now();
   }

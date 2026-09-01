@@ -10,7 +10,7 @@ description: Answer Chinese executive operating questions from configured live, 
 本 Skill 有两个正式运行环境：
 
 - Codex 对话模式：当前调用本 Skill 的 Codex 就是分析模型，不得再调用其他模型、Codex API 或启动第二个 Codex。
-- 企业微信 Agent 模式：国内版企业微信客户端中由普通员工创建的智能机器人通过官方 WebSocket 长连接接入；桥接进程拥有一个仅监听 `127.0.0.1` 的本机 Codex App Server，并按已授权 USERID 的不可逆摘要维护持久 Thread。每轮都显式加载本 Skill，固定使用 `gpt-5.6-sol` 与 `max` 推理强度，复用机器人所在 Windows 用户的 Codex ChatGPT 登录，不需要独立模型 API Key。Codex 是顶层分析 Agent，不是桥接层内部的临时子模型；经营事实只能通过受控动态工具 `query_xbb` 获取，真正的 bundled runner 调用、授权复核与明文临时文件清理由桥接层执行。
+- 企业微信 Agent 模式：国内版企业微信客户端中由普通员工创建的智能机器人通过官方 WebSocket 长连接接入；桥接进程拥有一个仅监听 `127.0.0.1` 的本机 Codex App Server，并按已授权 USERID 的不可逆摘要维护持久 Thread。每轮都显式加载本 Skill，固定使用旗舰模型 `gpt-5.6-sol` 与兼顾质量和客服响应速度的 `medium` 推理强度，复用机器人所在 Windows 用户的 Codex ChatGPT 登录，不需要独立模型 API Key。Codex 是顶层分析 Agent，不是桥接层内部的临时子模型；经营事实只能通过受控动态工具 `query_xbb` 获取，真正的 bundled runner 调用、授权复核与明文临时文件清理由桥接层执行。
 
 两种模式共享同一个唯一事实入口，不得自行访问销帮帮接口、凭证或历史输出。
 
@@ -31,8 +31,8 @@ description: Answer Chinese executive operating questions from configured live, 
    两种模式都不得直接读取凭证或调用销帮帮端点。
 4. 若事实包状态为 `needs_disambiguation`，只返回用户选择所需的最少真实候选项，不得自行选择、合并相似实体。
 5. 若事实包为 `ready`，所有事实数值只能来自该事实包。明确区分来源事实、透明规则信号和模型判断。
-6. 仅当图表实质性提升理解时，创建单次运行 JSON 图表规范并调用 `scripts/render-chart.ps1`。除非用户明确要求多个图表，否则最多一个。
-7. Codex 对话模式在最终答复前删除明文事实包与图表规范；最终 SVG 可在本机图表临时目录保留最多 24 小时，供当前答复展示。企业微信 Agent 模式的工具网关必须在成功或失败后自行删除明文事实包，只向企业微信返回最小化文字结论。
+6. 回答必须让老板在手机上一眼看懂：结论先行、短句、少术语，只保留必要数字、依据和关键限制。只要真实事实中有两个以上可比较的数据点且图形不会误导，默认生成一张图；跨日或跨月趋势优先折线图，公司排名优先条形图，收入结构优先堆叠条形图。单一数字或无法形成真实比较时不凑图。
+7. Codex 对话模式创建单次运行图表规范并调用 `scripts/render-chart.ps1`，最终答复前删除明文事实包与图表规范；最终 SVG 可在本机图表临时目录保留最多 24 小时。企业微信 Agent 模式只在结构化最终结果中返回最小文字结论和可选图表规范，由桥接层在内存中生成 PNG 并随最终流式回复发送；模型不得用 shell 生成图片。工具网关仍须在成功或失败后删除明文事实包。
 
 ## 数据域路由
 

@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@wecom/aibot-node-sdk": "1.0.7",
+    "sharp": "0.35.4",
     "ws": "8.21.3"
   }
 }

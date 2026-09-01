@@ -4,12 +4,13 @@ const path = require("node:path");
 const { AppServerClient } = require("../shared/codex/app-server-client.js");
 const { LocalAppServerHost } = require("../shared/codex/app-server-host.js");
 const { buildThreadInstructions } = require("../shared/codex/thread-instructions.js");
+const { WECOM_RESPONSE_SCHEMA, parseAgentResponse } = require("../shared/codex/response-contract.js");
 const { readCodexVersion, verifyCodexChatGptLogin } = require("../shared/codex/runtime.js");
 const { QUERY_XBB_DYNAMIC_TOOL } = require("../shared/xbb/query-tool.js");
 
 async function runSmoke() {
   const projectRoot = path.resolve(__dirname, "..");
-  const config = { projectRoot, codexModel: "gpt-5.6-sol", codexReasoningEffort: "max" };
+  const config = { projectRoot, codexModel: "gpt-5.6-sol", codexReasoningEffort: "medium" };
   verifyCodexChatGptLogin(config);
   const codexVersion = readCodexVersion(config);
   let host;
@@ -46,7 +47,9 @@ async function runSmoke() {
           ? [...turn.items].reverse().find((item) => item?.type === "agentMessage" && typeof item.text === "string" && item.text.trim())
           : null;
         if (turn?.status !== "completed" || !final) reject(new Error("Codex App Server smoke turn did not produce a final answer."));
-        else resolve(final.text.trim());
+        else {
+          try { resolve(parseAgentResponse(final.text.trim())); } catch (error) { reject(error); }
+        }
       });
     });
     await client.startTurn({
@@ -61,9 +64,11 @@ async function runSmoke() {
       sandboxPolicy: { type: "readOnly", networkAccess: false },
       model: config.codexModel,
       effort: config.codexReasoningEffort,
-      summary: "none"
+      summary: "none",
+      outputSchema: WECOM_RESPONSE_SCHEMA
     });
-    await completion;
+    const response = await completion;
+    if (response.chart !== null) throw new Error("Codex App Server smoke greeting unexpectedly generated a chart.");
     if (unexpectedToolCall) throw new Error("Codex App Server smoke greeting unexpectedly called query_xbb.");
     process.stdout.write(`${JSON.stringify({ success: true, codexVersion, model: config.codexModel, effort: config.codexReasoningEffort, skill: "xbb-executive-analyst", toolCalls: 0 })}\n`);
   } finally {

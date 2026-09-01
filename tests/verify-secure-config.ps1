@@ -34,8 +34,8 @@ try {
     if ([string]$full.wecomBotSecret -ne 'dummy-bot-secret-for-test') { throw 'Bot secret DPAPI round trip failed.' }
     if ([string]$full.modelProvider -ne 'codex-app-server') { throw 'Codex App Server provider round trip failed.' }
     if ([string]$full.codexModel -ne 'gpt-5.6-sol') { throw 'Local Codex model round trip failed.' }
-    if ([string]$full.codexReasoningEffort -ne 'max') { throw 'Local Codex reasoning effort round trip failed.' }
-    if ([int]$full.agentTurnTimeoutMs -ne 900000) { throw 'Codex Agent timeout round trip failed.' }
+    if ([string]$full.codexReasoningEffort -ne 'medium') { throw 'Local Codex reasoning effort round trip failed.' }
+    if ([int]$full.agentTurnTimeoutMs -ne 300000) { throw 'Codex Agent timeout round trip failed.' }
     if ([string]$full.agentStatePath -ne [IO.Path]::GetFullPath((Join-Path $testRoot 'agent-state.json'))) { throw 'Codex Agent state path round trip failed.' }
     if ([string]$full.statusLogPath -ne [IO.Path]::GetFullPath((Join-Path $testRoot 'status.jsonl'))) { throw 'Status log path round trip failed.' }
 
@@ -76,7 +76,7 @@ try {
     if ([string]$policy.users.'first-user'.scope -ne 'all' -or [string]$policy.users.'second-user'.scope -ne 'all') { throw 'Atomic access policy replacement did not preserve and add users.' }
     if (@(Get-ChildItem -LiteralPath $testRoot -File | Where-Object { $_.Name -like 'access-policy.json.tmp-*' -or $_.Name -like 'access-policy.json.bak-*' }).Count -ne 0) { throw 'Atomic access policy replacement left temporary files.' }
 
-    Write-Output ([ordered]@{ success = $true; checks = 24; schemaVersion = '4.0'; dpapi = 'CurrentUser'; modelProvider = 'codex-app-server'; codexModel = 'gpt-5.6-sol'; reasoning = 'max'; atomicReplace = 'passed'; migration = '3.0-to-4.0-passed' } | ConvertTo-Json -Compress)
+    Write-Output ([ordered]@{ success = $true; checks = 24; schemaVersion = '4.0'; dpapi = 'CurrentUser'; modelProvider = 'codex-app-server'; codexModel = 'gpt-5.6-sol'; reasoning = 'medium'; atomicReplace = 'passed'; migration = '3.0-to-4.0-passed' } | ConvertTo-Json -Compress)
 } finally {
     if ([IO.Directory]::Exists($testRoot)) {
         $verified = [IO.Path]::GetFullPath($testRoot)

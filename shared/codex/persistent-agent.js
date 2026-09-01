@@ -7,8 +7,9 @@ const { AccessDeniedError } = require("../security/access-control.js");
 const { sanitizeAgentText } = require("../security/output-sanitizer.js");
 const { createToolGateway } = require("../xbb/tool-gateway.js");
 const { QUERY_XBB_DYNAMIC_TOOL, queryToolContractHash } = require("../xbb/query-tool.js");
-const { AppServerClient, AppServerRpcError } = require("./app-server-client.js");
+const { AppServerClient } = require("./app-server-client.js");
 const { LocalAppServerHost } = require("./app-server-host.js");
+const { WECOM_RESPONSE_SCHEMA, parseAgentResponse, responseContractHash } = require("./response-contract.js");
 const { loadAgentState, saveAgentState } = require("./state-store.js");
 const { buildThreadInstructions } = require("./thread-instructions.js");
 const { readCodexVersion, verifyCodexChatGptLogin } = require("./runtime.js");
@@ -57,6 +58,13 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+class AgentBusyError extends Error {
+  constructor() {
+    super("上一条经营分析仍在处理中。");
+    this.name = "AgentBusyError";
+  }
+}
+
 class PersistentCodexAgent extends EventEmitter {
   constructor(config, options = {}) {
     super();
@@ -72,10 +80,11 @@ class PersistentCodexAgent extends EventEmitter {
     this.loadState = options.loadState || loadAgentState;
     this.saveState = options.saveState || saveAgentState;
     this.statePath = config.agentStatePath;
-    this.turnTimeoutMs = config.agentTurnTimeoutMs || 15 * 60 * 1000;
+    this.turnTimeoutMs = config.agentTurnTimeoutMs || 5 * 60 * 1000;
     this.contractHash = sha256(JSON.stringify({
       instructions: this.instructions,
       tool: queryToolContractHash(),
+      response: responseContractHash(),
       model: config.codexModel,
       effort: config.codexReasoningEffort,
       sandbox: "read-only",
@@ -179,25 +188,9 @@ class PersistentCodexAgent extends EventEmitter {
       }
     ];
 
-    if (session.active?.turnId) {
-      const active = session.active;
-      active.waiters.push(waiter);
-      session.access = access;
-      try {
-        await this.client.steerTurn({
-          threadId: session.threadId,
-          expectedTurnId: active.turnId,
-          clientUserMessageId: messageId || null,
-          input
-        });
-        await this._notifyWaiter(waiter, "已把新问题追加到当前 Codex 任务。", false);
-        return;
-      } catch (error) {
-        active.waiters = active.waiters.filter((value) => value !== waiter);
-        if (!(error instanceof AppServerRpcError)) throw error;
-        if (session.active !== active) return this._submit(session, { question, access, messageId, waiter });
-        throw new Error("上一条 Codex 任务刚刚结束，请重新发送本条问题。", { cause: error });
-      }
+    if (session.active) {
+      this.emit("activity", { status: "agent_busy" });
+      throw new AgentBusyError();
     }
 
     session.access = access;
@@ -213,12 +206,17 @@ class PersistentCodexAgent extends EventEmitter {
         sandboxPolicy: { type: "readOnly", networkAccess: false },
         model: this.config.codexModel,
         effort: this.config.codexReasoningEffort,
-        summary: "none"
+        summary: "none",
+        outputSchema: WECOM_RESPONSE_SCHEMA
       });
       active.turnId = extractTurnId(result);
+      this.emit("activity", { status: "turn_started" });
       if (session.active === active) active.timeout = setTimeout(() => { void this._timeoutTurn(session, active); }, this.turnTimeoutMs);
     } catch (error) {
-      if (session.active === active) session.active = null;
+      if (session.active === active) {
+        session.active = null;
+        this.emit("activity", { status: "turn_failed", elapsedMs: Date.now() - active.startedAtMs });
+      }
       throw error;
     }
   }
@@ -248,6 +246,8 @@ class PersistentCodexAgent extends EventEmitter {
       finalText: "",
       lastText: "",
       toolCalls: 0,
+      startedAtMs: Date.now(),
+      toolStartedAtMs: null,
       timeout: null
     };
   }
@@ -263,18 +263,23 @@ class PersistentCodexAgent extends EventEmitter {
       this.client.reject(request.id, "未授权或失效的经营分析工具请求。");
       return;
     }
-    session.active.toolCalls += 1;
-    if (session.active.toolCalls > 4) {
+    const active = session.active;
+    active.toolCalls += 1;
+    if (active.toolCalls > 4) {
       this.client.respond(request.id, { success: false, contentItems: [{ type: "inputText", text: JSON.stringify({ status: "error", message: "工具调用轮次超过安全上限。" }) }] });
       return;
     }
+    active.toolStartedAtMs = Date.now();
+    this.emit("activity", { status: "tool_started" });
     await this._notifyProgress(session, "正在查询销帮帮实时只读数据，请稍候……");
     try {
       const result = await this.queryXbb(args, session.access);
       this.client.respond(request.id, { success: true, contentItems: [{ type: "inputText", text: JSON.stringify(result) }] });
+      this.emit("activity", { status: "tool_completed", elapsedMs: Date.now() - active.toolStartedAtMs });
     } catch (error) {
       const message = error instanceof AccessDeniedError ? error.message : (error?.message || "实时销帮帮查询失败。");
       this.client.respond(request.id, { success: false, contentItems: [{ type: "inputText", text: JSON.stringify({ status: "error", message }) }] });
+      this.emit("activity", { status: "tool_failed", elapsedMs: Date.now() - active.toolStartedAtMs });
     }
   }
 
@@ -298,7 +303,7 @@ class PersistentCodexAgent extends EventEmitter {
       return;
     }
     if (method === "item/completed" && params?.item?.type === "agentMessage" && session.active && params.turnId === session.active.turnId) {
-      const text = sanitizeAgentText(params.item.text || session.active.messages.get(params.item.id)?.text || "");
+      const text = String(params.item.text || session.active.messages.get(params.item.id)?.text || "").trim();
       const phase = params.item.phase || session.active.messages.get(params.item.id)?.phase || null;
       if (text) {
         session.active.lastText = text;
@@ -317,11 +322,21 @@ class PersistentCodexAgent extends EventEmitter {
     const items = Array.isArray(turn?.items) ? turn.items : [];
     const agentMessages = items.filter((item) => item?.type === "agentMessage" && typeof item.text === "string");
     const finalItem = [...agentMessages].reverse().find((item) => item.phase === "final_answer") || agentMessages.at(-1);
-    const answer = sanitizeAgentText(active.finalText || finalItem?.text || active.lastText || "");
+    const rawAnswer = active.finalText || finalItem?.text || active.lastText || "";
     session.active = null;
-    if (turn?.status === "completed" && answer) {
-      for (const waiter of active.waiters) waiter.resolve(answer);
+    if (turn?.status === "completed" && rawAnswer) {
+      try {
+        const answer = parseAgentResponse(rawAnswer);
+        this.emit("activity", { status: "turn_completed", elapsedMs: Date.now() - active.startedAtMs });
+        for (const waiter of active.waiters) waiter.resolve(answer);
+        return;
+      } catch (error) {
+        this.emit("activity", { status: "turn_failed", elapsedMs: Date.now() - active.startedAtMs });
+        for (const waiter of active.waiters) waiter.reject(error);
+        return;
+      }
     } else {
+      this.emit("activity", { status: "turn_failed", elapsedMs: Date.now() - active.startedAtMs });
       const error = new Error(turn?.status === "interrupted" ? "Codex 任务已中断。" : "Codex Agent 未生成可用最终答复。");
       for (const waiter of active.waiters) waiter.reject(error);
     }
@@ -331,6 +346,7 @@ class PersistentCodexAgent extends EventEmitter {
     if (session.active !== active) return;
     try { if (active.turnId) await this.client.interruptTurn(session.threadId, active.turnId); } catch {}
     session.active = null;
+    this.emit("activity", { status: "turn_failed", elapsedMs: Date.now() - active.startedAtMs });
     const error = new Error("Codex Agent 本轮处理超时。");
     for (const waiter of active.waiters) waiter.reject(error);
   }
@@ -374,6 +390,7 @@ class PersistentCodexAgent extends EventEmitter {
 }
 
 module.exports = {
+  AgentBusyError,
   PersistentCodexAgent,
   accessLabel,
   extractActiveTurnId,

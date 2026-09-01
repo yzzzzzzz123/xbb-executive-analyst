@@ -2,7 +2,8 @@
 
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
-const { createLongConnectionHandler, extractQuestion } = require("../shared/wecom/long-connection-handler.js");
+const { AgentBusyError } = require("../shared/codex/persistent-agent.js");
+const { createLongConnectionHandler, extractQuestion, operationalFailure } = require("../shared/wecom/long-connection-handler.js");
 const { createBotService } = require("../shared/wecom/server.js");
 const { checkAuthentication } = require("../shared/wecom/check-auth.js");
 const { loadConfig, loadWecomConfig, validateWebSocketEndpoint } = require("../shared/config.js");
@@ -26,8 +27,8 @@ class FakeClient extends EventEmitter {
     this.disconnected = true;
   }
 
-  async replyStream(frame, streamId, content, finish) {
-    const reply = { reqId: frame.headers.req_id, streamId, content, finish };
+  async replyStream(frame, streamId, content, finish, msgItem) {
+    const reply = { reqId: frame.headers.req_id, streamId, content, finish, msgItem };
     this.replies.push(reply);
     return reply;
   }
@@ -52,11 +53,22 @@ function frame(messageId, userId, msgtype, body) {
       assert.match(principalKey, /^[a-f0-9]{64}$/);
       assert.equal(messageId, "msg-1");
       await onProgress("正在查询销帮帮实时只读数据，请稍候……");
-      return "集团9月业绩排名已生成（MTD）。";
+      return {
+        answer: "集团9月业绩排名已生成（MTD）。",
+        chart: { type: "bar", title: "集团业绩排名", categories: ["公司A"], series: [{ name: "业绩", values: [100] }], valueFormat: "money" }
+      };
     }
   };
   let streamCounter = 0;
-  const handler = createLongConnectionHandler({ policy, agent, streamIdFactory: () => `stream-${++streamCounter}` });
+  const handlerStatuses = [];
+  const fakeChartItem = { msgtype: "image", image: { base64: "iVBORw0KGgo=", md5: "fake-md5" } };
+  const handler = createLongConnectionHandler({
+    policy,
+    agent,
+    streamIdFactory: () => `stream-${++streamCounter}`,
+    statusWriter: (value) => handlerStatuses.push(value),
+    chartRenderer: async () => fakeChartItem
+  });
   const client = new FakeClient();
 
   const textFrame = frame("msg-1", "boss", "text", { text: { content: "集团9月业绩排名" } });
@@ -65,11 +77,14 @@ function frame(messageId, userId, msgtype, body) {
   assert.match(client.replies[0].content, /Codex 经营分析 Agent 正在处理/);
   assert.match(client.replies[1].content, /正在查询销帮帮实时只读数据/);
   assert.equal(client.replies[2].content, "集团9月业绩排名已生成（MTD）。");
+  assert.deepEqual(client.replies[2].msgItem, [fakeChartItem]);
+  assert.equal(handlerStatuses.some((value) => value.status === "chart_generated"), true);
   assert.equal(agentCalls, 1);
 
   await handler.handleMessage(textFrame, client);
   assert.equal(client.replies[3].streamId, "stream-1");
   assert.equal(client.replies[3].finish, true);
+  assert.deepEqual(client.replies[3].msgItem, [fakeChartItem]);
   assert.equal(agentCalls, 1);
 
   const denied = frame("msg-2", "unknown", "text", { text: { content: "集团业绩" } });
@@ -85,6 +100,7 @@ function frame(messageId, userId, msgtype, body) {
 
   assert.equal(extractQuestion({ msgtype: "voice", voice: { content: "语音问题" } }), "语音问题");
   assert.equal(extractQuestion({ msgtype: "mixed", mixed: { msg_item: [{ msgtype: "image" }, { msgtype: "text", text: { content: "图文问题" } }] } }), "图文问题");
+  assert.match(operationalFailure(new AgentBusyError()), /没有合并到当前任务/);
   await assert.rejects(() => handler.handleMessage({ headers: {}, body: {} }, client), /req_id/);
 
   const config = loadConfig({ env: {
@@ -94,7 +110,8 @@ function frame(messageId, userId, msgtype, body) {
   } });
   assert.equal(config.modelProvider, "codex-app-server");
   assert.equal(config.codexModel, "gpt-5.6-sol");
-  assert.equal(config.codexReasoningEffort, "max");
+  assert.equal(config.codexReasoningEffort, "medium");
+  assert.equal(config.agentTurnTimeoutMs, 300000);
   assert.equal(config.wecomWsUrl, "wss://openws.work.weixin.qq.com/");
   assert.equal(config.wecomMaxReconnectAttempts, -1);
   assert.match(config.agentStatePath, /agent-state\.json$/);
@@ -156,6 +173,7 @@ function frame(messageId, userId, msgtype, body) {
   rejectedAuthClient.emit("error", new Error("Authentication failed: invalid secret (code: 853000)"));
   assert.deepEqual(await rejectedAuth, { success: false, stage: "authentication", errorCode: 853000 });
   assert.deepEqual(Object.keys(safeStatus({ status: "ready", secret: "must-not-appear" })), ["at", "status", "transport"]);
+  assert.deepEqual(Object.keys(safeStatus({ status: "turn_completed", elapsedMs: 1234, userId: "must-not-appear" })), ["at", "status", "transport", "elapsedMs"]);
   assert.throws(() => safeStatus({ status: "unknown" }), /未知机器人状态/);
 
   process.stdout.write(`${JSON.stringify({ success: true, checks: 51 })}\n`);

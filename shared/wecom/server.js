@@ -11,8 +11,10 @@ const { createStatusWriter } = require("./status-writer.js");
 async function buildRuntime(config, options = {}) {
   const policy = loadAccessPolicy(config.accessPolicyPath);
   const agent = options.agent || new PersistentCodexAgent(config);
+  const statusWriter = options.statusWriter || (() => {});
+  agent.on("activity", statusWriter);
   await agent.start();
-  const handler = createLongConnectionHandler({ policy, agent });
+  const handler = createLongConnectionHandler({ policy, agent, statusWriter });
   return Object.freeze({
     handleMessage: (frame, client) => handler.handleMessage(frame, client),
     close: () => agent.close(),
@@ -74,8 +76,9 @@ function createBotService(config, runtime, options = {}) {
 if (require.main === module) {
   void (async () => {
     const config = loadConfig();
-    const runtime = await buildRuntime(config);
-    const service = createBotService(config, runtime, { exitOnFatal: true });
+    const statusWriter = createStatusWriter({ logPath: config.statusLogPath });
+    const runtime = await buildRuntime(config, { statusWriter });
+    const service = createBotService(config, runtime, { exitOnFatal: true, statusWriter });
     let stopping = false;
     const shutdown = async () => {
       if (stopping) return;

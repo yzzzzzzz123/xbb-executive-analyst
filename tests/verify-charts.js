@@ -1,7 +1,9 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const { render } = require("../shared/xbb/render-chart.js");
+const { createWecomChartItem } = require("../shared/wecom/chart-image.js");
 
 const specs = [
   { type: "bar", title: "公司排名", categories: ["公司A", "公司B"], series: [{ name: "业绩", values: [100, 80] }], valueFormat: "money" },
@@ -12,15 +14,27 @@ const specs = [
   { type: "funnel", title: "商机阶段", items: [{ name: "发现需求", value: 10 }, { name: "确认需求", value: 7 }, { name: "解决方案", value: 4 }, { name: "赢单", value: 2 }] }
 ];
 
-for (const spec of specs) {
-  const svg = render(spec);
-  assert.match(svg, /^<\?xml version="1\.0" encoding="UTF-8"\?>/);
-  assert.match(svg, /<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
-  assert.match(svg, new RegExp(spec.title));
-  assert.doesNotMatch(svg, /<(?:script|foreignObject)\b|\b(?:href|xlink:href)\s*=/i);
-  assert.doesNotMatch(svg.replace('xmlns="http://www.w3.org/2000/svg"', ""), /https?:\/\//i);
-  assert.ok(Buffer.byteLength(svg, "utf8") > 1000);
-}
+(async () => {
+  for (const spec of specs) {
+    const svg = render(spec);
+    assert.match(svg, /^<\?xml version="1\.0" encoding="UTF-8"\?>/);
+    assert.match(svg, /<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
+    assert.match(svg, new RegExp(spec.title));
+    assert.doesNotMatch(svg, /<(?:script|foreignObject)\b|\b(?:href|xlink:href)\s*=/i);
+    assert.doesNotMatch(svg.replace('xmlns="http://www.w3.org/2000/svg"', ""), /https?:\/\//i);
+    assert.ok(Buffer.byteLength(svg, "utf8") > 1000);
+  }
 
-assert.throws(() => render({ type: "pie", title: "错误类型" }), /type/);
-process.stdout.write(`${JSON.stringify({ success: true, chartTypes: specs.map((spec) => spec.type) })}\n`);
+  const imageItem = await createWecomChartItem(specs[2]);
+  const png = Buffer.from(imageItem.image.base64, "base64");
+  assert.equal(imageItem.msgtype, "image");
+  assert.deepEqual([...png.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+  assert.equal(imageItem.image.md5, crypto.createHash("md5").update(png).digest("hex"));
+  assert.ok(png.length < 10 * 1024 * 1024);
+
+  assert.throws(() => render({ type: "pie", title: "错误类型" }), /type/);
+  process.stdout.write(`${JSON.stringify({ success: true, chartTypes: specs.map((spec) => spec.type), wecomPng: true })}\n`);
+})().catch((error) => {
+  process.stderr.write(`${error.stack}\n`);
+  process.exitCode = 1;
+});

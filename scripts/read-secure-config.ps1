@@ -47,8 +47,8 @@ try {
     if (-not $WecomOnly) {
         $result['modelProvider'] = 'codex-app-server'
         $result['codexModel'] = 'gpt-5.6-sol'
-        $result['codexReasoningEffort'] = 'max'
-        $result['agentTurnTimeoutMs'] = if ($stored.PSObject.Properties.Name -contains 'agentTurnTimeoutMs') { [int]$stored.agentTurnTimeoutMs } else { 900000 }
+        $result['codexReasoningEffort'] = if ($stored.PSObject.Properties.Name -contains 'codexReasoningEffort') { [string]$stored.codexReasoningEffort } else { 'medium' }
+        $result['agentTurnTimeoutMs'] = if ($stored.PSObject.Properties.Name -contains 'agentTurnTimeoutMs') { [int]$stored.agentTurnTimeoutMs } else { 300000 }
         $result['agentStatePath'] = if ($stored.PSObject.Properties.Name -contains 'agentStatePath') { [string]$stored.agentStatePath } else { Join-Path ([IO.Path]::GetDirectoryName($resolved)) 'agent-state.json' }
         $result['statusLogPath'] = if ($stored.PSObject.Properties.Name -contains 'statusLogPath') { [string]$stored.statusLogPath } else { Join-Path ([IO.Path]::GetDirectoryName($resolved)) 'status.jsonl' }
         $result['accessPolicyPath'] = [string]$stored.accessPolicyPath

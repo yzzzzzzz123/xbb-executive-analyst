@@ -111,8 +111,8 @@ function loadConfig(options = {}) {
     modelProvider,
     projectRoot,
     codexModel: validateCodexModel(envValue(env, "XBB_CODEX_MODEL", stored.codexModel || "gpt-5.6-sol")),
-    codexReasoningEffort: validateReasoningEffort(envValue(env, "XBB_CODEX_REASONING_EFFORT", stored.codexReasoningEffort || "max")),
-    agentTurnTimeoutMs: parseInteger(envValue(env, "XBB_AGENT_TURN_TIMEOUT_MS", stored.agentTurnTimeoutMs || 900000), "Codex Agent 单轮超时", 30000, 1800000),
+    codexReasoningEffort: validateReasoningEffort(envValue(env, "XBB_CODEX_REASONING_EFFORT", stored.codexReasoningEffort || "medium")),
+    agentTurnTimeoutMs: parseInteger(envValue(env, "XBB_AGENT_TURN_TIMEOUT_MS", stored.agentTurnTimeoutMs || 300000), "Codex Agent 单轮超时", 30000, 1800000),
     agentStatePath: requireOutsideProject(envValue(env, "XBB_AGENT_STATE_PATH", stored.agentStatePath || path.join(localRoot, "agent-state.json")), "Codex Agent 状态文件"),
     statusLogPath: requireOutsideProject(envValue(env, "XBB_STATUS_LOG_PATH", stored.statusLogPath || path.join(localRoot, "status.jsonl")), "机器人状态日志"),
     accessPolicyPath: path.resolve(envValue(env, "XBB_ACCESS_POLICY_PATH", stored.accessPolicyPath || path.join(localRoot, "access-policy.json")))

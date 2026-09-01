@@ -1,8 +1,9 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const { principalKeyFromUserId } = require("../codex/persistent-agent.js");
+const { AgentBusyError, principalKeyFromUserId } = require("../codex/persistent-agent.js");
 const { authorize, AccessDeniedError } = require("../security/access-control.js");
+const { createWecomChartItem } = require("./chart-image.js");
 const { MessageStore } = require("./message-store.js");
 
 function extractQuestion(message) {
@@ -19,6 +20,7 @@ function extractQuestion(message) {
 
 function operationalFailure(error) {
   if (error instanceof AccessDeniedError) return error.message;
+  if (error instanceof AgentBusyError) return "上一条问题仍在处理中，本条没有合并到当前任务。请等待上一条结果后再提问。";
   return "实时经营分析失败，未返回替代或陈旧数据。请稍后重试。";
 }
 
@@ -39,7 +41,10 @@ function createLongConnectionHandler({
   agent,
   messageStore = new MessageStore(),
   streamIdFactory = defaultStreamId,
-  principalKeyFactory = principalKeyFromUserId
+  principalKeyFactory = principalKeyFromUserId,
+  statusWriter = () => {},
+  heartbeatMs = 30000,
+  chartRenderer = createWecomChartItem
 }) {
   if (!policy || !agent?.answer) throw new Error("企业微信长连接处理器初始化参数不完整。");
 
@@ -48,6 +53,7 @@ function createLongConnectionHandler({
       if (!client?.replyStream) throw new Error("企业微信长连接客户端不可用。");
       const message = validateFrame(frame);
       const messageId = message.msgid;
+      const receivedAtMs = Date.now();
       const userId = String(message.from?.userid || "");
       const question = String(extractQuestion(message) || "").trim();
 
@@ -66,10 +72,13 @@ function createLongConnectionHandler({
         : "目前仅支持文字、语音转文字或图文中的文字经营问题。";
       const { state, isNew } = messageStore.begin({ messageId, userId, streamId: streamIdFactory(), content: initialContent });
 
-      if (!isNew) return client.replyStream(frame, state.streamId, state.content, state.finish);
+      if (!isNew) return client.replyStream(frame, state.streamId, state.content, state.finish, state.finish ? state.msgItem : undefined);
+      statusWriter({ status: "message_received" });
       if (!question) {
         messageStore.complete(messageId, initialContent);
-        return client.replyStream(frame, state.streamId, initialContent, true);
+        const reply = await client.replyStream(frame, state.streamId, initialContent, true);
+        statusWriter({ status: "reply_completed", elapsedMs: Date.now() - receivedAtMs });
+        return reply;
       }
 
       try {
@@ -80,6 +89,8 @@ function createLongConnectionHandler({
       }
 
       let answer;
+      let chart = null;
+      let heartbeat;
       try {
         let delivery = Promise.resolve();
         const onProgress = (content) => {
@@ -87,19 +98,39 @@ function createLongConnectionHandler({
           delivery = delivery.then(() => client.replyStream(frame, state.streamId, content, false));
           return delivery;
         };
-        answer = await agent.answer({
+        heartbeat = setInterval(() => {
+          const seconds = Math.max(1, Math.floor((Date.now() - receivedAtMs) / 1000));
+          void onProgress(`Codex 仍在分析，已用时约 ${seconds} 秒，请稍候……`).catch(() => {});
+        }, heartbeatMs);
+        heartbeat.unref?.();
+        const result = await agent.answer({
           question,
           access,
           principalKey: principalKeyFactory(userId, access),
           messageId,
           onProgress
         });
+        answer = typeof result === "string" ? result : result.answer;
+        chart = typeof result === "object" && result ? result.chart : null;
+        clearInterval(heartbeat);
         await delivery;
       } catch (error) {
+        if (heartbeat) clearInterval(heartbeat);
         answer = operationalFailure(error);
       }
-      messageStore.complete(messageId, answer);
-      return client.replyStream(frame, state.streamId, answer, true);
+      let msgItem = [];
+      if (chart) {
+        try {
+          msgItem = [await chartRenderer(chart)];
+          statusWriter({ status: "chart_generated" });
+        } catch {
+          statusWriter({ status: "chart_failed" });
+        }
+      }
+      messageStore.complete(messageId, answer, msgItem);
+      const reply = await client.replyStream(frame, state.streamId, answer, true, msgItem);
+      statusWriter({ status: "reply_completed", elapsedMs: Date.now() - receivedAtMs });
+      return reply;
     }
   });
 }
