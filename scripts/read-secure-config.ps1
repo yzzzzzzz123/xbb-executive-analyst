@@ -45,7 +45,8 @@ try {
     }
     if (-not $WecomOnly) {
         $result['modelProvider'] = [string]$stored.modelProvider
-        $result['codexReasoningEffort'] = if ($stored.PSObject.Properties.Name -contains 'codexReasoningEffort') { [string]$stored.codexReasoningEffort } else { 'medium' }
+        $result['codexModel'] = 'gpt-5.6-sol'
+        $result['codexReasoningEffort'] = 'max'
         $result['modelTimeoutMs'] = if ($stored.PSObject.Properties.Name -contains 'modelTimeoutMs') { [int]$stored.modelTimeoutMs } else { 300000 }
         $result['accessPolicyPath'] = [string]$stored.accessPolicyPath
     }

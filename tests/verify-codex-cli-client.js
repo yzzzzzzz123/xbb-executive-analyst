@@ -45,7 +45,8 @@ const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-codex-client-test-")
   assert.match(captured.prompt, /application_tools_json/);
   assert.match(captured.args.join(" "), /--ephemeral/);
   assert.match(captured.args.join(" "), /read-only/);
-  assert.match(captured.args.join(" "), /model_reasoning_effort=\"medium\"/);
+  assert.match(captured.args.join(" "), /--model gpt-5\.6-sol/);
+  assert.match(captured.args.join(" "), /model_reasoning_effort=\"max\"/);
   assert.equal(Object.hasOwn(captured.env, "XBB_WECOM_BOT_SECRET"), false);
   assert.equal(Object.hasOwn(captured.env, "OPENAI_API_KEY"), false);
   assert.equal(fs.existsSync(captured.cwd), false);
@@ -64,7 +65,7 @@ const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-codex-client-test-")
     spawnSync: () => ({ status: 0, stdout: "Logged in using an API key", stderr: "" })
   }), /不是 ChatGPT 登录模式/);
 
-  process.stdout.write(`${JSON.stringify({ success: true, checks: 17 })}\n`);
+  process.stdout.write(`${JSON.stringify({ success: true, checks: 18 })}\n`);
 })().catch((error) => {
   process.stderr.write(`${error.stack}\n`);
   process.exitCode = 1;

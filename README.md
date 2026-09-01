@@ -11,7 +11,7 @@
         ↕ 官方 WebSocket 长连接
 shared/wecom
         ↓ USERID 访问控制
-shared/agent（本机 Codex，ChatGPT 登录）
+shared/agent（本机 Codex，ChatGPT 登录，gpt-5.6-sol/max）
         ↓ query_xbb
 skills/xbb-executive-analyst/scripts/query-xbb.ps1
         ↓
@@ -62,7 +62,7 @@ cd D:\codex\xbb-executive-analyst
 & .\scripts\configure-bot.ps1 -WecomBotId '企微页面显示的Bot ID'
 ```
 
-脚本随后只安全读取企业微信机器人 Secret。模型直接复用本机 Codex 的 ChatGPT 登录，不询问也不保存 OpenAI API Key、模型接口地址或模型名称。
+脚本随后只安全读取企业微信机器人 Secret。模型直接复用本机 Codex 的 ChatGPT 登录，不询问也不保存 OpenAI API Key 或模型接口地址；正式配置固定使用 `gpt-5.6-sol` 与 `max` 推理强度。
 
 Secret 使用 Windows DPAPI CurrentUser 加密，保存到：
 
@@ -202,7 +202,8 @@ Get-ScheduledTask -TaskName 'Codex-XBB-Executive-Analyst-WeCom' |
 - `XBB_MODEL_PROVIDER`，默认 `local-codex`
 - `XBB_MODEL_TIMEOUT_MS`，默认 300000 毫秒
 - `XBB_CODEX_COMMAND`，仅在无法自动定位 Codex CLI 时指定绝对可执行文件路径
-- `XBB_CODEX_REASONING_EFFORT`，默认 `medium`；可显式改为 `minimal`、`low`、`high` 或模型支持的 `xhigh`
+- `XBB_CODEX_MODEL`，正式默认 `gpt-5.6-sol`
+- `XBB_CODEX_REASONING_EFFORT`，正式默认 `max`；也支持 `minimal`、`low`、`medium`、`high` 或 `xhigh`
 - `XBB_ACCESS_POLICY_PATH`
 
 只要 Bot ID 与 Secret 环境变量不完整，服务就读取 DPAPI 安全配置。普通桌面部署优先使用安全配置脚本，避免 Secret 出现在进程环境中。

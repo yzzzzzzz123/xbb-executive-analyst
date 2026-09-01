@@ -87,7 +87,8 @@ function frame(messageId, userId, msgtype, body) {
     XBB_ACCESS_POLICY_PATH: "D:\\policy.json"
   } });
   assert.equal(config.modelProvider, "local-codex");
-  assert.equal(config.codexReasoningEffort, "medium");
+  assert.equal(config.codexModel, "gpt-5.6-sol");
+  assert.equal(config.codexReasoningEffort, "max");
   assert.equal(config.wecomWsUrl, "wss://openws.work.weixin.qq.com/");
   assert.equal(config.wecomMaxReconnectAttempts, -1);
   assert.equal(Object.hasOwn(config, "callbackPath"), false);
@@ -139,7 +140,7 @@ function frame(messageId, userId, msgtype, body) {
   assert.equal(pairingClient.disconnected, true);
   assert.equal(pairingOutput[0].pairingPhrase, `绑定 ${pairingCode}`);
 
-  process.stdout.write(`${JSON.stringify({ success: true, checks: 37 })}\n`);
+  process.stdout.write(`${JSON.stringify({ success: true, checks: 38 })}\n`);
 })().catch((error) => {
   process.stderr.write(`${error.stack}\n`);
   process.exitCode = 1;

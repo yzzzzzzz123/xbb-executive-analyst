@@ -81,8 +81,15 @@ function validateEndpoint(value) {
 }
 
 function validateReasoningEffort(value) {
-  if (!["minimal", "low", "medium", "high", "xhigh"].includes(value)) {
-    throw new Error("Codex 推理强度只支持 minimal、low、medium、high 或 xhigh。");
+  if (!["minimal", "low", "medium", "high", "xhigh", "max"].includes(value)) {
+    throw new Error("Codex 推理强度只支持 minimal、low、medium、high、xhigh 或 max。");
+  }
+  return value;
+}
+
+function validateCodexModel(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9._-]{2,128}$/.test(value)) {
+    throw new Error("Codex 模型名称格式无效。");
   }
   return value;
 }
@@ -112,7 +119,8 @@ function loadConfig(options = {}) {
   if (modelProvider === "local-codex") {
     const codexCommand = envValue(env, "XBB_CODEX_COMMAND", stored.codexCommand);
     if (codexCommand) config.codexCommand = codexCommand;
-    config.codexReasoningEffort = validateReasoningEffort(envValue(env, "XBB_CODEX_REASONING_EFFORT", stored.codexReasoningEffort || "medium"));
+    config.codexModel = validateCodexModel(envValue(env, "XBB_CODEX_MODEL", stored.codexModel || "gpt-5.6-sol"));
+    config.codexReasoningEffort = validateReasoningEffort(envValue(env, "XBB_CODEX_REASONING_EFFORT", stored.codexReasoningEffort || "max"));
   } else {
     config.modelEndpoint = validateEndpoint(envValue(env, "XBB_MODEL_ENDPOINT", stored.modelEndpoint));
     config.modelApiKey = envValue(env, "XBB_MODEL_API_KEY", stored.modelApiKey || "");
@@ -122,4 +130,4 @@ function loadConfig(options = {}) {
   return Object.freeze(config);
 }
 
-module.exports = { defaultLocalRoot, loadConfig, loadWecomConfig, validateEndpoint, validateReasoningEffort, validateWebSocketEndpoint };
+module.exports = { defaultLocalRoot, loadConfig, loadWecomConfig, validateCodexModel, validateEndpoint, validateReasoningEffort, validateWebSocketEndpoint };

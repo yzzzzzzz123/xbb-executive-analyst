@@ -34,7 +34,7 @@
 
 - 默认模型入口是当前 Windows 用户已使用 ChatGPT 登录的本机 Codex CLI，不配置独立 OpenAI API Key、模型端点或模型名称。服务启动时必须校验登录模式为 ChatGPT。
 - 每个模型轮次使用 `codex exec --ephemeral`、`--sandbox read-only`、`--ignore-user-config` 和 `--ignore-rules`，在仓库外独立临时目录中运行；结构化输出必须在 `finally` 中删除。
-- 机器人默认使用 `model_reasoning_effort=medium` 与低输出冗余，在经营判断质量和最小化答复之间平衡；只能由部署配置显式调整推理强度，不得由用户消息修改。
+- 机器人显式使用当前质量优先配置 `gpt-5.6-sol`、`model_reasoning_effort=max` 与低输出冗余；这是旗舰能力优先而非时延优先的部署选择，只能由部署配置修改，不得由用户消息修改。
 - 服务把标准 `messages`、唯一业务工具定义和 Skill 完整规则作为不可信数据边界内的结构化输入。Codex 不得调用内置 shell、文件、网络、MCP 或 Skill，只能返回兼容 `tool_calls` 的 JSON；外层服务验证后才可执行 `query_xbb`。
 - 子进程环境使用白名单，不继承企微 Secret、销帮帮凭证、API Key、Token 或其他业务密钥。生产运行没有 mock、样例或固定答复回退。
 - 仅作为兼容选项，代码仍可通过完整环境变量显式切换到 `chat-completions`；默认桌面部署和 DPAPI 配置不要求也不保存模型 API Key。

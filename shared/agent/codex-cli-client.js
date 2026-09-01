@@ -179,7 +179,8 @@ function createCodexCliClient(config, options = {}) {
   const runner = options.runner || runCodexProcess;
   const temporaryRoot = options.temporaryRoot || path.join(os.tmpdir(), "Codex", "xbb-executive-analyst", "model");
   const timeoutMs = config.modelTimeoutMs || 300000;
-  const reasoningEffort = config.codexReasoningEffort || "medium";
+  const model = config.codexModel || "gpt-5.6-sol";
+  const reasoningEffort = config.codexReasoningEffort || "max";
 
   return Object.freeze({
     async complete({ messages, tools }) {
@@ -191,6 +192,7 @@ function createCodexCliClient(config, options = {}) {
         fs.writeFileSync(schemaPath, `${JSON.stringify(CODEX_MESSAGE_SCHEMA)}\n`, { encoding: "utf8", flag: "wx" });
         const args = [
           "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check",
+          "--model", model,
           "-c", `model_reasoning_effort=\"${reasoningEffort}\"`, "-c", "model_verbosity=\"low\"",
           "--sandbox", "read-only", "--color", "never", "--output-schema", schemaPath,
           "--output-last-message", outputPath, "-C", runDirectory, "-"

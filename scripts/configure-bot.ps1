@@ -43,7 +43,8 @@ $stored = [ordered]@{
     wecomHeartbeatMs = 30000
     wecomRequestTimeoutMs = 10000
     modelProvider = 'local-codex'
-    codexReasoningEffort = 'medium'
+    codexModel = 'gpt-5.6-sol'
+    codexReasoningEffort = 'max'
     modelTimeoutMs = 300000
     accessPolicyPath = $resolvedPolicy
 }
