@@ -1,7 +1,8 @@
 ﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [string]$Path
+    [string]$Path,
+    [switch]$WecomOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,7 +14,10 @@ if (-not [IO.File]::Exists($resolved)) {
 }
 
 $stored = Get-Content -LiteralPath $resolved -Raw -Encoding UTF8 | ConvertFrom-Json
-foreach ($field in @('wecomTokenDpapi', 'wecomEncodingAesKeyDpapi', 'modelEndpoint', 'modelName', 'accessPolicyPath')) {
+if ([string]$stored.schemaVersion -ne '2.0') { throw '机器人安全配置不是 WebSocket 长连接版 2.0，请重新运行 configure-bot.ps1。' }
+$requiredFields = @('wecomBotId', 'wecomBotSecretDpapi')
+if (-not $WecomOnly) { $requiredFields += @('modelEndpoint', 'modelName', 'accessPolicyPath') }
+foreach ($field in $requiredFields) {
     if ([string]::IsNullOrWhiteSpace([string]$stored.$field)) { throw "机器人安全配置缺少字段：$field" }
 }
 
@@ -29,25 +33,26 @@ function Unprotect-Value([string]$ProtectedValue) {
     }
 }
 
-$token = Unprotect-Value ([string]$stored.wecomTokenDpapi)
-$aesKey = Unprotect-Value ([string]$stored.wecomEncodingAesKeyDpapi)
-$modelApiKey = if ([string]::IsNullOrWhiteSpace([string]$stored.modelApiKeyDpapi)) { '' } else { Unprotect-Value ([string]$stored.modelApiKeyDpapi) }
+$botSecret = Unprotect-Value ([string]$stored.wecomBotSecretDpapi)
+$modelApiKey = if ($WecomOnly -or [string]::IsNullOrWhiteSpace([string]$stored.modelApiKeyDpapi)) { '' } else { Unprotect-Value ([string]$stored.modelApiKeyDpapi) }
 try {
-    [ordered]@{
-        host = if ($stored.PSObject.Properties.Name -contains 'host') { [string]$stored.host } else { '127.0.0.1' }
-        port = if ($stored.PSObject.Properties.Name -contains 'port') { [int]$stored.port } else { 8788 }
-        callbackPath = if ($stored.PSObject.Properties.Name -contains 'callbackPath') { [string]$stored.callbackPath } else { '/wecom/callback' }
-        wecomToken = $token
-        wecomEncodingAesKey = $aesKey
-        wecomReceiveId = if ($stored.PSObject.Properties.Name -contains 'wecomReceiveId') { [string]$stored.wecomReceiveId } else { '' }
-        modelEndpoint = [string]$stored.modelEndpoint
-        modelApiKey = $modelApiKey
-        modelName = [string]$stored.modelName
-        modelTimeoutMs = if ($stored.PSObject.Properties.Name -contains 'modelTimeoutMs') { [int]$stored.modelTimeoutMs } else { 120000 }
-        accessPolicyPath = [string]$stored.accessPolicyPath
-    } | ConvertTo-Json -Compress
+    $result = [ordered]@{
+        wecomBotId = [string]$stored.wecomBotId
+        wecomBotSecret = $botSecret
+        wecomWsUrl = if ($stored.PSObject.Properties.Name -contains 'wecomWsUrl') { [string]$stored.wecomWsUrl } else { 'wss://openws.work.weixin.qq.com' }
+        wecomMaxReconnectAttempts = if ($stored.PSObject.Properties.Name -contains 'wecomMaxReconnectAttempts') { [int]$stored.wecomMaxReconnectAttempts } else { -1 }
+        wecomHeartbeatMs = if ($stored.PSObject.Properties.Name -contains 'wecomHeartbeatMs') { [int]$stored.wecomHeartbeatMs } else { 30000 }
+        wecomRequestTimeoutMs = if ($stored.PSObject.Properties.Name -contains 'wecomRequestTimeoutMs') { [int]$stored.wecomRequestTimeoutMs } else { 10000 }
+    }
+    if (-not $WecomOnly) {
+        $result['modelEndpoint'] = [string]$stored.modelEndpoint
+        $result['modelApiKey'] = $modelApiKey
+        $result['modelName'] = [string]$stored.modelName
+        $result['modelTimeoutMs'] = if ($stored.PSObject.Properties.Name -contains 'modelTimeoutMs') { [int]$stored.modelTimeoutMs } else { 120000 }
+        $result['accessPolicyPath'] = [string]$stored.accessPolicyPath
+    }
+    $result | ConvertTo-Json -Compress
 } finally {
-    $token = $null
-    $aesKey = $null
+    $botSecret = $null
     $modelApiKey = $null
 }

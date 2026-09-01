@@ -10,7 +10,7 @@ description: Answer Chinese executive operating questions from configured live, 
 本 Skill 有两个正式运行环境：
 
 - Codex 对话模式：当前调用本 Skill 的 Codex 就是分析模型，不得再调用其他模型、Codex API 或 `codex exec`。
-- 企业微信服务模式：`shared/agent` 中配置的模型是本次请求的顶层分析模型，不属于嵌套调用。服务必须完整加载本 Skill 与引用规则，并且只允许模型调用受控的 `query_xbb` 工具。
+- 企业微信服务模式：国内版企业微信客户端中由普通员工创建的智能机器人通过官方 WebSocket 长连接接入；`shared/agent` 中配置的模型是本次请求的顶层分析模型，不属于嵌套调用。服务必须完整加载本 Skill 与引用规则，并且只允许模型调用受控的 `query_xbb` 工具。
 
 两种模式共享同一个唯一事实入口，不得自行访问销帮帮接口、凭证或历史输出。
 

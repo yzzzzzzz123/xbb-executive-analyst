@@ -17,7 +17,7 @@ $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument 
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsIdentity]::GetCurrent().Name)
 $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-$task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description '真实只读销帮帮经营分析企业微信智能机器人'
+$task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description '真实只读销帮帮经营分析企业微信智能机器人（WebSocket 长连接）'
 Register-ScheduledTask -TaskName $TaskName -InputObject $task -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
 

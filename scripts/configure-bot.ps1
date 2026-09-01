@@ -1,7 +1,9 @@
 ﻿[CmdletBinding()]
 param(
-    [SecureString]$WecomToken,
-    [SecureString]$WecomEncodingAesKey,
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[A-Za-z0-9_-]{4,256}$')]
+    [string]$WecomBotId,
+    [SecureString]$WecomBotSecret,
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^https?://')]
     [string]$ModelEndpoint,
@@ -9,18 +11,15 @@ param(
     [string]$ModelName,
     [SecureString]$ModelApiKey,
     [string]$AccessPolicyPath = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Codex\xbb-executive-analyst\access-policy.json'),
-    [string]$HostName = '127.0.0.1',
-    [ValidateRange(1, 65535)]
-    [int]$Port = 8788,
-    [string]$CallbackPath = '/wecom/callback',
+    [ValidatePattern('^wss://')]
+    [string]$WecomWsUrl = 'wss://openws.work.weixin.qq.com',
     [string]$Path = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Codex\xbb-executive-analyst\bot-config.json')
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-if ($null -eq $WecomToken) { $WecomToken = Read-Host '企业微信智能机器人 Token' -AsSecureString }
-if ($null -eq $WecomEncodingAesKey) { $WecomEncodingAesKey = Read-Host '企业微信智能机器人 EncodingAESKey' -AsSecureString }
+if ($null -eq $WecomBotSecret) { $WecomBotSecret = Read-Host '企业微信智能机器人 Secret' -AsSecureString }
 if ($null -eq $ModelApiKey) { $ModelApiKey = Read-Host '模型 API Key（本地免鉴权模型可直接回车）' -AsSecureString }
 
 function Get-PlainText([SecureString]$Value) {
@@ -29,14 +28,11 @@ function Get-PlainText([SecureString]$Value) {
     finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer) }
 }
 
-$tokenText = Get-PlainText $WecomToken
-$aesText = Get-PlainText $WecomEncodingAesKey
+$secretText = Get-PlainText $WecomBotSecret
 try {
-    if ([string]::IsNullOrWhiteSpace($tokenText)) { throw '企业微信 Token 不能为空。' }
-    if ($aesText -notmatch '^[A-Za-z0-9+/]{43}$') { throw 'EncodingAESKey 必须是 43 位 Base64 字符串。' }
+    if ([string]::IsNullOrWhiteSpace($secretText)) { throw '企业微信智能机器人 Secret 不能为空。' }
 } finally {
-    $tokenText = $null
-    $aesText = $null
+    $secretText = $null
 }
 
 $resolved = [IO.Path]::GetFullPath($Path)
@@ -45,13 +41,13 @@ $parent = [IO.Path]::GetDirectoryName($resolved)
 [IO.Directory]::CreateDirectory($parent) | Out-Null
 
 $stored = [ordered]@{
-    schemaVersion = '1.0'
-    host = $HostName
-    port = $Port
-    callbackPath = $CallbackPath
-    wecomReceiveId = ''
-    wecomTokenDpapi = ConvertFrom-SecureString $WecomToken
-    wecomEncodingAesKeyDpapi = ConvertFrom-SecureString $WecomEncodingAesKey
+    schemaVersion = '2.0'
+    wecomBotId = $WecomBotId
+    wecomBotSecretDpapi = ConvertFrom-SecureString $WecomBotSecret
+    wecomWsUrl = $WecomWsUrl
+    wecomMaxReconnectAttempts = -1
+    wecomHeartbeatMs = 30000
+    wecomRequestTimeoutMs = 10000
     modelEndpoint = $ModelEndpoint
     modelName = $ModelName
     modelApiKeyDpapi = ConvertFrom-SecureString $ModelApiKey
@@ -67,4 +63,4 @@ try {
     if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
 }
 
-Write-Output ([ordered]@{ success = $true; configPath = $resolved; accessPolicyPath = $resolvedPolicy; secrets = 'DPAPI CurrentUser' } | ConvertTo-Json -Compress)
+Write-Output ([ordered]@{ success = $true; transport = 'wecom-websocket'; botId = $WecomBotId; configPath = $resolved; accessPolicyPath = $resolvedPolicy; secrets = 'DPAPI CurrentUser' } | ConvertTo-Json -Compress)

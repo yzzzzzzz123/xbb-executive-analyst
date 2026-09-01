@@ -1,27 +1,34 @@
-# 企业微信智能机器人服务合同
+# 国内版企业微信智能机器人服务合同
 
 ## 正式接入方式
 
-- 使用企业微信“智能机器人”的 API 模式，不使用群机器人 webhook 代替智能客服。
-- 回调 URL 必须是企业微信能够访问的 HTTPS 地址。Node 服务默认只监听 `127.0.0.1:8788`，应由反向代理或可信隧道终止公网 TLS，再转发到本机。
-- 企业内部自建智能机器人的 `ReceiveId` 使用空字符串，除非企业微信后台的实际接入类型明确要求其他值。
-- URL 校验必须在一秒内完成签名校验和 `echostr` 解密，并原样返回无 BOM、无引号、无换行的明文。
+- 面向国内版企业微信普通员工，使用客户端“工作台 → 智能机器人 → 手动创建 → API 模式创建 → 使用长连接”。不要求企业管理后台、自建应用或超级管理员；若企业策略隐藏或禁止创建入口，才需要管理员开放。
+- 正式传输只使用企业微信官方 `@wecom/aibot-node-sdk` WebSocket 长连接，以 Bot ID 和 Secret 认证。国内版默认地址是 `wss://openws.work.weixin.qq.com`。
+- 服务主动建立出站连接，不监听业务 HTTP 端口，不要求公网 IP、域名、HTTPS 回调、反向代理、Token、EncodingAESKey 或 ReceiveId。
+- Bot Secret 使用 Windows DPAPI CurrentUser 保护并保存在仓库外。一个 Bot ID 同时只运行一个正式连接；后台任务与人工前台调试不得并行。
+
+## 身份识别与访问控制
+
+- 消息中的 `from.userid` 是唯一授权键。不得按姓名猜测，也不得把通讯录显示值当作实际回传值。
+- 初次部署可运行 bundled 一次性识别入口。它仅接受本机随机生成、五分钟有效的完整绑定口令，只在本机标准输出显示命中的 USERID，不加载访问策略、模型或销帮帮数据，并在成功或超时后断开。
+- 正式服务启动前必须建立访问策略。未登记 USERID 在模型和销帮帮查询前失败关闭；公司级授权必须在模型调用前和 runner 调用时双重强制。
+- SDK debug 日志必须关闭。服务日志不得记录消息正文、完整帧、USERID、事实包、跟进摘录、Secret、模型 Key 或销帮帮凭证。
 
 ## 消息与流式回复
 
-- 接收 JSON 密文包装 `{ "encrypt": "..." }`，使用回调 URL 的 `msg_signature`、`timestamp`、`nonce` 校验。
-- 用户消息以 `msgid` 排重；只接受已登记 USERID。访问控制失败发生在模型和销帮帮查询之前。
-- 文字、语音转文字和图文混排中的文字可进入分析；图片、文件、视频本身不进入模型。
-- 首次响应生成唯一 `stream.id`，可先返回真实运行状态且 `finish=false`。企业微信后续以 `msgtype=stream` 和同一 `stream.id` 刷新，服务返回当前完整内容；最终结果设置 `finish=true`。
-- `stream.content` 是覆盖式完整内容，不是增量片段；UTF-8 长度不得超过 20480 字节。
-- 服务只输出文字分析，不上传事实包、跟进证据或 CRM 附件。反馈 id 只用于关联回答，不含用户标识或业务数据。
+- 以 `msgid` 做十分钟内存排重；同一消息重投不得重复调用模型或 runner。
+- 只读取文字、语音转文字和图文混排中的文字。图片、文件、视频及下载地址不进入模型。
+- 首次回复沿用收到帧的 `headers.req_id`，生成唯一 stream id，并在调用模型前发送“正在查询”的真实运行状态，`finish=false`。
+- 模型完成后使用同一帧和 stream id 返回完整最终内容，`finish=true`。最终内容是覆盖式全文，不是增量片段，UTF-8 长度不得超过 20480 字节。
+- 发送首次状态失败时不得调用模型或 runner；最终回复失败时保留内存排重状态，企微重投可重发相同最终结果。
+- 服务只输出文字经营分析，不上传事实包、跟进证据或 CRM 附件。模型失败或 runner 失败只返回失败状态，不使用陈旧数据、样例或固定答复。
 
-## 加解密
+## 连接生命周期
 
-- 签名为 Token、timestamp、nonce、encrypt 四个字符串排序拼接后的 SHA-1。
-- AESKey 是 EncodingAESKey 补 `=` 后 Base64 解码所得 32 字节；AES-256-CBC 的 IV 是 AESKey 前 16 字节。
-- 明文为 16 字节随机数、4 字节网络序消息长度、UTF-8 JSON 消息、ReceiveId，再按 32 字节块执行 PKCS#7 填充。
-- 被动回复密文包装字段为 `encrypt`、`msgsignature`、`timestamp`、`nonce`；回复 nonce 使用当前回调 URL 的 nonce。
+- 使用官方 SDK 自动认证、心跳和指数退避重连；正式配置的最大重连次数为 `-1`，直到人工停止进程。
+- 认证成功只输出不含业务数据的 `ready` 状态；连接错误、断开和重连日志只输出固定状态及重试次数，不输出 SDK 原始错误或消息帧。
+- 进程收到 `SIGINT` 或 `SIGTERM` 时主动断开。Windows 登录计划任务必须使用创建 DPAPI 配置的同一当前用户。
+- 电脑关机、睡眠、休眠、断网或用户未登录时机器人离线；当前部署不是开机前运行的 Windows Service。
 
 ## 模型与工具
 
@@ -29,10 +36,7 @@
 - 模型只拥有 `query_xbb` 一个业务工具。工具参数经过白名单校验，且事实包在传给模型前再次验证实时只读来源、隐私标志和 SHA-256 完整性。
 - 模型失败或 runner 失败只返回失败状态，不使用陈旧数据；明文事实包在 `finally` 中删除。
 
-## 官方协议依据
+## 官方依据
 
-- 智能机器人接收消息：https://developer.work.weixin.qq.com/document/path/100719
-- 智能机器人接收事件：https://developer.work.weixin.qq.com/document/path/101027
-- 智能机器人被动回复：https://developer.work.weixin.qq.com/document/path/101031
-- 回调与回复加解密：https://developer.work.weixin.qq.com/document/path/101033
-- 智能机器人主动回复：https://developer.work.weixin.qq.com/document/path/101138
+- 企业微信官方智能机器人 Node.js SDK：https://github.com/WecomTeam/aibot-node-sdk
+- 国内版客户端创建长连接智能机器人操作指引：https://cloud.tencent.cn/document/product/1831/137051

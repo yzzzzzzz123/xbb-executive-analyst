@@ -1,81 +1,57 @@
 "use strict";
 
-const http = require("node:http");
+const { WSClient } = require("@wecom/aibot-node-sdk");
 const { loadConfig } = require("../config.js");
 const { createChatCompletionsClient } = require("../agent/chat-completions-client.js");
 const { createExecutiveAgent } = require("../agent/executive-agent.js");
 const { loadSystemPrompt } = require("../agent/system-prompt.js");
 const { loadAccessPolicy } = require("../security/access-control.js");
 const { createToolGateway } = require("../xbb/tool-gateway.js");
-const { createCallbackHandler } = require("./callback-handler.js");
-const { WecomCrypto } = require("./crypto.js");
-
-function send(res, status, contentType, body) {
-  const payload = Buffer.from(body, "utf8");
-  res.writeHead(status, { "content-type": `${contentType}; charset=utf-8`, "content-length": payload.length, "cache-control": "no-store" });
-  res.end(payload);
-}
-
-function readJsonBody(req, maxBytes) {
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    const chunks = [];
-    req.on("data", (chunk) => {
-      size += chunk.length;
-      if (size > maxBytes) {
-        reject(new Error("回调消息超过大小上限。"));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on("end", () => {
-      try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
-      catch { reject(new Error("回调消息不是有效 JSON。")); }
-    });
-    req.on("error", reject);
-  });
-}
+const { createLongConnectionHandler } = require("./long-connection-handler.js");
+const { createPrivacyLogger } = require("./privacy-logger.js");
 
 function buildRuntime(config) {
   const policy = loadAccessPolicy(config.accessPolicyPath);
   const modelClient = createChatCompletionsClient(config);
   const queryXbb = createToolGateway();
   const agent = createExecutiveAgent({ modelClient, queryXbb, systemPrompt: loadSystemPrompt() });
-  const wecomCrypto = new WecomCrypto({ token: config.wecomToken, encodingAesKey: config.wecomEncodingAesKey, receiveId: config.wecomReceiveId });
-  return createCallbackHandler({ wecomCrypto, policy, agent });
+  return createLongConnectionHandler({ policy, agent });
 }
 
-function createServer(config, runtime = buildRuntime(config)) {
-  return http.createServer(async (req, res) => {
-    try {
-      const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-      if (req.method === "GET" && url.pathname === "/healthz") {
-        send(res, 200, "application/json", JSON.stringify({ status: "ok", service: "xbb-executive-analyst-wecom" }));
-        return;
-      }
-      if (url.pathname !== config.callbackPath) {
-        send(res, 404, "application/json", JSON.stringify({ error: "not_found" }));
-        return;
-      }
-      const query = Object.fromEntries(url.searchParams.entries());
-      if (req.method === "GET") {
-        send(res, 200, "text/plain", runtime.verifyUrl(query));
-        return;
-      }
-      if (req.method === "POST") {
-        const reply = runtime.handlePost(query, await readJsonBody(req, config.maxBodyBytes));
-        if (reply === null) {
-          res.writeHead(200, { "content-length": "0", "cache-control": "no-store" });
-          res.end();
-        } else {
-          send(res, 200, "application/json", JSON.stringify(reply));
-        }
-        return;
-      }
-      send(res, 405, "application/json", JSON.stringify({ error: "method_not_allowed" }));
-    } catch (error) {
-      send(res, 400, "application/json", JSON.stringify({ error: "invalid_callback", message: error.message }));
+function defaultStatusWriter(status) {
+  process.stdout.write(`${JSON.stringify(status)}\n`);
+}
+
+function createBotService(config, runtime = buildRuntime(config), options = {}) {
+  const statusWriter = options.statusWriter || defaultStatusWriter;
+  const clientFactory = options.clientFactory || ((clientOptions) => new WSClient(clientOptions));
+  const client = clientFactory({
+    botId: config.wecomBotId,
+    secret: config.wecomBotSecret,
+    wsUrl: config.wecomWsUrl,
+    maxReconnectAttempts: config.wecomMaxReconnectAttempts,
+    heartbeatInterval: config.wecomHeartbeatMs,
+    requestTimeout: config.wecomRequestTimeoutMs,
+    logger: createPrivacyLogger()
+  });
+
+  client.on("authenticated", () => statusWriter({ status: "ready", transport: "wecom-websocket" }));
+  client.on("disconnected", () => statusWriter({ status: "disconnected", transport: "wecom-websocket" }));
+  client.on("reconnecting", (attempt) => statusWriter({ status: "reconnecting", transport: "wecom-websocket", attempt }));
+  client.on("error", () => statusWriter({ status: "connection_error", transport: "wecom-websocket" }));
+  client.on("message", (frame) => {
+    Promise.resolve(runtime.handleMessage(frame, client))
+      .catch(() => statusWriter({ status: "message_failed", transport: "wecom-websocket" }));
+  });
+
+  return Object.freeze({
+    client,
+    start() {
+      statusWriter({ status: "connecting", transport: "wecom-websocket" });
+      client.connect();
+    },
+    stop() {
+      client.disconnect();
     }
   });
 }
@@ -83,14 +59,20 @@ function createServer(config, runtime = buildRuntime(config)) {
 if (require.main === module) {
   try {
     const config = loadConfig();
-    const server = createServer(config);
-    server.listen(config.port, config.host, () => {
-      process.stdout.write(`${JSON.stringify({ success: true, host: config.host, port: config.port, callbackPath: config.callbackPath })}\n`);
-    });
+    const service = createBotService(config);
+    let stopping = false;
+    const shutdown = () => {
+      if (stopping) return;
+      stopping = true;
+      service.stop();
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+    service.start();
   } catch (error) {
     process.stderr.write(`${error.message}\n`);
     process.exitCode = 1;
   }
 }
 
-module.exports = { buildRuntime, createServer, readJsonBody };
+module.exports = { buildRuntime, createBotService, defaultStatusWriter };

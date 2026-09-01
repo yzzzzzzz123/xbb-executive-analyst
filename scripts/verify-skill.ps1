@@ -19,7 +19,7 @@ foreach ($file in @(
     (Join-Path $projectRoot 'shared\xbb\render-chart.js'),
     (Join-Path $projectRoot 'shared\wecom\server.js'),
     (Join-Path $projectRoot 'tests\verify-facts.js'),
-    (Join-Path $projectRoot 'tests\verify-wecom-callback.js'),
+    (Join-Path $projectRoot 'tests\verify-wecom-long-connection.js'),
     $validator
 )) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Required verification file is missing: $file" }
