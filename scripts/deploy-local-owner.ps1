@@ -48,33 +48,38 @@ if ($authentication.ExitCode -eq 0 -and $null -ne $authentication.Payload -and $
     }
 }
 
-Write-Host 'A five-minute pairing phrase is being generated. Send the displayed pairingPhrase to the bot in a WeCom private chat.' -ForegroundColor Cyan
-
-$startInfo = [Diagnostics.ProcessStartInfo]::new()
-$startInfo.FileName = 'node.exe'
-$startInfo.Arguments = '"' + $discover + '"'
-$startInfo.WorkingDirectory = $projectRoot
-$startInfo.UseShellExecute = $false
-$startInfo.RedirectStandardOutput = $true
-$startInfo.RedirectStandardError = $false
-$startInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
-$startInfo.CreateNoWindow = $true
-
-$process = [Diagnostics.Process]::new()
-$process.StartInfo = $startInfo
-if (-not $process.Start()) { throw 'Unable to start WeCom USERID pairing.' }
-
 $binding = $null
-while (-not $process.StandardOutput.EndOfStream) {
-    $line = $process.StandardOutput.ReadLine()
-    if (-not [string]::IsNullOrWhiteSpace($line)) { Write-Host $line }
-    try {
-        $value = $line | ConvertFrom-Json
-        if ($value.success -and -not [string]::IsNullOrWhiteSpace([string]$value.userId)) { $binding = $value }
-    } catch {}
+while ($null -eq $binding) {
+    Write-Host 'A five-minute pairing phrase is being generated. Send the displayed pairingPhrase to the bot in a WeCom private chat.' -ForegroundColor Cyan
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'node.exe'
+    $startInfo.Arguments = '"' + $discover + '"'
+    $startInfo.WorkingDirectory = $projectRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $false
+    $startInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $startInfo.CreateNoWindow = $true
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) { throw 'Unable to start WeCom USERID pairing.' }
+
+    while (-not $process.StandardOutput.EndOfStream) {
+        $line = $process.StandardOutput.ReadLine()
+        if (-not [string]::IsNullOrWhiteSpace($line)) { Write-Host $line }
+        try {
+            $value = $line | ConvertFrom-Json
+            if ($value.success -and -not [string]::IsNullOrWhiteSpace([string]$value.userId)) { $binding = $value }
+        } catch {}
+    }
+    $process.WaitForExit()
+    if ($null -eq $binding) {
+        Write-Host 'Pairing was not completed. A fresh five-minute phrase will be generated automatically.' -ForegroundColor Yellow
+        Start-Sleep -Seconds 2
+    }
 }
-$process.WaitForExit()
-if ($process.ExitCode -ne 0 -or $null -eq $binding) { throw 'WeCom USERID pairing was not completed. Run this script again.' }
 
 & $configurePolicy -UserId ([string]$binding.userId) -AllowAll | Out-Null
 Write-Host 'Group-wide read-only access was configured for the paired USERID.' -ForegroundColor Green
