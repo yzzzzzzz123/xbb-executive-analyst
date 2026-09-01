@@ -32,7 +32,12 @@
 
 ## 模型与工具
 
-- 模型端点必须支持兼容 Chat Completions 的 `messages`、`tools`、`tool_calls` 协议。生产运行没有 mock、样例或固定答复回退。
+- 默认模型入口是当前 Windows 用户已使用 ChatGPT 登录的本机 Codex CLI，不配置独立 OpenAI API Key、模型端点或模型名称。服务启动时必须校验登录模式为 ChatGPT。
+- 每个模型轮次使用 `codex exec --ephemeral`、`--sandbox read-only`、`--ignore-user-config` 和 `--ignore-rules`，在仓库外独立临时目录中运行；结构化输出必须在 `finally` 中删除。
+- 机器人默认使用 `model_reasoning_effort=medium` 与低输出冗余，在经营判断质量和最小化答复之间平衡；只能由部署配置显式调整推理强度，不得由用户消息修改。
+- 服务把标准 `messages`、唯一业务工具定义和 Skill 完整规则作为不可信数据边界内的结构化输入。Codex 不得调用内置 shell、文件、网络、MCP 或 Skill，只能返回兼容 `tool_calls` 的 JSON；外层服务验证后才可执行 `query_xbb`。
+- 子进程环境使用白名单，不继承企微 Secret、销帮帮凭证、API Key、Token 或其他业务密钥。生产运行没有 mock、样例或固定答复回退。
+- 仅作为兼容选项，代码仍可通过完整环境变量显式切换到 `chat-completions`；默认桌面部署和 DPAPI 配置不要求也不保存模型 API Key。
 - 模型只拥有 `query_xbb` 一个业务工具。工具参数经过白名单校验，且事实包在传给模型前再次验证实时只读来源、隐私标志和 SHA-256 完整性。
 - 模型失败或 runner 失败只返回失败状态，不使用陈旧数据；明文事实包在 `finally` 中删除。
 

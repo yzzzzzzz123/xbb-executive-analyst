@@ -11,7 +11,7 @@
         ↕ 官方 WebSocket 长连接
 shared/wecom
         ↓ USERID 访问控制
-shared/agent（真实模型工具调用）
+shared/agent（本机 Codex，ChatGPT 登录）
         ↓ query_xbb
 skills/xbb-executive-analyst/scripts/query-xbb.ps1
         ↓
@@ -26,7 +26,7 @@ skills/xbb-executive-analyst/scripts/query-xbb.ps1
 - 普通员工在“工作台”中能看到“智能机器人”及“创建”按钮；若企业策略隐藏或禁止创建，才需要管理员开放入口。
 - Windows PowerShell 5.1。
 - Node.js 22 或更高版本。
-- 一个支持 Chat Completions `messages`、`tools`、`tool_calls` 的真实模型端点。
+- 本机已安装 Codex CLI，并在运行机器人的同一 Windows 用户下使用 ChatGPT 登录；执行 `codex login status` 应显示 `Logged in using ChatGPT`。
 - 销帮帮只读凭证已存在于 `%LOCALAPPDATA%\Codex\xbb-openapi\credentials.json`。
 
 首次克隆后安装锁定依赖：
@@ -54,29 +54,23 @@ npm ci
 - 企业微信官方 Node.js SDK：https://github.com/WecomTeam/aibot-node-sdk
 - 国内版客户端创建长连接机器人的当前操作指引：https://cloud.tencent.cn/document/product/1831/137051
 
-## 2. 安全配置 Bot、模型与本地策略路径
+## 2. 安全配置 Bot 与本地策略路径
 
 ```powershell
 cd D:\codex\xbb-executive-analyst
 
-& .\scripts\configure-bot.ps1 `
-  -WecomBotId '企微页面显示的Bot ID' `
-  -ModelEndpoint 'https://你的模型服务/v1/chat/completions' `
-  -ModelName '支持工具调用的模型名称'
+& .\scripts\configure-bot.ps1 -WecomBotId '企微页面显示的Bot ID'
 ```
 
-脚本随后安全读取：
+脚本随后只安全读取企业微信机器人 Secret。模型直接复用本机 Codex 的 ChatGPT 登录，不询问也不保存 OpenAI API Key、模型接口地址或模型名称。
 
-1. 企业微信机器人 Secret。
-2. 模型 API Key；本机免鉴权回环模型可以直接回车。
-
-Secret 和模型 Key 使用 Windows DPAPI CurrentUser 加密，保存到：
+Secret 使用 Windows DPAPI CurrentUser 加密，保存到：
 
 ```text
 %LOCALAPPDATA%\Codex\xbb-executive-analyst\bot-config.json
 ```
 
-配置文件版本固定为长连接版 `2.0`。旧 URL 回调配置不会被误读。
+配置文件版本固定为本机 Codex 长连接版 `3.0`。旧 URL 回调配置和旧外部模型版配置不会被误读；升级时重新运行配置脚本即可。
 
 ## 3. 一次性识别实际企业微信 USERID
 
@@ -162,6 +156,8 @@ Secret 和模型 Key 使用 Windows DPAPI CurrentUser 加密，保存到：
 
 群聊中先添加机器人，再通过 `@机器人名称` 提问。正确结果应先显示真实运行状态，随后由完整最终答复覆盖；模型或 runner 失败时只返回失败，不使用固定文案数据、样例或旧结果。
 
+每轮分析由服务启动一次临时的本机 Codex 非交互任务：不保存 Codex 会话，只使用只读沙箱，临时结构化结果随后删除。公司权限和 `query_xbb` 执行仍由服务层强制，Codex 本身不能绕过授权直接取数。
+
 至少验证：
 
 - 集团级用户可查询真实集团数据。
@@ -203,12 +199,15 @@ Get-ScheduledTask -TaskName 'Codex-XBB-Executive-Analyst-WeCom' |
 - `XBB_WECOM_MAX_RECONNECT_ATTEMPTS`，默认 `-1` 无限重连
 - `XBB_WECOM_HEARTBEAT_MS`
 - `XBB_WECOM_REQUEST_TIMEOUT_MS`
-- `XBB_MODEL_ENDPOINT`
-- `XBB_MODEL_API_KEY`
-- `XBB_MODEL_NAME`
+- `XBB_MODEL_PROVIDER`，默认 `local-codex`
+- `XBB_MODEL_TIMEOUT_MS`，默认 300000 毫秒
+- `XBB_CODEX_COMMAND`，仅在无法自动定位 Codex CLI 时指定绝对可执行文件路径
+- `XBB_CODEX_REASONING_EFFORT`，默认 `medium`；可显式改为 `minimal`、`low`、`high` 或模型支持的 `xhigh`
 - `XBB_ACCESS_POLICY_PATH`
 
-只要环境变量不是完整配置，服务就读取 DPAPI 安全配置。普通桌面部署优先使用安全配置脚本，避免 Secret 出现在进程环境中。
+只要 Bot ID 与 Secret 环境变量不完整，服务就读取 DPAPI 安全配置。普通桌面部署优先使用安全配置脚本，避免 Secret 出现在进程环境中。
+
+代码保留显式 `chat-completions` 兼容入口，但它不是默认部署方式；只有主动设置 `XBB_MODEL_PROVIDER=chat-completions` 时，才需要同时提供 `XBB_MODEL_ENDPOINT`、`XBB_MODEL_NAME` 和可选的 `XBB_MODEL_API_KEY`。
 
 ## 验证
 
@@ -217,7 +216,7 @@ npm test
 & .\scripts\verify-skill.ps1
 ```
 
-验证覆盖事实编译、图表安全、访问控制、模型工具循环、长连接消息处理、排重、流式回复、隐私日志、连接配置和一次性 USERID 识别。测试构造数据只验证确定性代码，不会进入生产 runner 或作为答复回退。
+验证覆盖事实编译、图表安全、访问控制、模型工具循环、本机 Codex 临时目录与环境隔离、长连接消息处理、排重、流式回复、隐私日志、连接配置和一次性 USERID 识别。测试构造数据只验证确定性代码，不会进入生产 runner 或作为答复回退。
 
 ## 运行边界
 
@@ -225,5 +224,6 @@ npm test
 - 明文事实包只存在于单次临时目录，成功或失败后删除。
 - 五分钟业务缓存使用 Windows 当前用户 DPAPI 加密。
 - 用户问题、事实包、跟进摘录、Bot Secret、模型 Key 和销帮帮凭证不落盘、不进日志。
+- 本机 Codex 使用 ChatGPT 登录，不单独配置模型 API Key；调用采用临时会话、只读沙箱和环境变量白名单。
 - 机器人只读，不发送 CRM 消息、不创建记录、不推进商机、不写回销帮帮。
 - 一个 Bot ID 同时只运行一个正式长连接；新进程会使旧连接离线。

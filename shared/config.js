@@ -80,28 +80,46 @@ function validateEndpoint(value) {
   return url.toString();
 }
 
+function validateReasoningEffort(value) {
+  if (!["minimal", "low", "medium", "high", "xhigh"].includes(value)) {
+    throw new Error("Codex 推理强度只支持 minimal、low、medium、high 或 xhigh。");
+  }
+  return value;
+}
+
 function loadConfig(options = {}) {
   const env = options.env || process.env;
   const localRoot = options.localRoot || defaultLocalRoot();
   const configPath = path.resolve(envValue(env, "XBB_BOT_CONFIG_PATH", path.join(localRoot, "bot-config.json")));
 
   let stored = {};
-  const hasCompleteEnv = env.XBB_WECOM_BOT_ID && env.XBB_WECOM_BOT_SECRET && env.XBB_MODEL_ENDPOINT && env.XBB_MODEL_NAME;
+  const hasCompleteEnv = env.XBB_WECOM_BOT_ID && env.XBB_WECOM_BOT_SECRET;
   if (!hasCompleteEnv) stored = readSecureConfig(configPath);
 
   const transport = buildWecomConfig(env, stored);
+  const modelProvider = envValue(env, "XBB_MODEL_PROVIDER", stored.modelProvider || "local-codex");
+  if (!["local-codex", "chat-completions"].includes(modelProvider)) {
+    throw new Error("模型提供方式只支持 local-codex 或 chat-completions。");
+  }
 
   const config = {
     ...transport,
-    modelEndpoint: validateEndpoint(envValue(env, "XBB_MODEL_ENDPOINT", stored.modelEndpoint)),
-    modelApiKey: envValue(env, "XBB_MODEL_API_KEY", stored.modelApiKey || ""),
-    modelName: envValue(env, "XBB_MODEL_NAME", stored.modelName),
-    modelTimeoutMs: parseInteger(envValue(env, "XBB_MODEL_TIMEOUT_MS", stored.modelTimeoutMs || 120000), "模型超时", 1000, 360000),
+    modelProvider,
+    modelTimeoutMs: parseInteger(envValue(env, "XBB_MODEL_TIMEOUT_MS", stored.modelTimeoutMs || 300000), "模型超时", 1000, 600000),
     accessPolicyPath: path.resolve(envValue(env, "XBB_ACCESS_POLICY_PATH", stored.accessPolicyPath || path.join(localRoot, "access-policy.json")))
   };
 
-  if (typeof config.modelName !== "string" || !config.modelName.trim()) throw new Error("模型名称未配置。");
+  if (modelProvider === "local-codex") {
+    const codexCommand = envValue(env, "XBB_CODEX_COMMAND", stored.codexCommand);
+    if (codexCommand) config.codexCommand = codexCommand;
+    config.codexReasoningEffort = validateReasoningEffort(envValue(env, "XBB_CODEX_REASONING_EFFORT", stored.codexReasoningEffort || "medium"));
+  } else {
+    config.modelEndpoint = validateEndpoint(envValue(env, "XBB_MODEL_ENDPOINT", stored.modelEndpoint));
+    config.modelApiKey = envValue(env, "XBB_MODEL_API_KEY", stored.modelApiKey || "");
+    config.modelName = envValue(env, "XBB_MODEL_NAME", stored.modelName);
+    if (typeof config.modelName !== "string" || !config.modelName.trim()) throw new Error("模型名称未配置。");
+  }
   return Object.freeze(config);
 }
 
-module.exports = { defaultLocalRoot, loadConfig, loadWecomConfig, validateEndpoint, validateWebSocketEndpoint };
+module.exports = { defaultLocalRoot, loadConfig, loadWecomConfig, validateEndpoint, validateReasoningEffort, validateWebSocketEndpoint };

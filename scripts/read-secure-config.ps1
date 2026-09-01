@@ -14,9 +14,9 @@ if (-not [IO.File]::Exists($resolved)) {
 }
 
 $stored = Get-Content -LiteralPath $resolved -Raw -Encoding UTF8 | ConvertFrom-Json
-if ([string]$stored.schemaVersion -ne '2.0') { throw '机器人安全配置不是 WebSocket 长连接版 2.0，请重新运行 configure-bot.ps1。' }
+if ([string]$stored.schemaVersion -ne '3.0') { throw '机器人安全配置不是本机 Codex 长连接版 3.0，请重新运行 configure-bot.ps1。' }
 $requiredFields = @('wecomBotId', 'wecomBotSecretDpapi')
-if (-not $WecomOnly) { $requiredFields += @('modelEndpoint', 'modelName', 'accessPolicyPath') }
+if (-not $WecomOnly) { $requiredFields += @('modelProvider', 'accessPolicyPath') }
 foreach ($field in $requiredFields) {
     if ([string]::IsNullOrWhiteSpace([string]$stored.$field)) { throw "机器人安全配置缺少字段：$field" }
 }
@@ -34,7 +34,6 @@ function Unprotect-Value([string]$ProtectedValue) {
 }
 
 $botSecret = Unprotect-Value ([string]$stored.wecomBotSecretDpapi)
-$modelApiKey = if ($WecomOnly -or [string]::IsNullOrWhiteSpace([string]$stored.modelApiKeyDpapi)) { '' } else { Unprotect-Value ([string]$stored.modelApiKeyDpapi) }
 try {
     $result = [ordered]@{
         wecomBotId = [string]$stored.wecomBotId
@@ -45,14 +44,12 @@ try {
         wecomRequestTimeoutMs = if ($stored.PSObject.Properties.Name -contains 'wecomRequestTimeoutMs') { [int]$stored.wecomRequestTimeoutMs } else { 10000 }
     }
     if (-not $WecomOnly) {
-        $result['modelEndpoint'] = [string]$stored.modelEndpoint
-        $result['modelApiKey'] = $modelApiKey
-        $result['modelName'] = [string]$stored.modelName
-        $result['modelTimeoutMs'] = if ($stored.PSObject.Properties.Name -contains 'modelTimeoutMs') { [int]$stored.modelTimeoutMs } else { 120000 }
+        $result['modelProvider'] = [string]$stored.modelProvider
+        $result['codexReasoningEffort'] = if ($stored.PSObject.Properties.Name -contains 'codexReasoningEffort') { [string]$stored.codexReasoningEffort } else { 'medium' }
+        $result['modelTimeoutMs'] = if ($stored.PSObject.Properties.Name -contains 'modelTimeoutMs') { [int]$stored.modelTimeoutMs } else { 300000 }
         $result['accessPolicyPath'] = [string]$stored.accessPolicyPath
     }
     $result | ConvertTo-Json -Compress
 } finally {
     $botSecret = $null
-    $modelApiKey = $null
 }

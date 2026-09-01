@@ -84,10 +84,10 @@ function frame(messageId, userId, msgtype, body) {
   const config = loadConfig({ env: {
     XBB_WECOM_BOT_ID: "aibot_test",
     XBB_WECOM_BOT_SECRET: "secret-test",
-    XBB_MODEL_ENDPOINT: "https://model.example/v1/chat/completions",
-    XBB_MODEL_NAME: "tool-model",
     XBB_ACCESS_POLICY_PATH: "D:\\policy.json"
   } });
+  assert.equal(config.modelProvider, "local-codex");
+  assert.equal(config.codexReasoningEffort, "medium");
   assert.equal(config.wecomWsUrl, "wss://openws.work.weixin.qq.com/");
   assert.equal(config.wecomMaxReconnectAttempts, -1);
   assert.equal(Object.hasOwn(config, "callbackPath"), false);
@@ -96,6 +96,16 @@ function frame(messageId, userId, msgtype, body) {
   const transportOnly = loadWecomConfig({ env: { XBB_WECOM_BOT_ID: "aibot_transport", XBB_WECOM_BOT_SECRET: "transport-secret" } });
   assert.equal(transportOnly.wecomBotId, "aibot_transport");
   assert.equal(Object.hasOwn(transportOnly, "modelEndpoint"), false);
+
+  const externalModel = loadConfig({ env: {
+    XBB_WECOM_BOT_ID: "aibot_external",
+    XBB_WECOM_BOT_SECRET: "external-secret",
+    XBB_MODEL_PROVIDER: "chat-completions",
+    XBB_MODEL_ENDPOINT: "https://model.example/v1/chat/completions",
+    XBB_MODEL_NAME: "tool-model",
+    XBB_ACCESS_POLICY_PATH: "D:\\policy.json"
+  } });
+  assert.equal(externalModel.modelProvider, "chat-completions");
 
   let capturedOptions;
   const serviceClient = new FakeClient();
@@ -129,7 +139,7 @@ function frame(messageId, userId, msgtype, body) {
   assert.equal(pairingClient.disconnected, true);
   assert.equal(pairingOutput[0].pairingPhrase, `绑定 ${pairingCode}`);
 
-  process.stdout.write(`${JSON.stringify({ success: true, checks: 34 })}\n`);
+  process.stdout.write(`${JSON.stringify({ success: true, checks: 37 })}\n`);
 })().catch((error) => {
   process.stderr.write(`${error.stack}\n`);
   process.exitCode = 1;

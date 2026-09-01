@@ -2,6 +2,7 @@
 
 const { WSClient } = require("@wecom/aibot-node-sdk");
 const { loadConfig } = require("../config.js");
+const { createCodexCliClient, verifyCodexChatGptLogin } = require("../agent/codex-cli-client.js");
 const { createChatCompletionsClient } = require("../agent/chat-completions-client.js");
 const { createExecutiveAgent } = require("../agent/executive-agent.js");
 const { loadSystemPrompt } = require("../agent/system-prompt.js");
@@ -12,7 +13,10 @@ const { createPrivacyLogger } = require("./privacy-logger.js");
 
 function buildRuntime(config) {
   const policy = loadAccessPolicy(config.accessPolicyPath);
-  const modelClient = createChatCompletionsClient(config);
+  if (config.modelProvider === "local-codex") verifyCodexChatGptLogin(config);
+  const modelClient = config.modelProvider === "chat-completions"
+    ? createChatCompletionsClient(config)
+    : createCodexCliClient(config);
   const queryXbb = createToolGateway();
   const agent = createExecutiveAgent({ modelClient, queryXbb, systemPrompt: loadSystemPrompt() });
   return createLongConnectionHandler({ policy, agent });

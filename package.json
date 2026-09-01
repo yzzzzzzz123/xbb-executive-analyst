@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node shared/wecom/server.js",
-    "test": "node tests/verify-facts.js && node tests/verify-charts.js && node tests/verify-access-control.js && node tests/verify-agent-tool-loop.js && node tests/verify-wecom-long-connection.js && powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\tests\\verify-secure-config.ps1",
+    "test": "node tests/verify-facts.js && node tests/verify-charts.js && node tests/verify-access-control.js && node tests/verify-agent-tool-loop.js && node tests/verify-codex-cli-client.js && node tests/verify-wecom-long-connection.js && powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\tests\\verify-secure-config.ps1",
     "verify": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\verify-skill.ps1"
   },
   "dependencies": {

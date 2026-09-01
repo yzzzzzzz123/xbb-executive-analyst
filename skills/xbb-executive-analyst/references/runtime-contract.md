@@ -10,7 +10,7 @@
 - 确定性事实编译：项目公共实现 `shared/xbb/build-fact-pack.js`
 - 按需图表：`scripts/render-chart.ps1` → 项目公共实现 `shared/xbb/render-chart.js`
 
-不存在网页服务、HTML、驾驶舱、工作台、静态发布器、局域网代理或嵌套模型调用。
+不存在网页服务、HTML、驾驶舱、工作台、静态发布器、局域网代理或嵌套模型调用。企业微信服务中的本机 Codex 是该请求的顶层分析模型；Codex 对话模式仍禁止再次执行 `codex exec`。
 
 ## Runner
 
@@ -60,3 +60,6 @@
 - 来源包和事实包必须通过记录哈希与隐私扫描。电话、邮箱或常见凭据模式命中时失败关闭。
 - XBB 限流、网络错误、字段缺失、哈希错误、实体不唯一、缓存错误或图表验证错误都不能触发假数据回退。
 - 所有 XBB API 调用均为读取；不得向本 Skill 增加写接口。
+- 企业微信服务调用本机 Codex 时必须使用 `--ephemeral`、只读沙箱以及独立的单次临时目录；临时 schema 和结构化答复在成功或失败后均删除。
+- Codex 子进程只继承启动和 ChatGPT 登录所需的环境变量白名单，不得继承企微 Secret、销帮帮凭证、模型 API Key 或其他业务 Secret。
+- 本机 Codex 只能返回 `query_xbb` 的结构化请求；不得由 Codex 内置 shell、文件、网络、MCP 或 Skill 直接读取业务数据。授权与 runner 调用必须留在服务层。
