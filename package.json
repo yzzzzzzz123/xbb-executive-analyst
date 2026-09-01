@@ -9,10 +9,12 @@
   },
   "scripts": {
     "start": "node shared/wecom/server.js",
-    "test": "node tests/verify-facts.js && node tests/verify-charts.js && node tests/verify-access-control.js && node tests/verify-agent-tool-loop.js && node tests/verify-codex-cli-client.js && node tests/verify-wecom-long-connection.js && powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\tests\\verify-secure-config.ps1",
+    "smoke:app-server": "node scripts/smoke-codex-app-server.js",
+    "test": "node tests/verify-facts.js && node tests/verify-charts.js && node tests/verify-access-control.js && node tests/verify-codex-app-server.js && node tests/verify-wecom-long-connection.js && powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\tests\\verify-secure-config.ps1",
     "verify": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\verify-skill.ps1"
   },
   "dependencies": {
-    "@wecom/aibot-node-sdk": "1.0.7"
+    "@wecom/aibot-node-sdk": "1.0.7",
+    "ws": "8.21.3"
   }
 }

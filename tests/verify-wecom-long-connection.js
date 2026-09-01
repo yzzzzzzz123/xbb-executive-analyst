@@ -7,6 +7,7 @@ const { createBotService } = require("../shared/wecom/server.js");
 const { checkAuthentication } = require("../shared/wecom/check-auth.js");
 const { loadConfig, loadWecomConfig, validateWebSocketEndpoint } = require("../shared/config.js");
 const { createPairingCode, discoverUser } = require("../shared/wecom/discover-user.js");
+const { safeStatus } = require("../shared/wecom/status-writer.js");
 
 class FakeClient extends EventEmitter {
   constructor() {
@@ -44,10 +45,13 @@ function frame(messageId, userId, msgtype, body) {
   const policy = { schemaVersion: "1.0", users: { boss: { scope: "all" } } };
   let agentCalls = 0;
   const agent = {
-    answer: async ({ question, access }) => {
+    answer: async ({ question, access, principalKey, messageId, onProgress }) => {
       agentCalls += 1;
       assert.equal(question, "集团9月业绩排名");
       assert.equal(access.scope, "all");
+      assert.match(principalKey, /^[a-f0-9]{64}$/);
+      assert.equal(messageId, "msg-1");
+      await onProgress("正在查询销帮帮实时只读数据，请稍候……");
       return "集团9月业绩排名已生成（MTD）。";
     }
   };
@@ -57,26 +61,27 @@ function frame(messageId, userId, msgtype, body) {
 
   const textFrame = frame("msg-1", "boss", "text", { text: { content: "集团9月业绩排名" } });
   await handler.handleMessage(textFrame, client);
-  assert.deepEqual(client.replies.map((reply) => reply.finish), [false, true]);
-  assert.match(client.replies[0].content, /正在查询/);
-  assert.equal(client.replies[1].content, "集团9月业绩排名已生成（MTD）。");
+  assert.deepEqual(client.replies.map((reply) => reply.finish), [false, false, true]);
+  assert.match(client.replies[0].content, /Codex 经营分析 Agent 正在处理/);
+  assert.match(client.replies[1].content, /正在查询销帮帮实时只读数据/);
+  assert.equal(client.replies[2].content, "集团9月业绩排名已生成（MTD）。");
   assert.equal(agentCalls, 1);
 
   await handler.handleMessage(textFrame, client);
-  assert.equal(client.replies[2].streamId, "stream-1");
-  assert.equal(client.replies[2].finish, true);
+  assert.equal(client.replies[3].streamId, "stream-1");
+  assert.equal(client.replies[3].finish, true);
   assert.equal(agentCalls, 1);
 
   const denied = frame("msg-2", "unknown", "text", { text: { content: "集团业绩" } });
   await handler.handleMessage(denied, client);
-  assert.equal(client.replies[3].finish, true);
-  assert.match(client.replies[3].content, /尚未获准/);
+  assert.equal(client.replies[4].finish, true);
+  assert.match(client.replies[4].content, /尚未获准/);
   assert.equal(agentCalls, 1);
 
   const image = frame("msg-3", "boss", "image", { image: { url: "https://invalid.example/image" } });
   await handler.handleMessage(image, client);
-  assert.equal(client.replies[4].finish, true);
-  assert.match(client.replies[4].content, /仅支持文字/);
+  assert.equal(client.replies[5].finish, true);
+  assert.match(client.replies[5].content, /仅支持文字/);
 
   assert.equal(extractQuestion({ msgtype: "voice", voice: { content: "语音问题" } }), "语音问题");
   assert.equal(extractQuestion({ msgtype: "mixed", mixed: { msg_item: [{ msgtype: "image" }, { msgtype: "text", text: { content: "图文问题" } }] } }), "图文问题");
@@ -87,11 +92,13 @@ function frame(messageId, userId, msgtype, body) {
     XBB_WECOM_BOT_SECRET: "secret-test",
     XBB_ACCESS_POLICY_PATH: "D:\\policy.json"
   } });
-  assert.equal(config.modelProvider, "local-codex");
+  assert.equal(config.modelProvider, "codex-app-server");
   assert.equal(config.codexModel, "gpt-5.6-sol");
   assert.equal(config.codexReasoningEffort, "max");
   assert.equal(config.wecomWsUrl, "wss://openws.work.weixin.qq.com/");
   assert.equal(config.wecomMaxReconnectAttempts, -1);
+  assert.match(config.agentStatePath, /agent-state\.json$/);
+  assert.match(config.statusLogPath, /status\.jsonl$/);
   assert.equal(Object.hasOwn(config, "callbackPath"), false);
   assert.throws(() => validateWebSocketEndpoint("ws://public.example"), /必须使用 WSS/);
   assert.equal(validateWebSocketEndpoint("ws://127.0.0.1:9000"), "ws://127.0.0.1:9000/");
@@ -99,15 +106,12 @@ function frame(messageId, userId, msgtype, body) {
   assert.equal(transportOnly.wecomBotId, "aibot_transport");
   assert.equal(Object.hasOwn(transportOnly, "modelEndpoint"), false);
 
-  const externalModel = loadConfig({ env: {
+  assert.throws(() => loadConfig({ env: {
     XBB_WECOM_BOT_ID: "aibot_external",
     XBB_WECOM_BOT_SECRET: "external-secret",
     XBB_MODEL_PROVIDER: "chat-completions",
-    XBB_MODEL_ENDPOINT: "https://model.example/v1/chat/completions",
-    XBB_MODEL_NAME: "tool-model",
     XBB_ACCESS_POLICY_PATH: "D:\\policy.json"
-  } });
-  assert.equal(externalModel.modelProvider, "chat-completions");
+  } }), /只支持 codex-app-server/);
 
   let capturedOptions;
   const serviceClient = new FakeClient();
@@ -124,7 +128,7 @@ function frame(messageId, userId, msgtype, body) {
   assert.equal(capturedOptions.maxReconnectAttempts, -1);
   serviceClient.emit("authenticated");
   assert.equal(statuses.at(-1).status, "ready");
-  service.stop();
+  await service.stop();
   assert.equal(serviceClient.disconnected, true);
 
   const pairingClient = new FakeClient();
@@ -151,8 +155,10 @@ function frame(messageId, userId, msgtype, body) {
   const rejectedAuth = checkAuthentication({ client: rejectedAuthClient, timeoutMs: 1000 });
   rejectedAuthClient.emit("error", new Error("Authentication failed: invalid secret (code: 853000)"));
   assert.deepEqual(await rejectedAuth, { success: false, stage: "authentication", errorCode: 853000 });
+  assert.deepEqual(Object.keys(safeStatus({ status: "ready", secret: "must-not-appear" })), ["at", "status", "transport"]);
+  assert.throws(() => safeStatus({ status: "unknown" }), /未知机器人状态/);
 
-  process.stdout.write(`${JSON.stringify({ success: true, checks: 42 })}\n`);
+  process.stdout.write(`${JSON.stringify({ success: true, checks: 51 })}\n`);
 })().catch((error) => {
   process.stderr.write(`${error.stack}\n`);
   process.exitCode = 1;

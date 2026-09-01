@@ -14,13 +14,14 @@
 - 初次部署可运行 bundled 一次性识别入口。它仅接受本机随机生成、五分钟有效的完整绑定口令，只在本机标准输出显示命中的 USERID，不加载访问策略、模型或销帮帮数据，并在成功或超时后断开。
 - 正式服务启动前必须建立访问策略。未登记 USERID 在模型和销帮帮查询前失败关闭；公司级授权必须在模型调用前和 runner 调用时双重强制。
 - SDK debug 日志必须关闭。服务日志不得记录消息正文、完整帧、USERID、事实包、跟进摘录、Secret、模型 Key 或销帮帮凭证。
+- 允许在仓库外写入有大小上限的状态 JSONL，但字段只能包含时间、固定状态枚举、传输类型和重试次数；不得写入线程 ID、端口、用户或业务内容。
 
 ## 消息与流式回复
 
 - 以 `msgid` 做十分钟内存排重；同一消息重投不得重复调用模型或 runner。
 - 只读取文字、语音转文字和图文混排中的文字。图片、文件、视频及下载地址不进入模型。
-- 首次回复沿用收到帧的 `headers.req_id`，生成唯一 stream id，并在调用模型前发送“正在查询”的真实运行状态，`finish=false`。
-- 模型完成后使用同一帧和 stream id 返回完整最终内容，`finish=true`。最终内容是覆盖式全文，不是增量片段，UTF-8 长度不得超过 20480 字节。
+- 首次回复沿用收到帧的 `headers.req_id`，生成唯一 stream id，并在调用 Codex Agent 前发送“正在处理”的真实运行状态，`finish=false`；问候语不应伪称已经查询销帮帮。
+- Codex commentary 或真正发起 `query_xbb` 时可用同一 stream id 覆盖当前进度，仍为 `finish=false`。最终答复使用同一帧和 stream id 返回完整内容，`finish=true`；每次都是覆盖式全文，不是增量片段，UTF-8 长度不得超过 20480 字节。
 - 发送首次状态失败时不得调用模型或 runner；最终回复失败时保留内存排重状态，企微重投可重发相同最终结果。
 - 服务只输出文字经营分析，不上传事实包、跟进证据或 CRM 附件。模型失败或 runner 失败只返回失败状态，不使用陈旧数据、样例或固定答复。
 
@@ -29,16 +30,16 @@
 - 使用官方 SDK 自动认证、心跳和指数退避重连；正式配置的最大重连次数为 `-1`，直到人工停止进程。
 - 认证成功只输出不含业务数据的 `ready` 状态；连接错误、断开和重连日志只输出固定状态及重试次数，不输出 SDK 原始错误或消息帧。
 - 进程收到 `SIGINT` 或 `SIGTERM` 时主动断开。Windows 登录计划任务必须使用创建 DPAPI 配置的同一当前用户。
+- 计划任务应直接执行 Node 服务入口，不得再包一层长期 PowerShell 宿主；停止任务时必须同时结束 Node 与其 App Server 子进程，避免同一 Bot ID 出现孤儿连接。
 - 电脑关机、睡眠、休眠、断网或用户未登录时机器人离线；当前部署不是开机前运行的 Windows Service。
 
 ## 模型与工具
 
-- 默认模型入口是当前 Windows 用户已使用 ChatGPT 登录的本机 Codex CLI，不配置独立 OpenAI API Key、模型端点或模型名称。服务启动时必须校验登录模式为 ChatGPT。
-- 每个模型轮次使用 `codex exec --ephemeral`、`--sandbox read-only`、`--ignore-user-config` 和 `--ignore-rules`，在仓库外独立临时目录中运行；结构化输出必须在 `finally` 中删除。
+- 默认模型入口是当前 Windows 用户已使用 ChatGPT 登录的本机 Codex App Server，不配置独立 OpenAI API Key 或模型端点。服务启动时必须校验登录模式为 ChatGPT。
+- 桥接进程启动一个回环地址、capability-token 鉴权的 Codex App Server，并按授权主体维护持久 Thread；不得每条消息执行一次 `codex exec`，不得把 Codex 当无状态 JSON 生成器。
 - 机器人显式使用当前质量优先配置 `gpt-5.6-sol`、`model_reasoning_effort=max` 与低输出冗余；这是旗舰能力优先而非时延优先的部署选择，只能由部署配置修改，不得由用户消息修改。
-- 服务把标准 `messages`、唯一业务工具定义和 Skill 完整规则作为不可信数据边界内的结构化输入。Codex 不得调用内置 shell、文件、网络、MCP 或 Skill，只能返回兼容 `tool_calls` 的 JSON；外层服务验证后才可执行 `query_xbb`。
-- 子进程环境使用白名单，不继承企微 Secret、销帮帮凭证、API Key、Token 或其他业务密钥。生产运行没有 mock、样例或固定答复回退。
-- 仅作为兼容选项，代码仍可通过完整环境变量显式切换到 `chat-completions`；默认桌面部署和 DPAPI 配置不要求也不保存模型 API Key。
+- 每个 Turn 显式传入 `xbb-executive-analyst` Skill，并在 Thread 级完整加载本 Skill 与引用合同。用户消息只能作为不可信经营问题，不能修改 Agent 身份、授权或工具边界。
+- 子进程环境使用白名单，不继承企微 Secret、销帮帮凭证、API Key、Token 或其他业务密钥。生产运行没有 `chat-completions` 兼容分支、mock、样例或固定答复回退。
 - 模型只拥有 `query_xbb` 一个业务工具。工具参数经过白名单校验，且事实包在传给模型前再次验证实时只读来源、隐私标志和 SHA-256 完整性。
 - 模型失败或 runner 失败只返回失败状态，不使用陈旧数据；明文事实包在 `finally` 中删除。
 

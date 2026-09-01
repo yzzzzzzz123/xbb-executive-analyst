@@ -34,6 +34,13 @@ class MessageStore {
     state.updatedAt = this.now();
   }
 
+  update(messageId, content) {
+    const state = this.messages.get(messageId);
+    if (!state || state.finish) return;
+    state.content = content;
+    state.updatedAt = this.now();
+  }
+
   delete(messageId) {
     this.messages.delete(messageId);
   }

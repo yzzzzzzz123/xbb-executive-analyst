@@ -11,8 +11,10 @@
         ↕ 官方 WebSocket 长连接
 shared/wecom
         ↓ USERID 访问控制
-shared/agent（本机 Codex，ChatGPT 登录，gpt-5.6-sol/max）
-        ↓ query_xbb
+shared/codex（回环 App Server + 每授权主体持久 Thread）
+        ↓ 每轮显式 xbb-executive-analyst Skill
+Codex Agent（ChatGPT 登录，gpt-5.6-sol/max）
+        ↓ 唯一动态工具 query_xbb
 skills/xbb-executive-analyst/scripts/query-xbb.ps1
         ↓
 真实只读销帮帮数据
@@ -70,7 +72,7 @@ Secret 使用 Windows DPAPI CurrentUser 加密，保存到：
 %LOCALAPPDATA%\Codex\xbb-executive-analyst\bot-config.json
 ```
 
-配置文件版本固定为本机 Codex 长连接版 `3.0`。旧 URL 回调配置和旧外部模型版配置不会被误读；升级时重新运行配置脚本即可。
+配置文件版本固定为本机 Codex App Server Agent 版 `4.0`。升级已有 3.0 配置时可以运行 `scripts/migrate-app-server-config.ps1`，脚本只迁移非敏感字段并原样保留 DPAPI 密文，不要求再次输入 Secret。
 
 若希望从凭据输入到后台任务一次完成，运行：
 
@@ -164,7 +166,9 @@ Secret 使用 Windows DPAPI CurrentUser 加密，保存到：
 
 群聊中先添加机器人，再通过 `@机器人名称` 提问。正确结果应先显示真实运行状态，随后由完整最终答复覆盖；模型或 runner 失败时只返回失败，不使用固定文案数据、样例或旧结果。
 
-每轮分析由服务启动一次临时的本机 Codex 非交互任务：不保存 Codex 会话，只使用只读沙箱，临时结构化结果随后删除。公司权限和 `query_xbb` 执行仍由服务层强制，Codex 本身不能绕过授权直接取数。
+机器人后端是一个真正的专用 Codex Agent：桥接进程启动仅监听 `127.0.0.1` 的本机 App Server，并按“USERID + 当前授权范围”的不可逆摘要维护持久 Thread；进程重启后恢复 Thread，上下文不会跨用户共享。每轮都显式加载 `xbb-executive-analyst` Skill。空闲时使用 `turn/start`，同一用户在当前任务仍处理中继续提问时使用 `turn/steer`。
+
+App Server 使用内存中的随机 capability token；命令行只有 token 的 SHA-256 校验值。模型运行在只读、无网络、永不申请批准的沙箱中。公司权限和 `query_xbb` 执行仍由桥接服务层强制，明文事实包由工具网关在 `finally` 中清除。
 
 至少验证：
 
@@ -195,7 +199,7 @@ Get-ScheduledTask -TaskName 'Codex-XBB-Executive-Analyst-WeCom' |
 & .\scripts\uninstall-wecom-task.ps1
 ```
 
-任务以配置凭据的同一个 Windows 用户、有限权限和隐藏窗口运行，登录后自动启动。电脑关机、睡眠、休眠、断网或用户尚未登录时机器人不在线；当前脚本不是开机前运行的 Windows Service。
+任务以配置凭据的同一个 Windows 用户、有限权限和隐藏窗口直接执行 Node 服务入口，登录后自动启动。直接执行避免停止计划任务时遗留 Node/App Server 子进程。电脑关机、睡眠、休眠、断网或用户尚未登录时机器人不在线；当前脚本不是开机前运行的 Windows Service。
 
 ## 环境变量部署
 
@@ -207,8 +211,10 @@ Get-ScheduledTask -TaskName 'Codex-XBB-Executive-Analyst-WeCom' |
 - `XBB_WECOM_MAX_RECONNECT_ATTEMPTS`，默认 `-1` 无限重连
 - `XBB_WECOM_HEARTBEAT_MS`
 - `XBB_WECOM_REQUEST_TIMEOUT_MS`
-- `XBB_MODEL_PROVIDER`，默认 `local-codex`
-- `XBB_MODEL_TIMEOUT_MS`，默认 300000 毫秒
+- `XBB_MODEL_PROVIDER`，正式运行时只能是 `codex-app-server`
+- `XBB_AGENT_TURN_TIMEOUT_MS`，默认 900000 毫秒
+- `XBB_AGENT_STATE_PATH`，默认 `%LOCALAPPDATA%\Codex\xbb-executive-analyst\agent-state.json`
+- `XBB_STATUS_LOG_PATH`，默认 `%LOCALAPPDATA%\Codex\xbb-executive-analyst\status.jsonl`，只记录固定连接/Agent 状态枚举
 - `XBB_CODEX_COMMAND`，仅在无法自动定位 Codex CLI 时指定绝对可执行文件路径
 - `XBB_CODEX_MODEL`，正式默认 `gpt-5.6-sol`
 - `XBB_CODEX_REASONING_EFFORT`，正式默认 `max`；也支持 `minimal`、`low`、`medium`、`high` 或 `xhigh`
@@ -216,7 +222,7 @@ Get-ScheduledTask -TaskName 'Codex-XBB-Executive-Analyst-WeCom' |
 
 只要 Bot ID 与 Secret 环境变量不完整，服务就读取 DPAPI 安全配置。普通桌面部署优先使用安全配置脚本，避免 Secret 出现在进程环境中。
 
-代码保留显式 `chat-completions` 兼容入口，但它不是默认部署方式；只有主动设置 `XBB_MODEL_PROVIDER=chat-completions` 时，才需要同时提供 `XBB_MODEL_ENDPOINT`、`XBB_MODEL_NAME` 和可选的 `XBB_MODEL_API_KEY`。
+正式代码不保留外部 `chat-completions` 或每消息一次的临时 Codex 兼容分支，避免机器人退化为无上下文的模型调用器。
 
 ## 验证
 
@@ -225,14 +231,16 @@ npm test
 & .\scripts\verify-skill.ps1
 ```
 
-验证覆盖事实编译、图表安全、访问控制、模型工具循环、本机 Codex 临时目录与环境隔离、长连接消息处理、排重、流式回复、隐私日志、连接配置和一次性 USERID 识别。测试构造数据只验证确定性代码，不会进入生产 runner 或作为答复回退。
+验证覆盖事实编译、图表安全、访问控制、App Server 协议、capability token 边界、持久 Thread 恢复与隔离、`turn/steer`、受控工具循环、长连接消息处理、排重、流式回复、隐私日志、连接配置和一次性 USERID 识别。测试构造数据只验证确定性代码，不会进入生产 runner 或作为答复回退。
 
 ## 运行边界
 
 - 官方 SDK 的 debug 日志被隐私 logger 禁用，不记录消息正文或企微帧。
+- 仓库外状态日志只记录时间、连接状态和重试次数，不记录 USERID、消息正文、线程 ID、Secret 或业务事实。
 - 明文事实包只存在于单次临时目录，成功或失败后删除。
 - 五分钟业务缓存使用 Windows 当前用户 DPAPI 加密。
-- 用户问题、事实包、跟进摘录、Bot Secret、模型 Key 和销帮帮凭证不落盘、不进日志。
-- 本机 Codex 使用 ChatGPT 登录，不单独配置模型 API Key；调用采用临时会话、只读沙箱和环境变量白名单。
+- 为实现持久上下文，用户问题和通过隐私/完整性校验的工具结果会进入该授权主体自己的本机 Codex Thread 历史；它们不进入项目仓库、状态 JSONL 或企微 SDK 日志，也不会跨 USERID/授权范围共享。明文 runner 文件仍会在 `finally` 删除。
+- 未脱敏跟进原文、Bot Secret、模型 Key 和销帮帮凭证不进入 Codex Thread 或服务日志。
+- 本机 Codex 使用 ChatGPT 登录，不单独配置模型 API Key；调用采用持久 Thread、只读无网络沙箱和环境变量白名单。
 - 机器人只读，不发送 CRM 消息、不创建记录、不推进商机、不写回销帮帮。
 - 一个 Bot ID 同时只运行一个正式长连接；新进程会使旧连接离线。

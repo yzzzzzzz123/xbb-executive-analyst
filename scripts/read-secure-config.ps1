@@ -14,7 +14,8 @@ if (-not [IO.File]::Exists($resolved)) {
 }
 
 $stored = Get-Content -LiteralPath $resolved -Raw -Encoding UTF8 | ConvertFrom-Json
-if ([string]$stored.schemaVersion -ne '3.0') { throw '机器人安全配置不是本机 Codex 长连接版 3.0，请重新运行 configure-bot.ps1。' }
+$schemaVersion = [string]$stored.schemaVersion
+if ($schemaVersion -notin @('3.0', '4.0')) { throw '机器人安全配置不是受支持的本机 Codex Agent 长连接版，请重新运行 configure-bot.ps1。' }
 $requiredFields = @('wecomBotId', 'wecomBotSecretDpapi')
 if (-not $WecomOnly) { $requiredFields += @('modelProvider', 'accessPolicyPath') }
 foreach ($field in $requiredFields) {
@@ -44,10 +45,12 @@ try {
         wecomRequestTimeoutMs = if ($stored.PSObject.Properties.Name -contains 'wecomRequestTimeoutMs') { [int]$stored.wecomRequestTimeoutMs } else { 10000 }
     }
     if (-not $WecomOnly) {
-        $result['modelProvider'] = [string]$stored.modelProvider
+        $result['modelProvider'] = 'codex-app-server'
         $result['codexModel'] = 'gpt-5.6-sol'
         $result['codexReasoningEffort'] = 'max'
-        $result['modelTimeoutMs'] = if ($stored.PSObject.Properties.Name -contains 'modelTimeoutMs') { [int]$stored.modelTimeoutMs } else { 300000 }
+        $result['agentTurnTimeoutMs'] = if ($stored.PSObject.Properties.Name -contains 'agentTurnTimeoutMs') { [int]$stored.agentTurnTimeoutMs } else { 900000 }
+        $result['agentStatePath'] = if ($stored.PSObject.Properties.Name -contains 'agentStatePath') { [string]$stored.agentStatePath } else { Join-Path ([IO.Path]::GetDirectoryName($resolved)) 'agent-state.json' }
+        $result['statusLogPath'] = if ($stored.PSObject.Properties.Name -contains 'statusLogPath') { [string]$stored.statusLogPath } else { Join-Path ([IO.Path]::GetDirectoryName($resolved)) 'status.jsonl' }
         $result['accessPolicyPath'] = [string]$stored.accessPolicyPath
     }
     $result | ConvertTo-Json -Compress

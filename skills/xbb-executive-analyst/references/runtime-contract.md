@@ -10,7 +10,7 @@
 - 确定性事实编译：项目公共实现 `shared/xbb/build-fact-pack.js`
 - 按需图表：`scripts/render-chart.ps1` → 项目公共实现 `shared/xbb/render-chart.js`
 
-不存在网页服务、HTML、驾驶舱、工作台、静态发布器、局域网代理或嵌套模型调用。企业微信服务中的本机 Codex 是该请求的顶层分析模型；Codex 对话模式仍禁止再次执行 `codex exec`。
+不存在网页服务、HTML、驾驶舱、工作台、静态发布器、局域网代理或嵌套模型调用。企业微信服务中的本机 Codex App Server 是顶层分析 Agent；Codex 对话模式仍禁止启动第二个 Codex。
 
 ## Runner
 
@@ -60,6 +60,11 @@
 - 来源包和事实包必须通过记录哈希与隐私扫描。电话、邮箱或常见凭据模式命中时失败关闭。
 - XBB 限流、网络错误、字段缺失、哈希错误、实体不唯一、缓存错误或图表验证错误都不能触发假数据回退。
 - 所有 XBB API 调用均为读取；不得向本 Skill 增加写接口。
-- 企业微信服务调用本机 Codex 时必须使用 `--ephemeral`、只读沙箱以及独立的单次临时目录；临时 schema 和结构化答复在成功或失败后均删除。
-- Codex 子进程只继承启动和 ChatGPT 登录所需的环境变量白名单，不得继承企微 Secret、销帮帮凭证、模型 API Key 或其他业务 Secret。
-- 本机 Codex 只能返回 `query_xbb` 的结构化请求；不得由 Codex 内置 shell、文件、网络、MCP 或 Skill 直接读取业务数据。授权与 runner 调用必须留在服务层。
+- 企业微信桥接拥有唯一一个本机 Codex App Server 子进程，必须只监听动态分配的 `127.0.0.1` WebSocket 端口，使用内存中的随机 capability token 连接；进程参数只允许出现 token 的 SHA-256 校验值，原始 token 不得进入命令行、状态文件或日志。
+- App Server 只继承启动和 ChatGPT 登录所需的环境变量白名单，不得继承企微 Secret、销帮帮凭证、模型 API Key 或其他业务 Secret。每轮使用只读沙箱、关闭网络并固定 `approvalPolicy=never`。
+- 每个已授权 USERID 与授权范围组合只能映射到自己的不可逆 principal 摘要和持久 Thread；状态保存在仓库外。Thread 在进程重启后通过 `thread/resume` 恢复，合约变化或授权范围变化时必须新建；不同用户上下文不得合并。
+- 持久 Thread 会在当前 Windows 用户的 Codex 本地历史中保存用户问题与已通过隐私/完整性校验的工具结果，这是提供连续上下文的必要数据；不得声称这些内容完全不落盘。仓库外 Agent 状态文件只保存 principal 摘要、Thread ID 和合约摘要，不保存问题或事实包。
+- 企业微信问题通过 `turn/start` 进入空闲 Thread；同一用户在本轮仍活跃时通过 `turn/steer` 追加。桥接进程重启时发现未完成 Turn，应先中断再接收新问题，不能把无调用方的旧任务继续发布。
+- App Server Thread 注册且只注册 `query_xbb` 这一项业务动态工具。Codex 不得用内置 shell、文件、网络、MCP 或 Skill 直接读取业务数据；授权与 bundled runner 调用必须留在桥接服务层。
+- Codex 0.151.x 的 `dynamicTools` 协议要求客户端声明 `experimentalApi=true`；该声明只用于注册受控 `query_xbb`，不能借此增加其他业务工具、运行时工作区或未验收的实验能力。
+- 工具网关最多接受四轮调用，逐次校验参数、USERID 授权范围、事实包实时只读来源、隐私标志与 SHA-256 完整性，并在 `finally` 删除明文事实包。

@@ -2,32 +2,31 @@
 
 const { WSClient } = require("@wecom/aibot-node-sdk");
 const { loadConfig } = require("../config.js");
-const { createCodexCliClient, verifyCodexChatGptLogin } = require("../agent/codex-cli-client.js");
-const { createChatCompletionsClient } = require("../agent/chat-completions-client.js");
-const { createExecutiveAgent } = require("../agent/executive-agent.js");
-const { loadSystemPrompt } = require("../agent/system-prompt.js");
+const { PersistentCodexAgent } = require("../codex/persistent-agent.js");
 const { loadAccessPolicy } = require("../security/access-control.js");
-const { createToolGateway } = require("../xbb/tool-gateway.js");
 const { createLongConnectionHandler } = require("./long-connection-handler.js");
 const { createPrivacyLogger } = require("./privacy-logger.js");
+const { createStatusWriter } = require("./status-writer.js");
 
-function buildRuntime(config) {
+async function buildRuntime(config, options = {}) {
   const policy = loadAccessPolicy(config.accessPolicyPath);
-  if (config.modelProvider === "local-codex") verifyCodexChatGptLogin(config);
-  const modelClient = config.modelProvider === "chat-completions"
-    ? createChatCompletionsClient(config)
-    : createCodexCliClient(config);
-  const queryXbb = createToolGateway();
-  const agent = createExecutiveAgent({ modelClient, queryXbb, systemPrompt: loadSystemPrompt() });
-  return createLongConnectionHandler({ policy, agent });
+  const agent = options.agent || new PersistentCodexAgent(config);
+  await agent.start();
+  const handler = createLongConnectionHandler({ policy, agent });
+  return Object.freeze({
+    handleMessage: (frame, client) => handler.handleMessage(frame, client),
+    close: () => agent.close(),
+    onFatal: (listener) => agent.on("fatal", listener)
+  });
 }
 
-function defaultStatusWriter(status) {
-  process.stdout.write(`${JSON.stringify(status)}\n`);
+function defaultStatusWriter(status, output = process.stdout) {
+  output.write(`${JSON.stringify(status)}\n`);
 }
 
-function createBotService(config, runtime = buildRuntime(config), options = {}) {
-  const statusWriter = options.statusWriter || defaultStatusWriter;
+function createBotService(config, runtime, options = {}) {
+  if (!runtime?.handleMessage) throw new Error("企业微信机器人运行时尚未初始化。");
+  const statusWriter = options.statusWriter || createStatusWriter({ logPath: config.statusLogPath });
   const clientFactory = options.clientFactory || ((clientOptions) => new WSClient(clientOptions));
   const client = clientFactory({
     botId: config.wecomBotId,
@@ -48,35 +47,48 @@ function createBotService(config, runtime = buildRuntime(config), options = {}) 
       .catch(() => statusWriter({ status: "message_failed", transport: "wecom-websocket" }));
   });
 
+  let stopped = false;
+  const stop = async () => {
+    if (stopped) return;
+    stopped = true;
+    client.disconnect();
+    if (typeof runtime.close === "function") await runtime.close();
+  };
+  if (typeof runtime.onFatal === "function") {
+    runtime.onFatal(() => {
+      statusWriter({ status: "agent_failed", transport: "wecom-websocket" });
+      void stop().finally(() => { if (options.exitOnFatal) process.exitCode = 1; });
+    });
+  }
+
   return Object.freeze({
     client,
     start() {
       statusWriter({ status: "connecting", transport: "wecom-websocket" });
       client.connect();
     },
-    stop() {
-      client.disconnect();
-    }
+    stop
   });
 }
 
 if (require.main === module) {
-  try {
+  void (async () => {
     const config = loadConfig();
-    const service = createBotService(config);
+    const runtime = await buildRuntime(config);
+    const service = createBotService(config, runtime, { exitOnFatal: true });
     let stopping = false;
-    const shutdown = () => {
+    const shutdown = async () => {
       if (stopping) return;
       stopping = true;
-      service.stop();
+      await service.stop();
     };
-    process.once("SIGINT", shutdown);
-    process.once("SIGTERM", shutdown);
+    process.once("SIGINT", () => { void shutdown(); });
+    process.once("SIGTERM", () => { void shutdown(); });
     service.start();
-  } catch (error) {
+  })().catch((error) => {
     process.stderr.write(`${error.message}\n`);
     process.exitCode = 1;
-  }
+  });
 }
 
 module.exports = { buildRuntime, createBotService, defaultStatusWriter };

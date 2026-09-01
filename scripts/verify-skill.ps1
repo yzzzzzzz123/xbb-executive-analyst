@@ -18,7 +18,10 @@ foreach ($file in @(
     (Join-Path $projectRoot 'shared\xbb\build-fact-pack.js'),
     (Join-Path $projectRoot 'shared\xbb\render-chart.js'),
     (Join-Path $projectRoot 'shared\wecom\server.js'),
+    (Join-Path $projectRoot 'shared\codex\persistent-agent.js'),
+    (Join-Path $projectRoot 'scripts\smoke-codex-app-server.js'),
     (Join-Path $projectRoot 'tests\verify-facts.js'),
+    (Join-Path $projectRoot 'tests\verify-codex-app-server.js'),
     (Join-Path $projectRoot 'tests\verify-wecom-long-connection.js'),
     $validator
 )) {
@@ -27,6 +30,7 @@ foreach ($file in @(
 
 $javascriptFiles = @(
     Get-ChildItem -LiteralPath (Join-Path $projectRoot 'shared') -Filter '*.js' -File -Recurse
+    Get-ChildItem -LiteralPath (Join-Path $projectRoot 'scripts') -Filter '*.js' -File -Recurse
     Get-ChildItem -LiteralPath (Join-Path $projectRoot 'tests') -Filter '*.js' -File -Recurse
 )
 foreach ($file in $javascriptFiles) {
@@ -73,6 +77,12 @@ if ($htmlFiles.Count -ne 0) { throw "HTML is forbidden in the formal Skill/runti
 $forbiddenRuntime = & rg -n --glob '!node_modules/**' --glob '!test-results/**' --glob '!verify-skill.ps1' 'serve-published|publish-codex-analysis|xbb-visual-shell|销帮帮经营分析-老板驾驶舱Demo' $projectRoot 2>$null
 if ($LASTEXITCODE -eq 0 -and $forbiddenRuntime) { throw "Legacy Demo runtime remains: $($forbiddenRuntime -join [Environment]::NewLine)" }
 if ($LASTEXITCODE -notin @(0, 1)) { throw 'Legacy runtime scan failed.' }
+
+$legacyAgentFiles = @(Get-ChildItem -LiteralPath (Join-Path $projectRoot 'shared\agent') -File -ErrorAction SilentlyContinue)
+if ($legacyAgentFiles.Count -ne 0) { throw "Legacy shared/agent files remain: $($legacyAgentFiles.FullName -join ', ')" }
+$forbiddenModelLoop = & rg -n 'createCodexCliClient|createChatCompletionsClient|"exec",\s*"--ephemeral"|modelProvider\s*===\s*"chat-completions"' (Join-Path $projectRoot 'shared') (Join-Path $projectRoot 'package.json') 2>$null
+if ($LASTEXITCODE -eq 0 -and $forbiddenModelLoop) { throw "Legacy model loop remains: $($forbiddenModelLoop -join [Environment]::NewLine)" }
+if ($LASTEXITCODE -notin @(0, 1)) { throw 'Legacy model loop scan failed.' }
 
 Write-Output ([ordered]@{
     success = $true

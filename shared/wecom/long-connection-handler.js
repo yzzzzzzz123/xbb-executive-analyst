@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { principalKeyFromUserId } = require("../codex/persistent-agent.js");
 const { authorize, AccessDeniedError } = require("../security/access-control.js");
 const { MessageStore } = require("./message-store.js");
 
@@ -33,7 +34,13 @@ function validateFrame(frame) {
   return message;
 }
 
-function createLongConnectionHandler({ policy, agent, messageStore = new MessageStore(), streamIdFactory = defaultStreamId }) {
+function createLongConnectionHandler({
+  policy,
+  agent,
+  messageStore = new MessageStore(),
+  streamIdFactory = defaultStreamId,
+  principalKeyFactory = principalKeyFromUserId
+}) {
   if (!policy || !agent?.answer) throw new Error("企业微信长连接处理器初始化参数不完整。");
 
   return Object.freeze({
@@ -55,7 +62,7 @@ function createLongConnectionHandler({ policy, agent, messageStore = new Message
       }
 
       const initialContent = question
-        ? "正在查询销帮帮实时数据，请稍候……"
+        ? "Codex 经营分析 Agent 正在处理，请稍候……"
         : "目前仅支持文字、语音转文字或图文中的文字经营问题。";
       const { state, isNew } = messageStore.begin({ messageId, userId, streamId: streamIdFactory(), content: initialContent });
 
@@ -74,7 +81,20 @@ function createLongConnectionHandler({ policy, agent, messageStore = new Message
 
       let answer;
       try {
-        answer = await agent.answer({ question, access });
+        let delivery = Promise.resolve();
+        const onProgress = (content) => {
+          messageStore.update(messageId, content);
+          delivery = delivery.then(() => client.replyStream(frame, state.streamId, content, false));
+          return delivery;
+        };
+        answer = await agent.answer({
+          question,
+          access,
+          principalKey: principalKeyFactory(userId, access),
+          messageId,
+          onProgress
+        });
+        await delivery;
       } catch (error) {
         answer = operationalFailure(error);
       }

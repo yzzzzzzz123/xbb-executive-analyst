@@ -70,16 +70,6 @@ function validateWebSocketEndpoint(value) {
   return url.toString();
 }
 
-function validateEndpoint(value) {
-  let url;
-  try { url = new URL(value); } catch { throw new Error("模型接口必须是完整 URL。"); }
-  const loopback = ["127.0.0.1", "localhost", "::1"].includes(url.hostname);
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
-    throw new Error("模型接口必须使用 HTTPS；仅回环地址允许 HTTP。");
-  }
-  return url.toString();
-}
-
 function validateReasoningEffort(value) {
   if (!["minimal", "low", "medium", "high", "xhigh", "max"].includes(value)) {
     throw new Error("Codex 推理强度只支持 minimal、low、medium、high、xhigh 或 max。");
@@ -94,6 +84,15 @@ function validateCodexModel(value) {
   return value;
 }
 
+function requireOutsideProject(value, label) {
+  const resolved = path.resolve(value);
+  const relative = path.relative(projectRoot, resolved);
+  if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+    throw new Error(`${label}必须位于项目仓库外。`);
+  }
+  return resolved;
+}
+
 function loadConfig(options = {}) {
   const env = options.env || process.env;
   const localRoot = options.localRoot || defaultLocalRoot();
@@ -104,30 +103,24 @@ function loadConfig(options = {}) {
   if (!hasCompleteEnv) stored = readSecureConfig(configPath);
 
   const transport = buildWecomConfig(env, stored);
-  const modelProvider = envValue(env, "XBB_MODEL_PROVIDER", stored.modelProvider || "local-codex");
-  if (!["local-codex", "chat-completions"].includes(modelProvider)) {
-    throw new Error("模型提供方式只支持 local-codex 或 chat-completions。");
-  }
+  const modelProvider = envValue(env, "XBB_MODEL_PROVIDER", "codex-app-server");
+  if (modelProvider !== "codex-app-server") throw new Error("正式运行时只支持 codex-app-server。");
 
   const config = {
     ...transport,
     modelProvider,
-    modelTimeoutMs: parseInteger(envValue(env, "XBB_MODEL_TIMEOUT_MS", stored.modelTimeoutMs || 300000), "模型超时", 1000, 600000),
+    projectRoot,
+    codexModel: validateCodexModel(envValue(env, "XBB_CODEX_MODEL", stored.codexModel || "gpt-5.6-sol")),
+    codexReasoningEffort: validateReasoningEffort(envValue(env, "XBB_CODEX_REASONING_EFFORT", stored.codexReasoningEffort || "max")),
+    agentTurnTimeoutMs: parseInteger(envValue(env, "XBB_AGENT_TURN_TIMEOUT_MS", stored.agentTurnTimeoutMs || 900000), "Codex Agent 单轮超时", 30000, 1800000),
+    agentStatePath: requireOutsideProject(envValue(env, "XBB_AGENT_STATE_PATH", stored.agentStatePath || path.join(localRoot, "agent-state.json")), "Codex Agent 状态文件"),
+    statusLogPath: requireOutsideProject(envValue(env, "XBB_STATUS_LOG_PATH", stored.statusLogPath || path.join(localRoot, "status.jsonl")), "机器人状态日志"),
     accessPolicyPath: path.resolve(envValue(env, "XBB_ACCESS_POLICY_PATH", stored.accessPolicyPath || path.join(localRoot, "access-policy.json")))
   };
 
-  if (modelProvider === "local-codex") {
-    const codexCommand = envValue(env, "XBB_CODEX_COMMAND", stored.codexCommand);
-    if (codexCommand) config.codexCommand = codexCommand;
-    config.codexModel = validateCodexModel(envValue(env, "XBB_CODEX_MODEL", stored.codexModel || "gpt-5.6-sol"));
-    config.codexReasoningEffort = validateReasoningEffort(envValue(env, "XBB_CODEX_REASONING_EFFORT", stored.codexReasoningEffort || "max"));
-  } else {
-    config.modelEndpoint = validateEndpoint(envValue(env, "XBB_MODEL_ENDPOINT", stored.modelEndpoint));
-    config.modelApiKey = envValue(env, "XBB_MODEL_API_KEY", stored.modelApiKey || "");
-    config.modelName = envValue(env, "XBB_MODEL_NAME", stored.modelName);
-    if (typeof config.modelName !== "string" || !config.modelName.trim()) throw new Error("模型名称未配置。");
-  }
+  const codexCommand = envValue(env, "XBB_CODEX_COMMAND", stored.codexCommand);
+  if (codexCommand) config.codexCommand = codexCommand;
   return Object.freeze(config);
 }
 
-module.exports = { defaultLocalRoot, loadConfig, loadWecomConfig, validateCodexModel, validateEndpoint, validateReasoningEffort, validateWebSocketEndpoint };
+module.exports = { defaultLocalRoot, loadConfig, loadWecomConfig, requireOutsideProject, validateCodexModel, validateReasoningEffort, validateWebSocketEndpoint };
