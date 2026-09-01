@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const { createLongConnectionHandler, extractQuestion } = require("../shared/wecom/long-connection-handler.js");
 const { createBotService } = require("../shared/wecom/server.js");
+const { checkAuthentication } = require("../shared/wecom/check-auth.js");
 const { loadConfig, loadWecomConfig, validateWebSocketEndpoint } = require("../shared/config.js");
 const { createPairingCode, discoverUser } = require("../shared/wecom/discover-user.js");
 
@@ -140,7 +141,18 @@ function frame(messageId, userId, msgtype, body) {
   assert.equal(pairingClient.disconnected, true);
   assert.equal(pairingOutput[0].pairingPhrase, `绑定 ${pairingCode}`);
 
-  process.stdout.write(`${JSON.stringify({ success: true, checks: 38 })}\n`);
+  const authClient = new FakeClient();
+  const authCheck = checkAuthentication({ client: authClient, timeoutMs: 1000 });
+  authClient.emit("authenticated");
+  assert.deepEqual(await authCheck, { success: true, stage: "authenticated" });
+  assert.equal(authClient.disconnected, true);
+
+  const rejectedAuthClient = new FakeClient();
+  const rejectedAuth = checkAuthentication({ client: rejectedAuthClient, timeoutMs: 1000 });
+  rejectedAuthClient.emit("error", new Error("Authentication failed: invalid secret (code: 853000)"));
+  assert.deepEqual(await rejectedAuth, { success: false, stage: "authentication", errorCode: 853000 });
+
+  process.stdout.write(`${JSON.stringify({ success: true, checks: 42 })}\n`);
 })().catch((error) => {
   process.stderr.write(`${error.stack}\n`);
   process.exitCode = 1;

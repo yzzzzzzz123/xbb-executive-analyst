@@ -42,7 +42,8 @@ $powershellFiles = @(
 foreach ($file in $powershellFiles) {
     $parseTokens = $null
     $parseErrors = $null
-    [void][Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$parseTokens, [ref]$parseErrors)
+    $source = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8
+    [void][Management.Automation.Language.Parser]::ParseInput($source, $file.FullName, [ref]$parseTokens, [ref]$parseErrors)
     if (@($parseErrors).Count -gt 0) { throw "PowerShell syntax check failed: $($file.FullName) - $($parseErrors -join '; ')" }
 }
 

@@ -37,11 +37,13 @@ $policy.users | Add-Member -NotePropertyName $UserId -NotePropertyValue $rule -F
 
 $json = $policy | ConvertTo-Json -Depth 20
 $temporary = "$resolved.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
+$backup = "$resolved.bak-$PID-$([Guid]::NewGuid().ToString('N'))"
 [IO.File]::WriteAllText($temporary, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
 try {
-    if ([IO.File]::Exists($resolved)) { [IO.File]::Replace($temporary, $resolved, $null) } else { [IO.File]::Move($temporary, $resolved) }
+    if ([IO.File]::Exists($resolved)) { [IO.File]::Replace($temporary, $resolved, $backup) } else { [IO.File]::Move($temporary, $resolved) }
 } finally {
     if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+    if ([IO.File]::Exists($backup)) { [IO.File]::Delete($backup) }
 }
 
 Write-Output ([ordered]@{ success = $true; path = $resolved; userId = $UserId; scope = $rule.scope } | ConvertTo-Json -Compress)

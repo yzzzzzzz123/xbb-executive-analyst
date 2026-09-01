@@ -6,6 +6,7 @@
 - 正式传输只使用企业微信官方 `@wecom/aibot-node-sdk` WebSocket 长连接，以 Bot ID 和 Secret 认证。国内版默认地址是 `wss://openws.work.weixin.qq.com`。
 - 服务主动建立出站连接，不监听业务 HTTP 端口，不要求公网 IP、域名、HTTPS 回调、反向代理、Token、EncodingAESKey 或 ReceiveId。
 - Bot Secret 使用 Windows DPAPI CurrentUser 保护并保存在仓库外。一个 Bot ID 同时只运行一个正式连接；后台任务与人工前台调试不得并行。
+- bundled 本机部署入口必须先做不回显 Secret 的单次鉴权检查；鉴权失败只显示阶段和企微错误码并允许重新输入。鉴权成功后才进入五分钟 USERID 绑定、集团只读策略写入以及登录计划任务安装，任何一步失败都不得伪报部署完成。
 
 ## 身份识别与访问控制
 

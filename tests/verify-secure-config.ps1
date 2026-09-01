@@ -6,6 +6,7 @@ Set-StrictMode -Version Latest
 
 $projectRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $configure = Join-Path $projectRoot 'scripts\configure-bot.ps1'
+$configurePolicy = Join-Path $projectRoot 'scripts\configure-access-policy.ps1'
 $reader = Join-Path $projectRoot 'scripts\read-secure-config.ps1'
 $expectedRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $testRoot = [IO.Path]::GetFullPath((Join-Path $expectedRoot ('xbb-secure-config-test-' + [Guid]::NewGuid().ToString('N'))))
@@ -38,7 +39,24 @@ try {
     if ($transport.PSObject.Properties.Name -contains 'modelApiKey') { throw 'Transport-only read exposed the model key.' }
     if ([string]$transport.wecomBotSecret -ne 'dummy-bot-secret-for-test') { throw 'Transport-only DPAPI read failed.' }
 
-    Write-Output ([ordered]@{ success = $true; checks = 10; schemaVersion = '3.0'; dpapi = 'CurrentUser'; modelProvider = 'local-codex'; codexModel = 'gpt-5.6-sol'; reasoning = 'max' } | ConvertTo-Json -Compress)
+    $updatedSecret = ConvertTo-SecureString 'updated-bot-secret-for-test' -AsPlainText -Force
+    & $configure `
+        -WecomBotId 'aibot_secure_updated' `
+        -WecomBotSecret $updatedSecret `
+        -AccessPolicyPath $policyPath `
+        -Path $configPath | Out-Null
+    $updated = (& $reader -Path $configPath -WecomOnly) | ConvertFrom-Json
+    if ([string]$updated.wecomBotId -ne 'aibot_secure_updated') { throw 'Atomic config replacement did not update Bot ID.' }
+    if ([string]$updated.wecomBotSecret -ne 'updated-bot-secret-for-test') { throw 'Atomic config replacement did not update the DPAPI secret.' }
+    if (@(Get-ChildItem -LiteralPath $testRoot -File | Where-Object { $_.Name -like 'bot-config.json.tmp-*' -or $_.Name -like 'bot-config.json.bak-*' }).Count -ne 0) { throw 'Atomic config replacement left temporary files.' }
+
+    & $configurePolicy -UserId 'first-user' -AllowAll -Path $policyPath | Out-Null
+    & $configurePolicy -UserId 'second-user' -AllowAll -Path $policyPath | Out-Null
+    $policy = Get-Content -LiteralPath $policyPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([string]$policy.users.'first-user'.scope -ne 'all' -or [string]$policy.users.'second-user'.scope -ne 'all') { throw 'Atomic access policy replacement did not preserve and add users.' }
+    if (@(Get-ChildItem -LiteralPath $testRoot -File | Where-Object { $_.Name -like 'access-policy.json.tmp-*' -or $_.Name -like 'access-policy.json.bak-*' }).Count -ne 0) { throw 'Atomic access policy replacement left temporary files.' }
+
+    Write-Output ([ordered]@{ success = $true; checks = 16; schemaVersion = '3.0'; dpapi = 'CurrentUser'; modelProvider = 'local-codex'; codexModel = 'gpt-5.6-sol'; reasoning = 'max'; atomicReplace = 'passed' } | ConvertTo-Json -Compress)
 } finally {
     if ([IO.Directory]::Exists($testRoot)) {
         $verified = [IO.Path]::GetFullPath($testRoot)

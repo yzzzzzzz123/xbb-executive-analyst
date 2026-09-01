@@ -50,11 +50,13 @@ $stored = [ordered]@{
 }
 $json = $stored | ConvertTo-Json -Depth 10
 $temporary = "$resolved.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
+$backup = "$resolved.bak-$PID-$([Guid]::NewGuid().ToString('N'))"
 [IO.File]::WriteAllText($temporary, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
 try {
-    if ([IO.File]::Exists($resolved)) { [IO.File]::Replace($temporary, $resolved, $null) } else { [IO.File]::Move($temporary, $resolved) }
+    if ([IO.File]::Exists($resolved)) { [IO.File]::Replace($temporary, $resolved, $backup) } else { [IO.File]::Move($temporary, $resolved) }
 } finally {
     if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+    if ([IO.File]::Exists($backup)) { [IO.File]::Delete($backup) }
 }
 
 Write-Output ([ordered]@{ success = $true; transport = 'wecom-websocket'; modelProvider = 'local-codex'; botId = $WecomBotId; configPath = $resolved; accessPolicyPath = $resolvedPolicy; secrets = 'DPAPI CurrentUser' } | ConvertTo-Json -Compress)
