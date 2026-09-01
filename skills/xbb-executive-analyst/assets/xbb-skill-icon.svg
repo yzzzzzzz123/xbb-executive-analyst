@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">XBB Executive Analysis Skill</title>
+  <desc id="desc">Orange rounded square with a white stylized lowercase b and an indigo analysis spark.</desc>
+  <defs>
+    <linearGradient id="orange" x1="72" y1="52" x2="430" y2="462" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FF862F"/>
+      <stop offset="1" stop-color="#FF5A00"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#D64D00" flood-opacity=".24"/>
+    </filter>
+  </defs>
+  <rect x="42" y="42" width="428" height="428" rx="126" fill="url(#orange)" filter="url(#shadow)"/>
+  <path d="M177 127h72v83c23-25 53-38 89-38 68 0 112 49 112 123 0 83-52 135-134 135-43 0-79-12-107-37-23-21-32-49-32-93V127Zm72 177c0 41 23 66 61 66 39 0 65-28 65-71 0-42-24-68-61-68-39 0-65 28-65 73Z" fill="#fff"/>
+  <path d="m117 302 10 30 30 10-30 10-10 30-10-30-30-10 30-10 10-30Z" fill="#6A63FF"/>
+</svg>

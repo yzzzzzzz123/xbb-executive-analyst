@@ -1,0 +1,10 @@
+interface:
+  display_name: "销帮帮经营分析智能客服"
+  short_description: "基于真实只读销帮帮数据回答老板经营问题"
+  icon_small: "../assets/xbb-skill-icon.svg"
+  icon_large: "../assets/xbb-skill-icon.svg"
+  brand_color: "#F15A24"
+  default_prompt: "Use $xbb-executive-analyst to answer this executive operating question from configured live, read-only销帮帮 data. Return only the minimum decision-useful conclusions, generate at most one supporting SVG chart when it materially helps, and never use sample data, fixed analysis, HTML, dashboards, or CRM writes."
+
+policy:
+  allow_implicit_invocation: true

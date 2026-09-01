@@ -1,0 +1,819 @@
+"use strict";
+
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const ALLOWED_DOMAINS = new Set([
+  "performance",
+  "product-sales",
+  "courses",
+  "delivery",
+  "opportunities"
+]);
+const COURSE_CATEGORIES = new Set([
+  "opp", "考培", "训练营", "会员卡", "内训", "小巨人", "游学", "长才", "训战班",
+  "认证班", "通", "班", "课程", "方案班", "商业逻辑", "工作坊"
+]);
+const CONSULT_CATEGORIES = new Set(["商事服务", "用工风险", "咨询", "专项", "顾问", "微咨询", "调研"]);
+const ACTIVE_STAGES = new Set(["发现需求", "确认需求", "解决方案", "商务谈判"]);
+const STAGE_ORDER = ["发现需求", "确认需求", "解决方案", "商务谈判", "赢单", "输单"];
+const NEXT_ACTION_RE = /(明天|后天|本周|下周|\d{1,2}[月\/.\-]\d{1,2}|上午|下午|晚上|再次|回访|邀约|约见|发方案|报价|确认|安排|跟进|联系)/i;
+const DECISION_RE = /(老板|法人|总经理|董事长|决策|股东|负责人|实际控制人)/i;
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function asText(value) {
+  if (value === null || value === undefined) return "";
+  if (Array.isArray(value)) return value.map(asText).filter(Boolean).join("、");
+  if (typeof value === "object") return asText(value.name || value.text || value.label || value.value || value.id);
+  return String(value).trim();
+}
+
+function safeNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function field(record, attr) {
+  return record && record.fields ? record.fields[attr] : undefined;
+}
+
+function relationIds(value) {
+  const rows = Array.isArray(value) ? value : value ? [value] : [];
+  return rows.map((item) => {
+    if (item && typeof item === "object") return asText(item.id || item.value || item.dataId);
+    return asText(item);
+  }).filter(Boolean);
+}
+
+function relationId(value) {
+  return relationIds(value)[0] || "";
+}
+
+function entityId(record) {
+  if (record && record.entityId) return record.entityId;
+  const recordId = asText(record && record.recordId);
+  return recordId.startsWith("record_") ? `rel_${recordId.slice(7)}` : "";
+}
+
+function recordCompany(record, ...attrs) {
+  for (const attr of attrs) {
+    const value = asText(field(record, attr));
+    if (value) return value;
+  }
+  return "未标公司";
+}
+
+function groupBy(rows, keyFn) {
+  const result = new Map();
+  for (const row of rows) {
+    const key = keyFn(row);
+    if (!result.has(key)) result.set(key, []);
+    result.get(key).push(row);
+  }
+  return result;
+}
+
+function sum(rows, selector) {
+  return rows.reduce((total, row) => total + safeNumber(selector(row)), 0);
+}
+
+function percentage(part, total) {
+  return total > 0 ? part / total * 100 : 0;
+}
+
+function unique(values) {
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+function normalizeName(value) {
+  return asText(value).toLocaleLowerCase("zh-CN").replace(/[\s\-_·（）()]/g, "");
+}
+
+function localDate(timestamp) {
+  const value = safeNumber(timestamp);
+  if (!value) return "";
+  return new Date((value > 1e12 ? value : value * 1000)).toLocaleDateString("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  });
+}
+
+function mostFrequent(values, fallback = "未标公司") {
+  const counts = new Map();
+  for (const value of values.map(asText).filter(Boolean)) counts.set(value, (counts.get(value) || 0) + 1);
+  const sorted = Array.from(counts.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-CN"));
+  return sorted.length ? sorted[0][0] : fallback;
+}
+
+function bookingCompany(booking) {
+  const orderType = asText(field(booking, "text_7"));
+  if (orderType.includes("OPP")) return recordCompany(booking, "text_25", "text_36", "text_26");
+  if (orderType.includes("业绩")) return recordCompany(booking, "text_26", "text_36", "text_25");
+  return recordCompany(booking, "text_26", "text_25", "text_36");
+}
+
+function classifyProduct(product, fallbackName = "") {
+  const name = asText(field(product, "text_1")) || asText(fallbackName) || "未命名产品";
+  const categoryRaw = asText(field(product, "text_6"));
+  const category = categoryRaw.toLocaleLowerCase("zh-CN");
+  const frontBack = asText(field(product, "text_15")) || "未分类";
+  const classificationBasis = product ? "product-master" : (asText(fallbackName) ? "business-record-product-name" : "unclassified");
+  let businessType = "其他";
+  if (COURSE_CATEGORIES.has(category)) businessType = "课程";
+  else if (CONSULT_CATEGORIES.has(category)) businessType = "咨询";
+  else if (/(课程|研讨会|训练营|私训营|游学|沙龙|门票|opp|班|通$)/i.test(name)) businessType = "课程";
+  else if (/(咨询|顾问|专项|调研|服务)/i.test(name)) businessType = "咨询";
+  const isOpen = frontBack === "前端" || frontBack === "OPP" || category === "opp" || /(门票|开源|opp)/i.test(name);
+  const isTicket = /门票|票务/.test(name) || (category === "opp" && /票|opp/i.test(name));
+  const isCommercial = /商业操盘/.test(name);
+  return { name, category: categoryRaw || "未分类", frontBack, businessType, isOpen, isTicket, isCommercial, classificationBasis };
+}
+
+function productMap(source) {
+  return new Map((source.records.product || []).map((record) => [entityId(record), record]));
+}
+
+function userCompany(user) {
+  const departments = Array.isArray(user && user.departments) ? user.departments : [];
+  const preferred = departments.find((department) => /公司|集团|区域/.test(asText(department.name)));
+  return asText((preferred || departments[0] || {}).name) || "未标公司";
+}
+
+function userMap(source) {
+  return new Map((source.records.user || []).map((user) => [asText(user.userId), user]));
+}
+
+function productFor(record, attr, products) {
+  return products.get(relationId(field(record, attr)));
+}
+
+function evidenceRefs(rows) {
+  return unique(rows.map((row) => asText(row && row.evidenceRef)));
+}
+
+function dayTrend(rows, dateFn, valueFns) {
+  const byDay = new Map();
+  for (const row of rows) {
+    const day = dateFn(row);
+    if (!day) continue;
+    if (!byDay.has(day)) byDay.set(day, Object.fromEntries(Object.keys(valueFns).map((key) => [key, 0])));
+    const bucket = byDay.get(day);
+    for (const [key, selector] of Object.entries(valueFns)) bucket[key] += safeNumber(selector(row));
+  }
+  return Array.from(byDay.entries()).sort((a, b) => a[0].localeCompare(b[0])).map(([date, values]) => ({ date, ...values }));
+}
+
+function buildCourseFacts(source) {
+  const courses = source.records.course || [];
+  const bookings = source.records.booking || [];
+  const bookingsByCourse = groupBy(bookings, (booking) => relationId(field(booking, "text_2")));
+  return courses.map((course) => {
+    const linkedBookings = bookingsByCourse.get(entityId(course)) || [];
+    const bookedCustomers = safeNumber(field(course, "num_3")) || linkedBookings.length;
+    const dealOrders = safeNumber(field(course, "num_6"));
+    const primaryCompany = mostFrequent(linkedBookings.map(bookingCompany));
+    return {
+      entityId: entityId(course),
+      evidenceRef: course.evidenceRef,
+      evidenceRefs: unique([course.evidenceRef, ...evidenceRefs(linkedBookings)]),
+      name: asText(field(course, "text_1")) || "未命名课程",
+      type: asText(field(course, "text_10")) || "未分类课程",
+      status: asText(field(course, "text_7")) || "未标状态",
+      date: localDate(field(course, "date_1")),
+      timestamp: safeNumber(field(course, "date_1")),
+      primaryCompany,
+      primaryCompanyBasis: "同一课程约课记录中订单所属公司出现次数最多者；不是课程组织公司字段",
+      bookedCustomers,
+      firms: new Set(linkedBookings.map((booking) => asText(field(booking, "text_36")) || booking.recordId)).size,
+      bosses: sum(linkedBookings, (booking) => field(booking, "num_1")),
+      students: sum(linkedBookings, (booking) => field(booking, "num_2")),
+      dealOrders,
+      dealAmount: safeNumber(field(course, "num_9")),
+      paidAmount: safeNumber(field(course, "num_10")),
+      conversionRate: percentage(dealOrders, bookedCustomers),
+      linkedBookings
+    };
+  });
+}
+
+function collectCompanyCandidates(source, courseFacts) {
+  const counts = new Map();
+  const add = (name, domain) => {
+    const value = asText(name) || "未标公司";
+    const row = counts.get(value) || { name: value, recordCount: 0, domains: new Set() };
+    row.recordCount += 1;
+    row.domains.add(domain);
+    counts.set(value, row);
+  };
+  for (const row of source.records.performance || []) add(field(row, "text_3"), "performance");
+  for (const row of source.records.oppOrder || []) add(field(row, "text_6"), "product-sales");
+  for (const row of source.records.booking || []) add(bookingCompany(row), "courses");
+  for (const row of courseFacts) add(row.primaryCompany, "courses");
+  for (const row of source.records.opportunity || []) add(field(row, "text_11"), "opportunities");
+  for (const user of source.records.user || []) {
+    const company = userCompany(user);
+    if (/公司|集团|区域/.test(company)) add(company, "users");
+  }
+  return Array.from(counts.values()).map((row) => ({ name: row.name, recordCount: row.recordCount, domains: Array.from(row.domains).sort() }))
+    .sort((a, b) => b.recordCount - a.recordCount || a.name.localeCompare(b.name, "zh-CN"));
+}
+
+function collectPersonCandidates(source) {
+  const opportunities = source.records.opportunity || [];
+  return (source.records.user || []).map((user) => {
+    const created = opportunities.filter((row) => relationId(field(row, "creatorId")) === asText(user.userId));
+    return {
+      id: asText(user.userId),
+      name: asText(user.name) || "未命名员工",
+      company: mostFrequent(created.map((row) => asText(field(row, "text_11"))), userCompany(user)),
+      createdCount: created.length,
+      expectedAmount: sum(created, (row) => field(row, "num_1"))
+    };
+  }).filter((row) => row.createdCount > 0)
+    .sort((a, b) => b.createdCount - a.createdCount || b.expectedAmount - a.expectedAmount || a.name.localeCompare(b.name, "zh-CN"));
+}
+
+function resolveEntity(input, candidates, type) {
+  if (!asText(input)) return { status: "not_requested", input: "", resolved: null, candidates: [] };
+  const requested = normalizeName(input);
+  let matches = candidates.filter((candidate) => normalizeName(candidate.name) === requested || normalizeName(candidate.id) === requested);
+  if (!matches.length) {
+    matches = candidates.filter((candidate) => {
+      const name = normalizeName(candidate.name);
+      return name.includes(requested) || requested.includes(name);
+    });
+  }
+  if (matches.length === 1) return { status: "resolved", input: asText(input), resolved: matches[0], candidates: matches };
+  if (matches.length > 1) return { status: "needs_disambiguation", input: asText(input), resolved: null, candidates: matches.slice(0, 12) };
+  return { status: "not_found", input: asText(input), resolved: null, candidates: candidates.slice(0, 12), entityType: type };
+}
+
+function buildPerformance(source, products, company) {
+  const normalized = (source.records.performance || []).map((record) => {
+    const product = classifyProduct(productFor(record, "text_26", products), field(record, "text_5"));
+    return {
+      record,
+      company: recordCompany(record, "text_3"),
+      amount: safeNumber(field(record, "num_6")),
+      date: localDate(field(record, "date_1")),
+      product
+    };
+  });
+  const selected = company ? normalized.filter((row) => row.company === company) : normalized;
+  const ranking = Array.from(groupBy(selected, (row) => row.company).entries()).map(([name, rows]) => {
+    const total = sum(rows, (row) => row.amount);
+    const course = sum(rows.filter((row) => row.product.businessType === "课程"), (row) => row.amount);
+    const consulting = sum(rows.filter((row) => row.product.businessType === "咨询"), (row) => row.amount);
+    const other = total - course - consulting;
+    return {
+      company: name,
+      total,
+      course,
+      consulting,
+      other,
+      courseShare: percentage(course, total),
+      consultingShare: percentage(consulting, total),
+      otherShare: percentage(other, total),
+      evidenceRefs: evidenceRefs(rows.map((row) => row.record))
+    };
+  }).filter((row) => row.total !== 0).sort((a, b) => b.total - a.total || a.company.localeCompare(b.company, "zh-CN"));
+  const total = sum(ranking, (row) => row.total);
+  const course = sum(ranking, (row) => row.course);
+  const consulting = sum(ranking, (row) => row.consulting);
+  const other = total - course - consulting;
+  return {
+    definitions: {
+      amount: "业绩回款表 num_6，按业务日期 date_1 归月",
+      company: "业绩回款表 text_3",
+      mix: "优先依据关联产品主数据；产品主数据不可用时，仅按业务记录中的明确产品名称关键词分类，其余进入其他"
+    },
+    summary: { total, companyCount: ranking.length, course, consulting, other, courseShare: percentage(course, total), consultingShare: percentage(consulting, total), otherShare: percentage(other, total) },
+    ranking,
+    dailyTrend: dayTrend(selected, (row) => row.date, {
+      total: (row) => row.amount,
+      course: (row) => row.product.businessType === "课程" ? row.amount : 0,
+      consulting: (row) => row.product.businessType === "咨询" ? row.amount : 0,
+      other: (row) => row.product.businessType === "其他" ? row.amount : 0
+    })
+  };
+}
+
+function buildProductSales(source, products, company) {
+  const rows = [];
+  for (const record of source.records.oppOrder || []) {
+    const product = classifyProduct(productFor(record, "text_10", products), field(record, "text_3"));
+    rows.push({
+      record,
+      source: "oppOrder",
+      company: recordCompany(record, "text_6"),
+      quantity: safeNumber(field(record, "num_1")),
+      revenue: safeNumber(field(record, "num_5")),
+      date: localDate(field(record, "date_1")),
+      product
+    });
+  }
+  for (const record of source.records.performance || []) {
+    const product = classifyProduct(productFor(record, "text_26", products), field(record, "text_5"));
+    rows.push({
+      record,
+      source: "performance",
+      company: recordCompany(record, "text_3"),
+      quantity: safeNumber(field(record, "num_3")),
+      revenue: safeNumber(field(record, "num_6")),
+      date: localDate(field(record, "date_1")),
+      product
+    });
+  }
+  const selected = company ? rows.filter((row) => row.company === company) : rows;
+  const ranking = Array.from(groupBy(selected, (row) => row.company).entries()).map(([name, companyRows]) => {
+    const oppRows = companyRows.filter((row) => row.source === "oppOrder");
+    const performanceRows = companyRows.filter((row) => row.source === "performance");
+    const unclassifiedRows = companyRows.filter((row) => !row.product.isTicket && !row.product.isCommercial && !row.product.isOpen);
+    return {
+      company: name,
+      oppOrderQuantity: sum(oppRows, (row) => row.quantity),
+      oppOrderRevenue: sum(oppRows, (row) => row.revenue),
+      ticketCount: sum(oppRows.filter((row) => row.product.isTicket), (row) => row.quantity),
+      commercialCount: sum(performanceRows.filter((row) => row.product.isCommercial), (row) => row.quantity),
+      openOppQuantity: sum(oppRows.filter((row) => row.product.isOpen), (row) => row.quantity),
+      openOppRevenue: sum(oppRows.filter((row) => row.product.isOpen), (row) => row.revenue),
+      openPerformanceQuantity: sum(performanceRows.filter((row) => row.product.isOpen), (row) => row.quantity),
+      openPerformanceRevenue: sum(performanceRows.filter((row) => row.product.isOpen), (row) => row.revenue),
+      unclassifiedQuantity: sum(unclassifiedRows, (row) => row.quantity),
+      unclassifiedRevenue: sum(unclassifiedRows, (row) => row.revenue),
+      evidenceRefs: evidenceRefs(companyRows.map((row) => row.record))
+    };
+  }).filter((row) => Object.entries(row).some(([key, value]) => key !== "company" && key !== "evidenceRefs" && safeNumber(value) !== 0))
+    .sort((a, b) => (b.ticketCount + b.commercialCount) - (a.ticketCount + a.commercialCount) || b.openOppRevenue - a.openOppRevenue || a.company.localeCompare(b.company, "zh-CN"));
+  const productRows = Array.from(groupBy(selected.filter((row) => row.product.isOpen || row.product.isTicket || row.product.isCommercial), (row) => `${row.source}\u0000${row.product.name}`).entries()).map(([key, productSales]) => {
+    const [sourceName, name] = key.split("\u0000");
+    return {
+      source: sourceName,
+      product: name,
+      category: productSales[0].product.category,
+      frontBack: productSales[0].product.frontBack,
+      isTicket: productSales[0].product.isTicket,
+      isCommercial: productSales[0].product.isCommercial,
+      isOpen: productSales[0].product.isOpen,
+      quantity: sum(productSales, (row) => row.quantity),
+      revenue: sum(productSales, (row) => row.revenue),
+      evidenceRefs: evidenceRefs(productSales.map((row) => row.record))
+    };
+  }).sort((a, b) => b.quantity - a.quantity || b.revenue - a.revenue || a.product.localeCompare(b.product, "zh-CN"));
+  return {
+    definitions: {
+      ticket: "仅统计 OPP 订单中产品主数据明确为门票/票务，或 OPP 分类且产品名称含票/OPP 的销量",
+      commercial: "仅统计业绩回款记录中产品主数据名称明确包含商业操盘的销量",
+      openProduct: "优先按产品主数据前端/OPP 分类；主数据不可用时仅按业务记录产品名中明确的门票、OPP、开源关键词",
+      nameFallback: "产品主数据没有返回记录时，只用业务记录中明确出现的门票、商业操盘、OPP/开源等产品名关键词；未命中仍为未分类",
+      crossForm: "OPP 订单与业绩回款缺少统一订单主键，分别呈现，不相加冒充去重成交额"
+    },
+    summary: {
+      companyCount: ranking.length,
+      oppOrderQuantity: sum(ranking, (row) => row.oppOrderQuantity),
+      oppOrderRevenue: sum(ranking, (row) => row.oppOrderRevenue),
+      ticketCount: sum(ranking, (row) => row.ticketCount),
+      commercialCount: sum(ranking, (row) => row.commercialCount),
+      openOppQuantity: sum(ranking, (row) => row.openOppQuantity),
+      openOppRevenue: sum(ranking, (row) => row.openOppRevenue),
+      openPerformanceQuantity: sum(ranking, (row) => row.openPerformanceQuantity),
+      openPerformanceRevenue: sum(ranking, (row) => row.openPerformanceRevenue),
+      unclassifiedQuantity: sum(ranking, (row) => row.unclassifiedQuantity),
+      unclassifiedRevenue: sum(ranking, (row) => row.unclassifiedRevenue)
+    },
+    ranking,
+    products: productRows,
+    dailyTrend: dayTrend(selected, (row) => row.date, {
+      ticketCount: (row) => row.source === "oppOrder" && row.product.isTicket ? row.quantity : 0,
+      commercialCount: (row) => row.source === "performance" && row.product.isCommercial ? row.quantity : 0,
+      openOppRevenue: (row) => row.source === "oppOrder" && row.product.isOpen ? row.revenue : 0,
+      openPerformanceRevenue: (row) => row.source === "performance" && row.product.isOpen ? row.revenue : 0
+    })
+  };
+}
+
+function buildCourses(courseFacts, company) {
+  const selected = company ? courseFacts.filter((row) => row.primaryCompany === company) : courseFacts;
+  const courses = selected.map((row) => ({
+    evidenceRef: row.evidenceRef,
+    evidenceRefs: row.evidenceRefs,
+    name: row.name,
+    type: row.type,
+    status: row.status,
+    date: row.date,
+    primaryCompany: row.primaryCompany,
+    bookedCustomers: row.bookedCustomers,
+    firms: row.firms,
+    bosses: row.bosses,
+    students: row.students,
+    dealOrders: row.dealOrders,
+    dealAmount: row.dealAmount,
+    paidAmount: row.paidAmount,
+    conversionRate: row.conversionRate
+  })).sort((a, b) => a.date.localeCompare(b.date) || a.name.localeCompare(b.name, "zh-CN"));
+  const companies = Array.from(groupBy(courseFacts, (row) => row.primaryCompany).entries()).map(([name, rows]) => ({
+    company: name,
+    courseCount: rows.length,
+    bookedCustomers: sum(rows, (row) => row.bookedCustomers),
+    bosses: sum(rows, (row) => row.bosses),
+    firms: sum(rows, (row) => row.firms),
+    dealOrders: sum(rows, (row) => row.dealOrders),
+    dealAmount: sum(rows, (row) => row.dealAmount),
+    conversionRate: percentage(sum(rows, (row) => row.dealOrders), sum(rows, (row) => row.bookedCustomers)),
+    evidenceRefs: unique(rows.flatMap((row) => row.evidenceRefs))
+  })).sort((a, b) => b.courseCount - a.courseCount || b.dealAmount - a.dealAmount || a.company.localeCompare(b.company, "zh-CN"));
+  const bookedCustomers = sum(courses, (row) => row.bookedCustomers);
+  const dealOrders = sum(courses, (row) => row.dealOrders);
+  return {
+    definitions: {
+      courseCount: "课程开始日期落在所选月份的课程记录数",
+      company: "课程表缺少可靠组织公司字段；按同课约课记录中订单所属公司的众数归集",
+      conversionRate: "课程成交订单数 num_6 ÷ 已预约客户数 num_3；不使用未可靠同步的签到字段",
+      firms: "约课记录中的客户所属公司去重",
+      dealAmount: "课程下游订单成交金额 num_9"
+    },
+    summary: {
+      selectedCompany: company || null,
+      courseCount: courses.length,
+      bookedCustomers,
+      firms: sum(courses, (row) => row.firms),
+      bosses: sum(courses, (row) => row.bosses),
+      students: sum(courses, (row) => row.students),
+      dealOrders,
+      dealAmount: sum(courses, (row) => row.dealAmount),
+      paidAmount: sum(courses, (row) => row.paidAmount),
+      conversionRate: percentage(dealOrders, bookedCustomers)
+    },
+    companies,
+    courses,
+    dailyTrend: dayTrend(courses, (row) => row.date, {
+      courseCount: () => 1,
+      bookedCustomers: (row) => row.bookedCustomers,
+      bosses: (row) => row.bosses,
+      dealOrders: (row) => row.dealOrders,
+      dealAmount: (row) => row.dealAmount
+    })
+  };
+}
+
+function buildDelivery(courseFacts, company) {
+  const deliveryCourses = courseFacts.filter((course) => course.type.includes("交付课程"));
+  const companyMap = new Map();
+  const courseRows = [];
+  for (const course of deliveryCourses) {
+    const perCourse = new Map();
+    for (const booking of course.linkedBookings) {
+      const bookingOwner = bookingCompany(booking);
+      const amount = safeNumber(field(booking, "num_3"));
+      const orderId = relationId(field(booking, "text_8")) || relationId(field(booking, "text_9")) || `booking:${booking.recordId}`;
+      const ensure = (map, key) => {
+        if (!map.has(key)) map.set(key, { company: key, invitations: 0, bosses: 0, students: 0, courses: new Set(), seenOrders: new Set(), attributedPaidAmount: 0, evidenceRefs: [] });
+        return map.get(key);
+      };
+      for (const bucket of [ensure(companyMap, bookingOwner), ensure(perCourse, bookingOwner)]) {
+        bucket.invitations += 1;
+        bucket.bosses += safeNumber(field(booking, "num_1"));
+        bucket.students += safeNumber(field(booking, "num_2"));
+        bucket.courses.add(course.entityId);
+        bucket.evidenceRefs.push(booking.evidenceRef);
+        if (!bucket.seenOrders.has(orderId)) {
+          bucket.attributedPaidAmount += amount;
+          bucket.seenOrders.add(orderId);
+        }
+      }
+    }
+    courseRows.push({
+      evidenceRef: course.evidenceRef,
+      name: course.name,
+      date: course.date,
+      invitations: course.linkedBookings.length,
+      bosses: course.bosses,
+      dealOrders: course.dealOrders,
+      courseDealAmount: course.dealAmount,
+      coursePaidAmount: course.paidAmount,
+      companies: Array.from(perCourse.values()).map((row) => ({
+        company: row.company,
+        invitations: row.invitations,
+        bosses: row.bosses,
+        students: row.students,
+        attributedPaidAmount: row.attributedPaidAmount,
+        evidenceRefs: unique(row.evidenceRefs)
+      })).sort((a, b) => b.invitations - a.invitations || b.attributedPaidAmount - a.attributedPaidAmount)
+    });
+  }
+  let companies = Array.from(companyMap.values()).map((row) => ({
+    company: row.company,
+    invitations: row.invitations,
+    bosses: row.bosses,
+    students: row.students,
+    courseCount: row.courses.size,
+    attributedPaidAmount: row.attributedPaidAmount,
+    evidenceRefs: unique(row.evidenceRefs)
+  })).sort((a, b) => b.invitations - a.invitations || b.attributedPaidAmount - a.attributedPaidAmount || a.company.localeCompare(b.company, "zh-CN"));
+  if (company) companies = companies.filter((row) => row.company === company);
+  const selectedCourses = company ? courseRows.filter((row) => row.companies.some((entry) => entry.company === company)).map((row) => ({ ...row, companies: row.companies.filter((entry) => entry.company === company) })) : courseRows;
+  return {
+    definitions: {
+      deliveryCourse: "课程类型包含交付课程且课程开始日期落在所选月份",
+      invitation: "交付课程关联的学员约课记录数",
+      company: "按约课记录关联订单所属公司归集",
+      attributedPaidAmount: "同一公司内按关联订单 ID 去重后的订单回款；不是财务分润或正式业绩分配"
+    },
+    summary: {
+      selectedCompany: company || null,
+      deliveryCourseCount: selectedCourses.length,
+      companyCount: companies.length,
+      invitations: sum(companies, (row) => row.invitations),
+      bosses: sum(companies, (row) => row.bosses),
+      students: sum(companies, (row) => row.students),
+      attributedPaidAmount: sum(companies, (row) => row.attributedPaidAmount)
+    },
+    companies,
+    courses: selectedCourses.sort((a, b) => a.date.localeCompare(b.date) || a.name.localeCompare(b.name, "zh-CN")),
+    dailyTrend: dayTrend(selectedCourses, (row) => row.date, {
+      courseCount: () => 1,
+      invitations: (row) => company ? sum(row.companies, (entry) => entry.invitations) : row.invitations,
+      bosses: (row) => company ? sum(row.companies, (entry) => entry.bosses) : row.bosses,
+      attributedPaidAmount: (row) => sum(row.companies, (entry) => entry.attributedPaidAmount)
+    })
+  };
+}
+
+function latestTimestamp(rows) {
+  return rows.reduce((latest, row) => Math.max(latest, safeNumber(field(row, "date_1"))), 0);
+}
+
+function opportunityFact(opportunity, follows, users, asOf) {
+  const creatorId = relationId(field(opportunity, "creatorId"));
+  const user = users.get(creatorId);
+  const stage = asText(field(opportunity, "text_17")) || "未标阶段";
+  const willingness = asText(field(opportunity, "text_12")) || "未标意愿";
+  const latestFollow = latestTimestamp(follows);
+  const baseline = latestFollow || safeNumber(opportunity.addTime);
+  const staleDays = baseline ? Math.max(0, Math.floor((asOf - baseline) / 86400)) : null;
+  const contents = follows.map((follow) => asText(field(follow, "text_6"))).filter(Boolean);
+  const meaningfulFollowCount = contents.filter((content) => content.replace(/\s/g, "").length >= 20).length;
+  const hasNextAction = contents.some((content) => NEXT_ACTION_RE.test(content));
+  const hasDecisionSignal = contents.some((content) => DECISION_RE.test(content));
+  const expectedAmount = safeNumber(field(opportunity, "num_1"));
+  const active = ACTIVE_STAGES.has(stage);
+  const effectiveSignal = /(中|高)/.test(willingness) || meaningfulFollowCount > 0;
+  const forgottenCandidate = active && expectedAmount > 0 && effectiveSignal && staleDays !== null && staleDays >= 14;
+  const latestCustomerName = follows.slice().sort((a, b) => safeNumber(field(b, "date_1")) - safeNumber(field(a, "date_1")));
+  return {
+    evidenceRef: opportunity.evidenceRef,
+    evidenceRefs: unique([opportunity.evidenceRef, ...evidenceRefs(follows)]),
+    entityId: entityId(opportunity),
+    creator: {
+      id: creatorId,
+      name: asText(user && user.name) || "创建人未标记",
+      company: recordCompany(opportunity, "text_11") !== "未标公司" ? recordCompany(opportunity, "text_11") : userCompany(user)
+    },
+    ownerIds: relationIds(field(opportunity, "ownerId")),
+    customerId: relationId(field(opportunity, "text_3")),
+    customerName: asText(field(latestCustomerName[0], "text_10")) || "客户名称未标",
+    name: asText(field(opportunity, "text_1")) || "未命名商机",
+    createdDate: localDate(opportunity.addTime),
+    stage,
+    willingness,
+    expectedAmount,
+    wonAmount: safeNumber(field(opportunity, "num_14")),
+    industry: asText(field(opportunity, "text_2")) || "未标行业",
+    nature: asText(field(opportunity, "text_24")) || "未标性质",
+    scale: asText(field(opportunity, "text_20")) || "未标规模",
+    source: asText(field(opportunity, "text_23")) || "未标来源",
+    relatedProducts: asText(field(opportunity, "array_1")),
+    signals: {
+      active,
+      followCount: follows.length,
+      meaningfulFollowCount,
+      latestFollowDate: localDate(latestFollow),
+      staleDays,
+      hasNextAction,
+      hasDecisionSignal,
+      effectiveSignal,
+      forgottenCandidate
+    },
+    followEvidence: follows.slice().sort((a, b) => safeNumber(field(b, "date_1")) - safeNumber(field(a, "date_1"))).slice(0, 3).map((follow) => ({
+      evidenceRef: follow.evidenceRef,
+      date: localDate(field(follow, "date_1")),
+      excerpt: asText(field(follow, "text_6")).replace(/\s+/g, " ").slice(0, 240)
+    }))
+  };
+}
+
+function buildOpportunities(source, company, person) {
+  const opportunities = source.records.opportunity || [];
+  const follows = source.records.follow || [];
+  const users = userMap(source);
+  const directFollows = groupBy(follows.filter((follow) => relationId(field(follow, "text_5"))), (follow) => relationId(field(follow, "text_5")));
+  const customerFollows = groupBy(follows.filter((follow) => relationId(field(follow, "text_1"))), (follow) => relationId(field(follow, "text_1")));
+  const current = Math.floor(Date.now() / 1000);
+  const rangeStart = safeNumber(source.range && source.range.start);
+  const rangeEnd = safeNumber(source.range && source.range.end);
+  const asOf = Math.min(Math.max(current, rangeStart), rangeEnd);
+  let rows = opportunities.map((opportunity) => {
+    const direct = directFollows.get(entityId(opportunity)) || [];
+    const related = direct.length ? direct : (customerFollows.get(relationId(field(opportunity, "text_3"))) || []);
+    return opportunityFact(opportunity, related, users, asOf);
+  });
+  if (person) rows = rows.filter((row) => row.creator.id === person.id);
+  if (company) rows = rows.filter((row) => row.creator.company === company);
+  const stages = Array.from(groupBy(rows, (row) => row.stage).entries()).map(([stage, stageRows]) => ({
+    stage,
+    count: stageRows.length,
+    expectedAmount: sum(stageRows, (row) => row.expectedAmount),
+    wonAmount: sum(stageRows, (row) => row.wonAmount),
+    evidenceRefs: unique(stageRows.flatMap((row) => row.evidenceRefs))
+  })).sort((a, b) => {
+    const ai = STAGE_ORDER.indexOf(a.stage);
+    const bi = STAGE_ORDER.indexOf(b.stage);
+    return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi) || b.count - a.count;
+  });
+  const people = Array.from(groupBy(rows, (row) => row.creator.id || "unknown").values()).map((personRows) => ({
+    person: personRows[0].creator,
+    createdCount: personRows.length,
+    expectedAmount: sum(personRows, (row) => row.expectedAmount),
+    wins: personRows.filter((row) => row.stage === "赢单").length,
+    wonAmount: sum(personRows.filter((row) => row.stage === "赢单"), (row) => row.wonAmount || row.expectedAmount),
+    active: personRows.filter((row) => row.signals.active).length,
+    forgottenCandidates: personRows.filter((row) => row.signals.forgottenCandidate).length,
+    evidenceRefs: unique(personRows.flatMap((row) => row.evidenceRefs))
+  })).sort((a, b) => b.expectedAmount - a.expectedAmount || b.createdCount - a.createdCount || a.person.name.localeCompare(b.person.name, "zh-CN"));
+  const forgotten = rows.filter((row) => row.signals.forgottenCandidate).sort((a, b) => b.expectedAmount - a.expectedAmount || (b.signals.staleDays || 0) - (a.signals.staleDays || 0));
+  return {
+    definitions: {
+      created: "商机 addTime 落在所选月份，并按 creatorId 归属创建人",
+      expectedAmount: "商机预计金额 num_1",
+      won: "商机阶段 text_17 为赢单",
+      followLink: "优先按跟进关联业务直连商机；缺失时按同客户回退",
+      forgottenCandidate: "活动阶段、预计金额大于 0、有中高意愿或有效跟进证据，并且至少 14 天未跟进",
+      qualityBoundary: "只提供可解释信号，不计算加权质量分或预测成交概率"
+    },
+    summary: {
+      selectedCompany: company || null,
+      selectedPerson: person || null,
+      createdCount: rows.length,
+      expectedAmount: sum(rows, (row) => row.expectedAmount),
+      wins: rows.filter((row) => row.stage === "赢单").length,
+      wonAmount: sum(rows.filter((row) => row.stage === "赢单"), (row) => row.wonAmount || row.expectedAmount),
+      lost: rows.filter((row) => row.stage === "输单").length,
+      active: rows.filter((row) => row.signals.active).length,
+      followCount: sum(rows, (row) => row.signals.followCount),
+      withNextAction: rows.filter((row) => row.signals.hasNextAction).length,
+      withDecisionSignal: rows.filter((row) => row.signals.hasDecisionSignal).length,
+      staleAtLeast14Days: rows.filter((row) => row.signals.active && row.signals.staleDays !== null && row.signals.staleDays >= 14).length,
+      forgottenCandidates: forgotten.length
+    },
+    stages,
+    people,
+    reactivationCandidates: forgotten,
+    opportunities: rows.sort((a, b) => b.expectedAmount - a.expectedAmount || (b.signals.staleDays || 0) - (a.signals.staleDays || 0)),
+    dailyTrend: dayTrend(rows, (row) => row.createdDate, {
+      createdCount: () => 1,
+      expectedAmount: (row) => row.expectedAmount,
+      wins: (row) => row.stage === "赢单" ? 1 : 0
+    })
+  };
+}
+
+function validateSource(source) {
+  if (!source || source.mode !== "live-readonly-source") throw new Error("来源包不是实时只读销帮帮来源");
+  if (!source.privacy || source.privacy.telephoneFieldsExported !== false || source.privacy.credentialFieldsExported !== false) {
+    throw new Error("来源包隐私边界不完整");
+  }
+  if (!source.records || !source.integrity || !source.integrity.recordsSha256) throw new Error("来源包缺少记录或完整性信息");
+  const actual = crypto.createHash("sha256").update(JSON.stringify(source.records), "utf8").digest("hex");
+  if (actual !== source.integrity.recordsSha256) throw new Error("来源包记录哈希校验失败");
+}
+
+function normalizeDomains(value) {
+  const requested = Array.isArray(value) ? value : asText(value).split(",");
+  const domains = unique(requested.map((item) => asText(item)).filter(Boolean));
+  if (!domains.length || domains.includes("all")) return Array.from(ALLOWED_DOMAINS);
+  for (const domain of domains) if (!ALLOWED_DOMAINS.has(domain)) throw new Error(`不支持的数据域：${domain}`);
+  return domains;
+}
+
+function buildFactPack(source, options = {}) {
+  validateSource(source);
+  const domains = normalizeDomains(options.domains || "all");
+  const products = productMap(source);
+  const courseFacts = buildCourseFacts(source);
+  const companyCandidates = collectCompanyCandidates(source, courseFacts);
+  const personCandidates = collectPersonCandidates(source);
+  const companyResolution = resolveEntity(options.company, companyCandidates, "company");
+  const personResolution = resolveEntity(options.person, personCandidates, "person");
+  const needsChoice = [companyResolution, personResolution].some((item) => item.status === "needs_disambiguation" || item.status === "not_found");
+  const pack = {
+    schemaVersion: "1.0",
+    skill: "xbb-executive-analyst",
+    mode: "xbb-live-readonly-fact-pack",
+    status: needsChoice ? "needs_disambiguation" : "ready",
+    scope: {
+      month: source.month,
+      range: clone(source.range),
+      refreshedAt: source.refreshedAt,
+      domains,
+      company: companyResolution.resolved ? companyResolution.resolved.name : null,
+      person: personResolution.resolved ? clone(personResolution.resolved) : null,
+      currentMonthPartial: source.month === new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit" }).format(new Date()).slice(0, 7)
+    },
+    entityResolution: {
+      company: companyResolution,
+      person: personResolution
+    },
+    provenance: {
+      live: true,
+      readOnly: true,
+      dataSource: source.provenance.dataSource,
+      sourceMode: source.mode,
+      sourceRefreshedAt: source.refreshedAt,
+      sourceRecordsSha256: source.integrity.recordsSha256,
+      formIds: clone(source.provenance.formIds),
+      recordCounts: clone(source.provenance.recordCounts),
+      telephoneFieldsExported: false,
+      credentialFieldsExported: false
+    },
+    facts: {},
+    limitations: [
+      "结论仅覆盖所选月份及来源包刷新时点前的只读销帮帮记录。",
+      "没有来源字段或关联主键支持的业务判断必须标记为无法确认，不能用模型推测补齐。"
+    ]
+  };
+  if (!needsChoice) {
+    const company = companyResolution.resolved ? companyResolution.resolved.name : null;
+    const person = personResolution.resolved;
+    if (domains.includes("performance")) pack.facts.performance = buildPerformance(source, products, company);
+    if (domains.includes("product-sales")) pack.facts.productSales = buildProductSales(source, products, company);
+    if (domains.includes("courses")) pack.facts.courses = buildCourses(courseFacts, company);
+    if (domains.includes("delivery")) pack.facts.delivery = buildDelivery(courseFacts, company);
+    if (domains.includes("opportunities")) pack.facts.opportunities = buildOpportunities(source, company, person);
+  }
+  const canonical = JSON.stringify({ scope: pack.scope, entityResolution: pack.entityResolution, provenance: pack.provenance, facts: pack.facts, limitations: pack.limitations });
+  pack.integrity = { algorithm: "sha256", factPackSha256: crypto.createHash("sha256").update(canonical, "utf8").digest("hex") };
+  const serialized = JSON.stringify(pack);
+  if (/(?<!\d)1[3-9]\d{9}(?!\d)|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\b(?:ghp_|github_pat_|sk-)[A-Za-z0-9_-]{16,}\b/i.test(serialized)) {
+    throw new Error("事实包隐私扫描失败");
+  }
+  return pack;
+}
+
+function parseArguments(argv) {
+  const parsed = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    const key = argv[index];
+    if (["--source", "--output", "--domains", "--company", "--person"].includes(key)) {
+      parsed[key.slice(2)] = argv[index + 1];
+      index += 1;
+    } else {
+      throw new Error(`不支持的参数：${key}`);
+    }
+  }
+  if (!parsed.source || !parsed.output) throw new Error("必须提供 --source 和 --output");
+  return parsed;
+}
+
+function atomicWrite(outputPath, value) {
+  const resolved = path.resolve(outputPath);
+  fs.mkdirSync(path.dirname(resolved), { recursive: true });
+  const temporary = `${resolved}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    fs.writeFileSync(temporary, `${JSON.stringify(value)}\n`, { encoding: "utf8", flag: "wx" });
+    fs.renameSync(temporary, resolved);
+  } catch (error) {
+    try { fs.unlinkSync(temporary); } catch (_) { /* no temporary file */ }
+    throw error;
+  }
+  return resolved;
+}
+
+function main() {
+  const args = parseArguments(process.argv.slice(2));
+  const source = JSON.parse(fs.readFileSync(path.resolve(args.source), "utf8"));
+  const pack = buildFactPack(source, args);
+  const output = atomicWrite(args.output, pack);
+  process.stdout.write(`${JSON.stringify({ success: true, status: pack.status, month: pack.scope.month, domains: pack.scope.domains, refreshedAt: pack.scope.refreshedAt, output, factPackSha256: pack.integrity.factPackSha256 })}\n`);
+}
+
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    process.stderr.write(`${error && error.message ? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  }
+}
+
+module.exports = {
+  buildFactPack,
+  classifyProduct,
+  normalizeDomains,
+  resolveEntity
+};

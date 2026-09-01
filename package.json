@@ -1,0 +1,15 @@
+{
+  "name": "xbb-executive-analyst",
+  "version": "1.0.0",
+  "private": true,
+  "description": "基于真实只读销帮帮数据的经营分析 Skill 与企业微信智能机器人服务",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node shared/wecom/server.js",
+    "test": "node tests/verify-facts.js && node tests/verify-charts.js && node tests/verify-access-control.js && node tests/verify-wecom-crypto.js && node tests/verify-agent-tool-loop.js && node tests/verify-wecom-callback.js",
+    "verify": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\verify-skill.ps1"
+  }
+}
