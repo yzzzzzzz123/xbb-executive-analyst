@@ -57,6 +57,7 @@ $startInfo.WorkingDirectory = $projectRoot
 $startInfo.UseShellExecute = $false
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $false
+$startInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
 $startInfo.CreateNoWindow = $true
 
 $process = [Diagnostics.Process]::new()
