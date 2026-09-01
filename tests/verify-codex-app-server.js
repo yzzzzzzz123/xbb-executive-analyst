@@ -157,33 +157,52 @@ class FakeAppServerClient extends EventEmitter {
     assert.match(principal, /^[a-f0-9]{64}$/);
     assert.notEqual(principal, principalKeyFromUserId("boss-user", { scope: "companies", companies: ["公司A"] }));
 
+    const warmPromise = agent.warm({ access, principalKey: principal });
+    await nextImmediate();
+    assert.equal(fakeClient.startThreadCalls.length, 1);
+    assert.equal(fakeClient.startTurnCalls[0].params.effort, "none");
+    assert.match(fakeClient.startTurnCalls[0].params.input[0].text, /后台缓存预热/);
+    assert.equal(queryCalls.length, 0);
+    fakeClient.complete("thread-1", "turn-1", JSON.stringify({ answer: "ready", chart: null }));
+    const ragStats = await warmPromise;
+    assert.equal(ragStats.sources, 5);
+    assert.equal(ragStats.principals, 1);
+
     const greetingPromise = agent.answer({ question: "你好", access, principalKey: principal, messageId: "msg-greeting" });
     await nextImmediate();
     assert.equal(fakeClient.startThreadCalls.length, 1);
     assert.equal(fakeClient.startThreadCalls[0].ephemeral, false);
     assert.equal(fakeClient.startThreadCalls[0].dynamicTools[0].name, "query_xbb");
-    assert.equal(fakeClient.startTurnCalls[0].params.input[0].type, "skill");
-    assert.deepEqual(fakeClient.startTurnCalls[0].params.sandboxPolicy, { type: "readOnly", networkAccess: false });
-    assert.deepEqual(fakeClient.startTurnCalls[0].params.outputSchema.required, ["answer", "chart"]);
-    fakeClient.complete("thread-1", "turn-1", JSON.stringify({ answer: "你好，我是销帮帮经营分析助手。你可以直接问经营问题。", chart: null }));
+    assert.equal(fakeClient.startTurnCalls[1].params.input.length, 1);
+    assert.equal(fakeClient.startTurnCalls[1].params.input[0].type, "text");
+    assert.match(fakeClient.startTurnCalls[1].params.input[0].text, /RAG 适用规则/);
+    assert.equal(fakeClient.startTurnCalls[1].params.effort, "none");
+    assert.deepEqual(fakeClient.startTurnCalls[1].params.sandboxPolicy, { type: "readOnly", networkAccess: false });
+    assert.deepEqual(fakeClient.startTurnCalls[1].params.outputSchema.required, ["answer", "chart"]);
+    fakeClient.complete("thread-1", "turn-2", JSON.stringify({ answer: "你好，我是销帮帮经营分析助手。你可以直接问经营问题。", chart: null }));
     assert.match((await greetingPromise).answer, /经营分析助手/);
     assert.equal(queryCalls.length, 0);
 
     const progress = [];
     const businessPromise = agent.answer({ question: "集团9月业绩排名", access, principalKey: principal, messageId: "msg-business", onProgress: async (text) => progress.push(text) });
     await nextImmediate();
+    assert.equal(queryCalls.length, 1);
+    assert.deepEqual(queryCalls[0].args, { months: ["2026-09"], domains: ["performance"] });
+    assert.equal(queryCalls[0].access.scope, "all");
+    assert.match(fakeClient.startTurnCalls[2].params.input[0].text, /本轮 query_xbb 实时预取事实包/);
+    assert.equal(fakeClient.startTurnCalls[2].params.effort, "none");
+    assert.match(fakeClient.startTurnCalls[2].params.input[0].text, /业绩与收入结构/);
     fakeClient.emit("serverRequest", {
       id: 77,
       method: "item/tool/call",
-      params: { threadId: "thread-1", turnId: "turn-2", callId: "call-1", namespace: null, tool: "query_xbb", arguments: { months: ["2026-09"], domains: ["performance"] } }
+      params: { threadId: "thread-1", turnId: "turn-3", callId: "call-1", namespace: null, tool: "query_xbb", arguments: { months: ["2026-09"], domains: ["performance"] } }
     });
     await nextImmediate();
-    assert.equal(queryCalls.length, 1);
-    assert.equal(queryCalls[0].access.scope, "all");
+    assert.equal(queryCalls.length, 2);
     assert.equal(fakeClient.responses[0].id, 77);
     assert.equal(fakeClient.responses[0].result.success, true);
     assert.match(progress.join("\n"), /正在查询销帮帮实时只读数据/);
-    fakeClient.complete("thread-1", "turn-2", JSON.stringify({
+    fakeClient.complete("thread-1", "turn-3", JSON.stringify({
       answer: "9月集团业绩排名结论（MTD）。",
       chart: { type: "bar", title: "公司排名 13800138000", categories: ["公司A", "公司B"], series: [{ name: "业绩", values: [123, 80] }], items: [], points: [], valueFormat: "money", unit: "", subtitle: "MTD", note: "", centerLabel: "", xLabel: "", yLabel: "", xFormat: "number", yFormat: "number", xUnit: "", yUnit: "" }
     }));
@@ -196,13 +215,14 @@ class FakeAppServerClient extends EventEmitter {
     agent.on("activity", (value) => activities.push(value));
     const first = agent.answer({ question: "继续分析商机", access, principalKey: principal, messageId: "msg-busy-1" });
     await nextImmediate();
+    assert.equal(fakeClient.startTurnCalls[3].params.effort, "medium");
     const second = agent.answer({ question: "同时看跟进质量", access, principalKey: principal, messageId: "msg-busy-2" });
     const secondRejection = assert.rejects(second, /仍在处理中/);
     await nextImmediate();
     await secondRejection;
     assert.equal(fakeClient.steerTurnCalls.length, 0);
     assert.equal(activities.some((value) => value.status === "agent_busy"), true);
-    fakeClient.complete("thread-1", "turn-3", JSON.stringify({ answer: "商机分析结论。", chart: null }));
+    fakeClient.complete("thread-1", "turn-4", JSON.stringify({ answer: "商机分析结论。", chart: null }));
     assert.equal((await first).answer, "商机分析结论。");
 
     await agent.close();
@@ -221,7 +241,7 @@ class FakeAppServerClient extends EventEmitter {
     assert.equal(resumedClient.startThreadCalls.length, 0);
     await resumed.close();
 
-    process.stdout.write(`${JSON.stringify({ success: true, checks: 36, runtime: "persistent-codex-app-server" })}\n`);
+    process.stdout.write(`${JSON.stringify({ success: true, checks: 42, runtime: "persistent-codex-app-server" })}\n`);
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }

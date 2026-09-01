@@ -71,8 +71,8 @@ function validateWebSocketEndpoint(value) {
 }
 
 function validateReasoningEffort(value) {
-  if (!["minimal", "low", "medium", "high", "xhigh", "max"].includes(value)) {
-    throw new Error("Codex 推理强度只支持 minimal、low、medium、high、xhigh 或 max。");
+  if (!["none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value)) {
+    throw new Error("Codex 推理强度只支持 none、minimal、low、medium、high、xhigh 或 max。");
   }
   return value;
 }

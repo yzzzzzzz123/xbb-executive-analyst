@@ -16,6 +16,8 @@ class FakeClient extends EventEmitter {
     this.replies = [];
     this.connected = false;
     this.disconnected = false;
+    this.uploads = [];
+    this.mediaMessages = [];
   }
 
   connect() {
@@ -31,6 +33,17 @@ class FakeClient extends EventEmitter {
     const reply = { reqId: frame.headers.req_id, streamId, content, finish, msgItem };
     this.replies.push(reply);
     return reply;
+  }
+
+  async uploadMedia(buffer, options) {
+    this.uploads.push({ buffer, options });
+    return { type: "image", media_id: "media-chart-1" };
+  }
+
+  async sendMediaMessage(target, mediaType, mediaId) {
+    const message = { target, mediaType, mediaId };
+    this.mediaMessages.push(message);
+    return message;
   }
 }
 
@@ -67,25 +80,44 @@ function frame(messageId, userId, msgtype, body) {
     agent,
     streamIdFactory: () => `stream-${++streamCounter}`,
     statusWriter: (value) => handlerStatuses.push(value),
-    chartRenderer: async () => fakeChartItem
+    chartRenderer: async () => ({ buffer: Buffer.from("fake-png"), item: fakeChartItem })
   });
   const client = new FakeClient();
 
   const textFrame = frame("msg-1", "boss", "text", { text: { content: "集团9月业绩排名" } });
   await handler.handleMessage(textFrame, client);
   assert.deepEqual(client.replies.map((reply) => reply.finish), [false, false, true]);
-  assert.match(client.replies[0].content, /Codex 经营分析 Agent 正在处理/);
+  assert.match(client.replies[0].content, /正在查询/);
   assert.match(client.replies[1].content, /正在查询销帮帮实时只读数据/);
   assert.equal(client.replies[2].content, "集团9月业绩排名已生成（MTD）。");
-  assert.deepEqual(client.replies[2].msgItem, [fakeChartItem]);
+  assert.deepEqual(client.replies[2].msgItem, []);
+  assert.equal(client.uploads.length, 1);
+  assert.deepEqual(client.uploads[0].options, { type: "image", filename: "经营分析图表.png" });
+  assert.deepEqual(client.mediaMessages, [{ target: "boss", mediaType: "image", mediaId: "media-chart-1" }]);
   assert.equal(handlerStatuses.some((value) => value.status === "chart_generated"), true);
+  assert.equal(handlerStatuses.some((value) => value.status === "chart_delivered"), true);
   assert.equal(agentCalls, 1);
 
   await handler.handleMessage(textFrame, client);
   assert.equal(client.replies[3].streamId, "stream-1");
   assert.equal(client.replies[3].finish, true);
-  assert.deepEqual(client.replies[3].msgItem, [fakeChartItem]);
+  assert.deepEqual(client.replies[3].msgItem, []);
+  assert.equal(client.mediaMessages.length, 1);
   assert.equal(agentCalls, 1);
+
+  const fallbackStatuses = [];
+  const fallbackClient = new FakeClient();
+  fallbackClient.sendMediaMessage = async () => { throw new Error("active media unavailable"); };
+  const fallbackHandler = createLongConnectionHandler({
+    policy,
+    agent: { answer: async () => ({ answer: "真实结论。", chart: { type: "bar" } }) },
+    streamIdFactory: () => "stream-fallback",
+    statusWriter: (value) => fallbackStatuses.push(value),
+    chartRenderer: async () => ({ buffer: Buffer.from("fake-png"), item: fakeChartItem })
+  });
+  await fallbackHandler.handleMessage(frame("msg-fallback", "boss", "text", { text: { content: "集团业绩" } }), fallbackClient);
+  assert.deepEqual(fallbackClient.replies.at(-1).msgItem, [fakeChartItem]);
+  assert.equal(fallbackStatuses.some((value) => value.status === "chart_delivered"), true);
 
   const denied = frame("msg-2", "unknown", "text", { text: { content: "集团业绩" } });
   await handler.handleMessage(denied, client);
@@ -176,7 +208,7 @@ function frame(messageId, userId, msgtype, body) {
   assert.deepEqual(Object.keys(safeStatus({ status: "turn_completed", elapsedMs: 1234, userId: "must-not-appear" })), ["at", "status", "transport", "elapsedMs"]);
   assert.throws(() => safeStatus({ status: "unknown" }), /未知机器人状态/);
 
-  process.stdout.write(`${JSON.stringify({ success: true, checks: 51 })}\n`);
+  process.stdout.write(`${JSON.stringify({ success: true, checks: 61 })}\n`);
 })().catch((error) => {
   process.stderr.write(`${error.stack}\n`);
   process.exitCode = 1;

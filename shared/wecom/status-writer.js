@@ -6,7 +6,8 @@ const path = require("node:path");
 const ALLOWED_STATUSES = new Set([
   "connecting", "ready", "disconnected", "reconnecting", "connection_error", "message_failed", "agent_failed",
   "message_received", "agent_busy", "turn_started", "tool_started", "tool_completed", "tool_failed",
-  "turn_completed", "turn_failed", "chart_generated", "chart_failed", "reply_completed"
+  "turn_completed", "turn_failed", "agent_warming", "agent_warmed", "agent_warm_failed",
+  "chart_generated", "chart_uploaded", "chart_delivered", "chart_failed", "reply_completed"
 ]);
 
 function safeStatus(value) {
@@ -14,7 +15,7 @@ function safeStatus(value) {
   if (!ALLOWED_STATUSES.has(status)) throw new Error("不允许写入未知机器人状态。");
   const result = { at: new Date().toISOString(), status, transport: "wecom-websocket" };
   if (status === "reconnecting" && Number.isInteger(value?.attempt)) result.attempt = value.attempt;
-  if (["tool_completed", "tool_failed", "turn_completed", "turn_failed", "reply_completed"].includes(status)
+  if (["tool_completed", "tool_failed", "turn_completed", "turn_failed", "agent_warmed", "reply_completed"].includes(status)
       && Number.isInteger(value?.elapsedMs) && value.elapsedMs >= 0) result.elapsedMs = value.elapsedMs;
   return result;
 }

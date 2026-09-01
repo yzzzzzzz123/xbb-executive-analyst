@@ -5,8 +5,10 @@ const { EventEmitter } = require("node:events");
 const path = require("node:path");
 const { AccessDeniedError } = require("../security/access-control.js");
 const { sanitizeAgentText } = require("../security/output-sanitizer.js");
+const { SkillKnowledgeBase } = require("../rag/skill-knowledge-base.js");
 const { createToolGateway } = require("../xbb/tool-gateway.js");
 const { QUERY_XBB_DYNAMIC_TOOL, queryToolContractHash } = require("../xbb/query-tool.js");
+const { chooseTurnEffort, planFastQuery } = require("../xbb/fast-query-plan.js");
 const { AppServerClient } = require("./app-server-client.js");
 const { LocalAppServerHost } = require("./app-server-host.js");
 const { WECOM_RESPONSE_SCHEMA, parseAgentResponse, responseContractHash } = require("./response-contract.js");
@@ -70,7 +72,7 @@ class PersistentCodexAgent extends EventEmitter {
     super();
     this.config = config;
     this.projectRoot = config.projectRoot || path.resolve(__dirname, "..", "..");
-    this.skillPath = path.join(this.projectRoot, "skills", "xbb-executive-analyst", "SKILL.md");
+    this.knowledgeBase = options.knowledgeBase || new SkillKnowledgeBase(this.projectRoot);
     this.instructions = options.instructions || buildThreadInstructions(this.projectRoot);
     this.queryXbb = options.queryXbb || createToolGateway({ projectRoot: this.projectRoot });
     this.hostFactory = options.hostFactory || LocalAppServerHost;
@@ -87,6 +89,8 @@ class PersistentCodexAgent extends EventEmitter {
       response: responseContractHash(),
       model: config.codexModel,
       effort: config.codexReasoningEffort,
+      interaction: "skill-rag-v1",
+      knowledge: this.knowledgeBase.digest,
       sandbox: "read-only",
       approvalPolicy: "never"
     }));
@@ -97,6 +101,7 @@ class PersistentCodexAgent extends EventEmitter {
     this.started = false;
     this.closing = false;
     this.fatalError = null;
+    this.warmedPrincipals = new Set();
   }
 
   async start() {
@@ -154,6 +159,37 @@ class PersistentCodexAgent extends EventEmitter {
   }
 
   async answer({ question, access, principalKey, messageId, onProgress }) {
+    return this._enqueue({ question, access, principalKey, messageId, onProgress });
+  }
+
+  async warm(options = {}) {
+    const startedAtMs = Date.now();
+    this.emit("activity", { status: "agent_warming" });
+    const stats = this.knowledgeBase.stats();
+    if (stats.sources !== 5 || stats.chunks < 15 || stats.sourceBytes < 1000) throw new Error("完整 Skill RAG 知识库未成功预热。");
+    const principals = Array.isArray(options.principals)
+      ? options.principals
+      : options.access && options.principalKey
+        ? [{ access: options.access, principalKey: options.principalKey }]
+        : [];
+    for (const principal of principals) {
+      if (this.warmedPrincipals.has(principal.principalKey)) continue;
+      const result = await this._enqueue({
+        question: "后台缓存预热：加载业绩、产品、课程、交付、商机、回答和图表规则。这不是经营查询，不得调用 query_xbb，不得输出经营数字；只返回 ready，chart 必须为 null。",
+        access: principal.access,
+        principalKey: principal.principalKey,
+        messageId: null,
+        onProgress: null,
+        warmup: true
+      });
+      if (result.chart !== null) throw new Error("Codex Thread 后台预热错误地生成了图表。");
+      this.warmedPrincipals.add(principal.principalKey);
+    }
+    this.emit("activity", { status: "agent_warmed", elapsedMs: Date.now() - startedAtMs });
+    return Object.freeze({ ...stats, principals: principals.length });
+  }
+
+  async _enqueue({ question, access, principalKey, messageId, onProgress, warmup = false }) {
     if (!this.started || !this.client) throw new Error("Codex Agent 尚未就绪。");
     if (typeof question !== "string" || !question.trim()) throw new Error("经营问题不能为空。");
     if (!/^[a-f0-9]{64}$/.test(principalKey)) throw new Error("Codex Agent principal key 无效。");
@@ -164,39 +200,62 @@ class PersistentCodexAgent extends EventEmitter {
     }
     const waiter = { ...deferred(), onProgress };
     session.operation = session.operation.then(
-      () => this._submit(session, { question: question.trim(), access, messageId, waiter }),
-      () => this._submit(session, { question: question.trim(), access, messageId, waiter })
+      () => this._submit(session, { question: question.trim(), access, messageId, waiter, warmup }),
+      () => this._submit(session, { question: question.trim(), access, messageId, waiter, warmup })
     );
     try { await session.operation; } catch (error) { waiter.reject(error); }
     return waiter.promise;
   }
 
-  async _submit(session, { question, access, messageId, waiter }) {
+  async _submit(session, { question, access, messageId, waiter, warmup }) {
     if (!session.threadId) await this._startThread(session);
-    const input = [
-      { type: "skill", name: "xbb-executive-analyst", path: this.skillPath },
-      {
-        type: "text",
-        text: [
-          "【可信运行元数据】",
-          `上海日期：${shanghaiDateLabel()}`,
-          `授权范围：${accessLabel(access)}`,
-          "【用户问题】",
-          question
-        ].join("\n"),
-        text_elements: []
-      }
-    ];
-
     if (session.active) {
       this.emit("activity", { status: "agent_busy" });
       throw new AgentBusyError();
     }
 
     session.access = access;
-    const active = this._newActive(null, waiter);
+    const active = this._newActive(null, waiter, { allowTools: !warmup });
     session.active = active;
     try {
+      const retrieved = this.knowledgeBase.retrieve(question);
+      const fastPlan = warmup ? null : planFastQuery(question);
+      const turnEffort = warmup ? "none" : chooseTurnEffort(question, this.config.codexReasoningEffort);
+      let prefetchedFactPack = null;
+      if (fastPlan) {
+        active.toolCalls += 1;
+        active.toolStartedAtMs = Date.now();
+        this.emit("activity", { status: "tool_started" });
+        await this._notifyProgress(session, "正在查询销帮帮实时只读数据，请稍候……");
+        try {
+          prefetchedFactPack = await this.queryXbb(fastPlan, access);
+          this.emit("activity", { status: "tool_completed", elapsedMs: Date.now() - active.toolStartedAtMs });
+          await this._notifyProgress(session, "实时数据已取回，正在生成结论和图表……");
+        } catch (error) {
+          this.emit("activity", { status: "tool_failed", elapsedMs: Date.now() - active.toolStartedAtMs });
+          throw error;
+        }
+      }
+      const input = [
+        {
+          type: "text",
+          text: [
+            "【RAG 适用规则】",
+            retrieved.text,
+            ...(prefetchedFactPack ? [
+              "【本轮 query_xbb 实时预取事实包】",
+              JSON.stringify(prefetchedFactPack),
+              "该事实包已在本轮按授权范围实时查询并通过完整性与隐私校验。直接分析；只有事实确实缺失或需要实体消歧时才再次调用 query_xbb，不要重复查询相同范围。"
+            ] : []),
+            "【可信运行元数据】",
+            `上海日期：${shanghaiDateLabel()}`,
+            `授权范围：${accessLabel(access)}`,
+            "【用户问题】",
+            question
+          ].join("\n"),
+          text_elements: []
+        }
+      ];
       const result = await this.client.startTurn({
         threadId: session.threadId,
         clientUserMessageId: messageId || null,
@@ -205,7 +264,7 @@ class PersistentCodexAgent extends EventEmitter {
         approvalPolicy: "never",
         sandboxPolicy: { type: "readOnly", networkAccess: false },
         model: this.config.codexModel,
-        effort: this.config.codexReasoningEffort,
+        effort: turnEffort,
         summary: "none",
         outputSchema: WECOM_RESPONSE_SCHEMA
       });
@@ -238,7 +297,7 @@ class PersistentCodexAgent extends EventEmitter {
     this.emit("threadReady", { principalKey: session.principalKey });
   }
 
-  _newActive(turnId, waiter) {
+  _newActive(turnId, waiter, options = {}) {
     return {
       turnId,
       waiters: waiter ? [waiter] : [],
@@ -246,6 +305,7 @@ class PersistentCodexAgent extends EventEmitter {
       finalText: "",
       lastText: "",
       toolCalls: 0,
+      allowTools: options.allowTools !== false,
       startedAtMs: Date.now(),
       toolStartedAtMs: null,
       timeout: null
@@ -264,6 +324,10 @@ class PersistentCodexAgent extends EventEmitter {
       return;
     }
     const active = session.active;
+    if (!active.allowTools) {
+      this.client.respond(request.id, { success: false, contentItems: [{ type: "inputText", text: JSON.stringify({ status: "error", message: "后台预热不允许查询业务数据。" }) }] });
+      return;
+    }
     active.toolCalls += 1;
     if (active.toolCalls > 4) {
       this.client.respond(request.id, { success: false, contentItems: [{ type: "inputText", text: JSON.stringify({ status: "error", message: "工具调用轮次超过安全上限。" }) }] });
@@ -308,7 +372,7 @@ class PersistentCodexAgent extends EventEmitter {
       if (text) {
         session.active.lastText = text;
         if (phase === "final_answer") session.active.finalText = text;
-        else if (phase === "commentary") await this._notifyProgress(session, text);
+        // 企业微信只显示桥接层的短状态，不转发模型内部 commentary。
       }
       return;
     }

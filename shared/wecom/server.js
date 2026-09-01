@@ -2,7 +2,7 @@
 
 const { WSClient } = require("@wecom/aibot-node-sdk");
 const { loadConfig } = require("../config.js");
-const { PersistentCodexAgent } = require("../codex/persistent-agent.js");
+const { PersistentCodexAgent, principalKeyFromUserId } = require("../codex/persistent-agent.js");
 const { loadAccessPolicy } = require("../security/access-control.js");
 const { createLongConnectionHandler } = require("./long-connection-handler.js");
 const { createPrivacyLogger } = require("./privacy-logger.js");
@@ -14,6 +14,22 @@ async function buildRuntime(config, options = {}) {
   const statusWriter = options.statusWriter || (() => {});
   agent.on("activity", statusWriter);
   await agent.start();
+  if (typeof agent.warm === "function") {
+    try {
+      const principals = Object.entries(policy.users).map(([userId, rule]) => {
+        const access = Object.freeze({
+          userId,
+          scope: rule.scope,
+          companies: rule.scope === "companies" ? Object.freeze([...rule.companies]) : Object.freeze([])
+        });
+        return Object.freeze({ access, principalKey: principalKeyFromUserId(userId, access) });
+      });
+      await agent.warm({ principals });
+    } catch (error) {
+      statusWriter({ status: "agent_warm_failed" });
+      throw error;
+    }
+  }
   const handler = createLongConnectionHandler({ policy, agent, statusWriter });
   return Object.freeze({
     handleMessage: (frame, client) => handler.handleMessage(frame, client),

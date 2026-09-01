@@ -10,7 +10,8 @@
   "scripts": {
     "start": "node shared/wecom/server.js",
     "smoke:app-server": "node scripts/smoke-codex-app-server.js",
-    "test": "node tests/verify-facts.js && node tests/verify-charts.js && node tests/verify-access-control.js && node tests/verify-codex-app-server.js && node tests/verify-wecom-long-connection.js && powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\tests\\verify-secure-config.ps1",
+    "smoke:business": "node scripts/smoke-codex-app-server.js --business",
+    "test": "node tests/verify-facts.js && node tests/verify-charts.js && node tests/verify-access-control.js && node tests/verify-rag-knowledge-base.js && node tests/verify-codex-app-server.js && node tests/verify-wecom-long-connection.js && powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\tests\\verify-secure-config.ps1",
     "verify": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\verify-skill.ps1"
   },
   "dependencies": {

@@ -54,7 +54,7 @@ Codex 对话模式把最小图表规格写入 run-scoped JSON，然后执行：
 
 生成器只输出自包含 SVG，不允许脚本、外链、远程字体或网络资源。最终 SVG 位于 `%TEMP%\Codex\xbb-executive-analyst\charts`，保留最多 24 小时；规格文件生成后立即删除。
 
-企业微信 Agent 模式不得在模型沙箱中运行图表脚本。模型按结构化输出合同返回一张可选图表规范；桥接层使用同一确定性 SVG 渲染器并在内存中转成 PNG，以最终 `replyStream(..., finish=true, msg_item)` 图文消息发送。不得把 Base64、SVG、临时路径或图表规范正文发给用户或写入状态日志。
+企业微信 Agent 模式不得在模型沙箱中运行图表脚本。模型按结构化输出合同返回一张可选图表规范；桥接层使用同一确定性 SVG 渲染器并在内存中转成 PNG，优先通过官方 `uploadMedia` 与 `sendMediaMessage` 发送独立图片，无法使用媒体消息时才以最终 `replyStream(..., finish=true, msg_item)` 回退。不得把 Base64、SVG、临时路径或图表规范正文发给用户或写入状态日志。
 
 ## 安全与失败
 
@@ -67,6 +67,6 @@ Codex 对话模式把最小图表规格写入 run-scoped JSON，然后执行：
 - 每个已授权 USERID 与授权范围组合只能映射到自己的不可逆 principal 摘要和持久 Thread；状态保存在仓库外。Thread 在进程重启后通过 `thread/resume` 恢复，合约变化或授权范围变化时必须新建；不同用户上下文不得合并。
 - 持久 Thread 会在当前 Windows 用户的 Codex 本地历史中保存用户问题与已通过隐私/完整性校验的工具结果，这是提供连续上下文的必要数据；不得声称这些内容完全不落盘。仓库外 Agent 状态文件只保存 principal 摘要、Thread ID 和合约摘要，不保存问题或事实包。
 - 企业微信问题通过 `turn/start` 进入空闲 Thread。同一用户已有问题仍在处理时，新消息不得通过 `turn/steer` 改写当前经营问题；应立即告知当前忙碌，并让原消息继续完成。桥接进程重启时发现未完成 Turn，应先中断再接收新问题，不能把无调用方的旧任务继续发布。
-- App Server Thread 注册且只注册 `query_xbb` 这一项业务动态工具。Codex 不得用内置 shell、文件、网络、MCP 或 Skill 直接读取业务数据；授权与 bundled runner 调用必须留在桥接服务层。
+- App Server Thread 注册且只注册 `query_xbb` 这一项业务动态工具。可确定月份与数据域时，桥接服务允许在 `turn/start` 前通过同一工具网关预取当前问题的实时事实包，从而避免模型先花时间规划基础查询；不确定或需要实体消歧时保留动态工具调用。Codex 不得用内置 shell、文件、网络、MCP 或 Skill 直接读取业务数据；授权与 bundled runner 调用必须留在桥接服务层。
 - Codex 0.151.x 的 `dynamicTools` 协议要求客户端声明 `experimentalApi=true`；该声明只用于注册受控 `query_xbb`，不能借此增加其他业务工具、运行时工作区或未验收的实验能力。
 - 工具网关最多接受四轮调用，逐次校验参数、USERID 授权范围、事实包实时只读来源、隐私标志与 SHA-256 完整性，并在 `finally` 删除明文事实包。

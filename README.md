@@ -11,9 +11,13 @@
         ↕ 官方 WebSocket 长连接
 shared/wecom
         ↓ USERID 访问控制
+shared/rag（完整 Skill/合同切块、索引与内存缓存）
+        ↓ 每轮检索适用原文规则并确定基础数据域/月度
+shared/xbb（同一受控 query_xbb 网关实时预取）
+        ↓ 已校验本轮事实包
 shared/codex（回环 App Server + 每授权主体持久 Thread）
-        ↓ 每轮显式 xbb-executive-analyst Skill
-Codex Agent（ChatGPT 登录，gpt-5.6-sol/medium）
+        ↓ 规则片段 + 实时事实 + 问题 + 授权元数据
+Codex Agent（ChatGPT 登录，gpt-5.6-sol；事实 none / 深分析 medium）
         ↓ 唯一动态工具 query_xbb
 skills/xbb-executive-analyst/scripts/query-xbb.ps1
         ↓
@@ -64,7 +68,7 @@ cd D:\codex\xbb-executive-analyst
 & .\scripts\configure-bot.ps1 -WecomBotId '企微页面显示的Bot ID'
 ```
 
-脚本随后只安全读取企业微信机器人 Secret。模型直接复用本机 Codex 的 ChatGPT 登录，不询问也不保存 OpenAI API Key 或模型接口地址；正式配置固定使用旗舰模型 `gpt-5.6-sol` 与适合交互式客服的 `medium` 推理强度。
+脚本随后只安全读取企业微信机器人 Secret。模型直接复用本机 Codex 的 ChatGPT 登录，不询问也不保存 OpenAI API Key 或模型接口地址；正式配置固定使用旗舰模型 `gpt-5.6-sol`。已由实时事实包确定的汇总、排名、数量、占比和成交率走 `none` 快速生成路径；商机质量、原因、风险、预测、异常诊断和建议走配置的 `medium` 深分析路径，保留完整能力。
 
 Secret 使用 Windows DPAPI CurrentUser 加密，保存到：
 
@@ -166,7 +170,7 @@ Secret 使用 Windows DPAPI CurrentUser 加密，保存到：
 
 群聊中先添加机器人，再通过 `@机器人名称` 提问。正确结果应先显示真实运行状态，随后由完整最终答复覆盖；模型或 runner 失败时只返回失败，不使用固定文案数据、样例或旧结果。
 
-机器人后端是一个真正的专用 Codex Agent：桥接进程启动仅监听 `127.0.0.1` 的本机 App Server，并按“USERID + 当前授权范围”的不可逆摘要维护持久 Thread；进程重启后恢复 Thread，上下文不会跨用户共享。每轮都显式加载 `xbb-executive-analyst` Skill。空闲时使用 `turn/start`；同一用户已有问题仍在处理时，新消息会立即收到忙碌提示，不会通过 `turn/steer` 改写或延长原任务。
+机器人后端是一个真正的专用 Codex Agent：桥接进程启动仅监听 `127.0.0.1` 的本机 App Server，并按“USERID + 当前授权范围”的不可逆摘要维护持久 Thread；进程重启后恢复 Thread，上下文不会跨用户共享。服务在企微连接就绪前把完整 `xbb-executive-analyst` Skill 和全部引用合同按章节切块、索引并缓存在内存中，并为每个授权主体执行一次禁止取数的后台 Thread 预热；首次规则升级可能在后台耗时，完成后日常问题复用持久 Thread。后续每轮只检索与当前问题相关的原文规则。对于可确定月份和数据域的问题，桥接层在启动模型 Turn 前通过同一受控 `query_xbb` 网关实时预取事实，Codex 直接完成分析；事实不足或需要实体消歧时仍保留动态工具调用。空闲时使用 `turn/start`；同一用户已有问题仍在处理时，新消息会立即收到忙碌提示，不会通过 `turn/steer` 改写或延长原任务。RAG 与 Thread 预热不缓存经营事实；经营事实仍由每个问题实时查询。
 
 App Server 使用内存中的随机 capability token；命令行只有 token 的 SHA-256 校验值。模型运行在只读、无网络、永不申请批准的沙箱中。公司权限和 `query_xbb` 执行仍由桥接服务层强制，明文事实包由工具网关在 `finally` 中清除。
 
@@ -217,7 +221,7 @@ Get-ScheduledTask -TaskName 'Codex-XBB-Executive-Analyst-WeCom' |
 - `XBB_STATUS_LOG_PATH`，默认 `%LOCALAPPDATA%\Codex\xbb-executive-analyst\status.jsonl`，只记录固定连接/Agent 状态枚举和阶段耗时，不记录用户或业务内容
 - `XBB_CODEX_COMMAND`，仅在无法自动定位 Codex CLI 时指定绝对可执行文件路径
 - `XBB_CODEX_MODEL`，正式默认 `gpt-5.6-sol`
-- `XBB_CODEX_REASONING_EFFORT`，正式默认 `medium`；也支持 `minimal`、`low`、`high`、`xhigh` 或 `max`
+- `XBB_CODEX_REASONING_EFFORT`，正式默认 `medium`，作为复杂问题的深分析强度；已完成事实计算的简单问题固定走 `none`；配置仍支持 `none`、`minimal`、`low`、`high`、`xhigh` 或 `max`
 - `XBB_ACCESS_POLICY_PATH`
 
 只要 Bot ID 与 Secret 环境变量不完整，服务就读取 DPAPI 安全配置。普通桌面部署优先使用安全配置脚本，避免 Secret 出现在进程环境中。
@@ -231,7 +235,7 @@ npm test
 & .\scripts\verify-skill.ps1
 ```
 
-验证覆盖事实编译、图表安全、访问控制、App Server 协议、capability token 边界、持久 Thread 恢复与隔离、忙碌隔离、受控工具循环、长连接消息处理、排重、流式回复、隐私日志、连接配置和一次性 USERID 识别。测试构造数据只验证确定性代码，不会进入生产 runner 或作为答复回退。
+验证覆盖事实编译、图表安全、完整 Skill RAG 切块与按域检索、访问控制、App Server 协议、capability token 边界、持久 Thread 恢复与隔离、忙碌隔离、受控工具循环、长连接消息处理、排重、流式回复、独立图片发送、隐私日志、连接配置和一次性 USERID 识别。测试构造数据只验证确定性代码，不会进入生产 runner 或作为答复回退。
 
 ## 运行边界
 

@@ -3,7 +3,7 @@
 const crypto = require("node:crypto");
 const { AgentBusyError, principalKeyFromUserId } = require("../codex/persistent-agent.js");
 const { authorize, AccessDeniedError } = require("../security/access-control.js");
-const { createWecomChartItem } = require("./chart-image.js");
+const { createWecomChartImage } = require("./chart-image.js");
 const { MessageStore } = require("./message-store.js");
 
 function extractQuestion(message) {
@@ -43,8 +43,8 @@ function createLongConnectionHandler({
   streamIdFactory = defaultStreamId,
   principalKeyFactory = principalKeyFromUserId,
   statusWriter = () => {},
-  heartbeatMs = 30000,
-  chartRenderer = createWecomChartItem
+  heartbeatMs = 45000,
+  chartRenderer = createWecomChartImage
 }) {
   if (!policy || !agent?.answer) throw new Error("企业微信长连接处理器初始化参数不完整。");
 
@@ -68,7 +68,7 @@ function createLongConnectionHandler({
       }
 
       const initialContent = question
-        ? "Codex 经营分析 Agent 正在处理，请稍候……"
+        ? "正在查询，请稍候……"
         : "目前仅支持文字、语音转文字或图文中的文字经营问题。";
       const { state, isNew } = messageStore.begin({ messageId, userId, streamId: streamIdFactory(), content: initialContent });
 
@@ -119,16 +119,47 @@ function createLongConnectionHandler({
         answer = operationalFailure(error);
       }
       let msgItem = [];
+      let imageBuffer = null;
       if (chart) {
         try {
-          msgItem = [await chartRenderer(chart)];
+          const rendered = await chartRenderer(chart);
+          if (rendered?.item && Buffer.isBuffer(rendered.buffer)) {
+            msgItem = [rendered.item];
+            imageBuffer = rendered.buffer;
+          } else {
+            msgItem = [rendered];
+          }
           statusWriter({ status: "chart_generated" });
         } catch {
           statusWriter({ status: "chart_failed" });
         }
       }
-      messageStore.complete(messageId, answer, msgItem);
-      const reply = await client.replyStream(frame, state.streamId, answer, true, msgItem);
+      let uploadedMediaId = null;
+      const target = message.chattype === "group" ? String(message.chatid || "") : userId;
+      if (imageBuffer && target && typeof client.uploadMedia === "function" && typeof client.sendMediaMessage === "function") {
+        try {
+          const uploaded = await client.uploadMedia(imageBuffer, { type: "image", filename: "经营分析图表.png" });
+          uploadedMediaId = uploaded?.media_id || null;
+          if (!uploadedMediaId) throw new Error("企业微信未返回图片 media_id。");
+          statusWriter({ status: "chart_uploaded" });
+        } catch {
+          uploadedMediaId = null;
+        }
+      }
+      let standaloneDelivered = false;
+      if (uploadedMediaId) {
+        try {
+          await client.sendMediaMessage(target, "image", uploadedMediaId);
+          standaloneDelivered = true;
+          statusWriter({ status: "chart_delivered" });
+        } catch {
+          standaloneDelivered = false;
+        }
+      }
+      const inlineItems = standaloneDelivered ? [] : msgItem;
+      messageStore.complete(messageId, answer, inlineItems);
+      const reply = await client.replyStream(frame, state.streamId, answer, true, inlineItems);
+      if (inlineItems.length) statusWriter({ status: "chart_delivered" });
       statusWriter({ status: "reply_completed", elapsedMs: Date.now() - receivedAtMs });
       return reply;
     }

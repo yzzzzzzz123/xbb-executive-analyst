@@ -1,80 +1,84 @@
 "use strict";
 
+const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
-const { AppServerClient } = require("../shared/codex/app-server-client.js");
-const { LocalAppServerHost } = require("../shared/codex/app-server-host.js");
-const { buildThreadInstructions } = require("../shared/codex/thread-instructions.js");
-const { WECOM_RESPONSE_SCHEMA, parseAgentResponse } = require("../shared/codex/response-contract.js");
+const { PersistentCodexAgent, principalKeyFromUserId } = require("../shared/codex/persistent-agent.js");
 const { readCodexVersion, verifyCodexChatGptLogin } = require("../shared/codex/runtime.js");
-const { QUERY_XBB_DYNAMIC_TOOL } = require("../shared/xbb/query-tool.js");
+const { chooseTurnEffort } = require("../shared/xbb/fast-query-plan.js");
+
+function elapsed(startedAtMs) {
+  return Date.now() - startedAtMs;
+}
 
 async function runSmoke() {
+  const business = process.argv.includes("--business");
+  const repeatOption = process.argv.find((value) => value.startsWith("--repeat="));
+  const repeat = repeatOption ? Number(repeatOption.split("=")[1]) : 1;
+  if (!Number.isInteger(repeat) || repeat < 1 || repeat > 3) throw new Error("--repeat 必须是 1-3 的整数。");
   const projectRoot = path.resolve(__dirname, "..");
-  const config = { projectRoot, codexModel: "gpt-5.6-sol", codexReasoningEffort: "medium" };
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-agent-smoke-"));
+  const config = {
+    projectRoot,
+    agentStatePath: path.join(tempRoot, "agent-state.json"),
+    agentTurnTimeoutMs: 300000,
+    codexModel: "gpt-5.6-sol",
+    codexReasoningEffort: "medium"
+  };
   verifyCodexChatGptLogin(config);
   const codexVersion = readCodexVersion(config);
-  let host;
-  let client;
-  let timer;
+  const access = Object.freeze({ userId: "local-smoke", scope: "all", companies: Object.freeze([]) });
+  const principalKey = principalKeyFromUserId(access.userId, access);
+  const activities = [];
+  const agent = new PersistentCodexAgent(config);
+  agent.on("activity", (value) => activities.push({ at: Date.now(), ...value }));
   try {
-    host = await LocalAppServerHost.start(config);
-    client = new AppServerClient({ endpoint: host.endpoint, token: host.token, requestTimeoutMs: 60000 });
-    await client.connect();
-    const threadResult = await client.startThread({
-      model: config.codexModel,
-      allowProviderModelFallback: false,
-      cwd: projectRoot,
-      approvalPolicy: "never",
-      sandbox: "read-only",
-      developerInstructions: buildThreadInstructions(projectRoot),
-      ephemeral: true,
-      dynamicTools: [QUERY_XBB_DYNAMIC_TOOL]
-    });
-    const threadId = threadResult?.thread?.id;
-    if (typeof threadId !== "string" || !threadId) throw new Error("App Server smoke did not return a thread ID.");
+    await agent.start();
+    const warmStartedAtMs = Date.now();
+    await agent.warm({ access, principalKey });
+    const warmMs = elapsed(warmStartedAtMs);
 
-    let unexpectedToolCall = false;
-    client.on("serverRequest", (request) => {
-      unexpectedToolCall = true;
-      try { client.reject(request.id, "Smoke greeting must not call a business tool."); } catch {}
-    });
-    const completion = new Promise((resolve, reject) => {
-      timer = setTimeout(() => reject(new Error("Codex App Server smoke turn timed out.")), 300000);
-      client.on("notification", ({ method, params }) => {
-        if (method !== "turn/completed" || params?.threadId !== threadId) return;
-        const turn = params.turn;
-        const final = Array.isArray(turn?.items)
-          ? [...turn.items].reverse().find((item) => item?.type === "agentMessage" && typeof item.text === "string" && item.text.trim())
-          : null;
-        if (turn?.status !== "completed" || !final) reject(new Error("Codex App Server smoke turn did not produce a final answer."));
-        else {
-          try { resolve(parseAgentResponse(final.text.trim())); } catch (error) { reject(error); }
-        }
+    const question = business
+      ? "对集团2026年9月业绩按照公司名称排名，并区分课程和咨询占比。结论给老板看，尽量简短，并配一张图。"
+      : "你好。请只用一句中文说明你的专用身份，不要查询销帮帮。";
+    const runs = [];
+    for (let index = 0; index < repeat; index += 1) {
+      const answerStartedAtMs = Date.now();
+      const result = await agent.answer({
+        question,
+        access,
+        principalKey,
+        messageId: `${business ? "local-business" : "local-greeting"}-smoke-${index + 1}`
       });
-    });
-    await client.startTurn({
-      threadId,
-      clientUserMessageId: "local-smoke",
-      input: [
-        { type: "skill", name: "xbb-executive-analyst", path: path.join(projectRoot, "skills", "xbb-executive-analyst", "SKILL.md") },
-        { type: "text", text: "你好。请只用一句中文说明你的专用身份。这是连接冒烟测试，不要查询销帮帮。", text_elements: [] }
-      ],
-      cwd: projectRoot,
-      approvalPolicy: "never",
-      sandboxPolicy: { type: "readOnly", networkAccess: false },
+      const answerMs = elapsed(answerStartedAtMs);
+      const answerActivities = activities.filter((value) => value.at >= answerStartedAtMs);
+      const toolStarted = answerActivities.find((value) => value.status === "tool_started");
+      const toolCompleted = answerActivities.find((value) => value.status === "tool_completed");
+      if (!business && (result.chart !== null || toolStarted)) throw new Error("问候冒烟不应查询业务或生成图表。");
+      if (business && (!toolStarted || !toolCompleted)) throw new Error("业务冒烟未调用真实 query_xbb。");
+      if (business && !result.chart) throw new Error("业务冒烟未生成辅助图表。");
+      runs.push({
+        answerMs,
+        timeToToolMs: toolStarted ? toolStarted.at - answerStartedAtMs : null,
+        toolMs: toolCompleted?.elapsedMs ?? null,
+        hasChart: result.chart !== null,
+        answerBytes: Buffer.byteLength(result.answer, "utf8")
+      });
+    }
+    process.stdout.write(`${JSON.stringify({
+      success: true,
+      mode: business ? "live-business" : "greeting",
+      codexVersion,
       model: config.codexModel,
-      effort: config.codexReasoningEffort,
-      summary: "none",
-      outputSchema: WECOM_RESPONSE_SCHEMA
-    });
-    const response = await completion;
-    if (response.chart !== null) throw new Error("Codex App Server smoke greeting unexpectedly generated a chart.");
-    if (unexpectedToolCall) throw new Error("Codex App Server smoke greeting unexpectedly called query_xbb.");
-    process.stdout.write(`${JSON.stringify({ success: true, codexVersion, model: config.codexModel, effort: config.codexReasoningEffort, skill: "xbb-executive-analyst", toolCalls: 0 })}\n`);
+      configuredEffort: config.codexReasoningEffort,
+      turnEffort: chooseTurnEffort(question, config.codexReasoningEffort),
+      skill: "xbb-executive-analyst",
+      warmMs,
+      runs
+    })}\n`);
   } finally {
-    if (timer) clearTimeout(timer);
-    if (client) await client.close().catch(() => {});
-    if (host) await host.close().catch(() => {});
+    await agent.close().catch(() => {});
+    fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 }
 
