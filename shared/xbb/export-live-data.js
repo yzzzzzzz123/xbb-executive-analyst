@@ -9,10 +9,11 @@ const CORPID = String(process.env.XBB_CORPID || "");
 const API_TOKEN = String(process.env.XBB_API_TOKEN || "");
 
 const FORM = Object.freeze({
-  performance: 6404920,
+  performance: 5614255,
   oppOrder: 6707824,
   course: 7452529,
-  booking: 7452855,
+  booking: 7642173,
+  deliveryBooking: 7452855,
   product: 5614247,
   opportunity: 5614253,
   follow: 5614251
@@ -20,6 +21,7 @@ const FORM = Object.freeze({
 
 const ENDPOINT = Object.freeze({
   paas: "/api/paas/list",
+  contract: "/api/contract/list",
   opportunity: "/api/opportunity/list",
   follow: "/api/communicate/list",
   product: "/api/product/list",
@@ -28,21 +30,30 @@ const ENDPOINT = Object.freeze({
 });
 
 const FIELD_ALLOWLIST = Object.freeze({
-  performance: ["date_1", "text_3", "text_5", "text_26", "num_3", "num_6"],
-  oppOrder: ["date_1", "text_3", "text_6", "text_10", "num_1", "num_5"],
-  course: ["date_1", "date_2", "text_1", "text_7", "text_10", "num_3", "num_6", "num_9", "num_10"],
-  booking: ["date_3", "text_2", "text_6", "text_7", "text_8", "text_9", "text_25", "text_26", "text_36", "text_39", "text_40", "num_1", "num_2", "num_3"],
+  performance: ["date_1", "text_63", "text_28", "num_1", "array_4", "text_3", "text_5", "text_26", "num_3", "num_6"],
+  oppOrder: ["date_1", "text_31", "array_4", "text_3", "text_6", "text_10", "num_1", "num_5"],
+  course: ["date_1", "date_2", "text_1", "text_5", "text_7", "text_10", "num_3", "num_6", "num_9", "num_10"],
+  booking: ["date_1", "date_3", "text_5", "text_22", "text_2", "text_36", "num_1", "num_2"],
+  deliveryBooking: ["date_3", "text_2", "text_6", "text_7", "text_8", "text_9", "text_25", "text_26", "text_36", "text_39", "text_40", "num_1", "num_2", "num_3"],
   product: ["text_1", "text_6", "text_15"],
   opportunity: ["creatorId", "ownerId", "text_1", "text_2", "text_3", "text_11", "text_12", "text_17", "text_20", "text_23", "text_24", "array_1", "num_1", "num_14"],
   follow: ["creatorId", "date_1", "text_1", "text_5", "text_6", "text_8", "text_10", "text_15", "text_22", "text_23"]
 });
 
+const SUBTABLE_ALLOWLIST = Object.freeze({
+  performance: Object.freeze({ array_4: Object.freeze(["text_10", "num_5", "text_1", "num_3"]) }),
+  oppOrder: Object.freeze({ array_4: Object.freeze(["text_1", "num_3", "num_5"]) })
+});
+
 const RELATION_FIELDS = new Set([
+  "performance.text_28",
   "performance.text_26",
   "oppOrder.text_10",
+  "booking.text_5",
   "booking.text_2",
-  "booking.text_8",
-  "booking.text_9",
+  "deliveryBooking.text_2",
+  "deliveryBooking.text_8",
+  "deliveryBooking.text_9",
   "opportunity.creatorId",
   "opportunity.ownerId",
   "opportunity.text_3",
@@ -53,7 +64,7 @@ const RELATION_FIELDS = new Set([
   "follow.text_22"
 ]);
 
-const REDACTED_TEXT_FIELDS = new Set(["booking.text_39", "follow.text_6"]);
+const REDACTED_TEXT_FIELDS = new Set(["deliveryBooking.text_39", "follow.text_6"]);
 const SYSTEM_LABELS = Object.freeze({
   creatorId: "创建人",
   ownerId: "负责人"
@@ -217,14 +228,30 @@ async function listAll(endpoint, payload, listKey = "list") {
 
 function buildSchema(explainList) {
   const schema = new Map();
-  for (const field of explainList || []) {
-    const items = new Map();
-    for (const item of field.items || []) items.set(String(item.value), asText(item.text));
-    schema.set(field.attr, {
-      name: asText(field.attrName) || field.attr,
-      items
-    });
-  }
+  const visit = (value, prefix = "") => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, prefix);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    const attr = asText(value.attr);
+    let childPrefix = prefix;
+    if (attr) {
+      const key = prefix ? `${prefix}.${attr}` : attr;
+      const items = new Map();
+      for (const item of value.items || []) items.set(String(item.value), asText(item.text));
+      schema.set(key, {
+        name: asText(value.attrName) || attr,
+        items
+      });
+      if (/^array_\d+$/.test(attr)) childPrefix = key;
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (["items", "attr", "attrName"].includes(key)) continue;
+      if (child && typeof child === "object") visit(child, childPrefix);
+    }
+  };
+  visit(explainList || []);
   return schema;
 }
 
@@ -241,10 +268,22 @@ function decode(schema, attr, raw) {
 
 async function loadMetadata() {
   const entries = await Promise.all(Object.entries(FORM).map(async ([name, formId]) => {
-    const result = await xbbPost(ENDPOINT.form, { formId });
-    return [name, buildSchema(result.explainList)];
+    try {
+      const result = await xbbPost(ENDPOINT.form, { formId });
+      return [name, buildSchema(result.explainList)];
+    } catch (error) {
+      throw new Error(`读取 ${name} 表单 ${formId} 定义失败：${error.message}`, { cause: error });
+    }
   }));
   return Object.fromEntries(entries);
+}
+
+async function loadNamedCollection(name, formId, loader) {
+  try {
+    return await loader();
+  } catch (error) {
+    throw new Error(`读取 ${name} 表单 ${formId} 数据失败：${error.message}`, { cause: error });
+  }
 }
 
 async function loadProducts(ids) {
@@ -258,6 +297,20 @@ async function loadProducts(ids) {
     }));
   }
   return rows.map(flattenRecord);
+}
+
+async function loadPaasByRelation(formId, attr, ids) {
+  const unique = Array.from(new Set(ids.map(asText).filter(Boolean)));
+  const rows = [];
+  for (let index = 0; index < unique.length; index += 50) {
+    const batch = unique.slice(index, index + 50).map((value) => /^\d+$/.test(value) ? Number(value) : value);
+    rows.push(...await listAll(ENDPOINT.paas, {
+      formId,
+      conditions: [{ attr, value: batch, symbol: "equal" }],
+      viewApproval: 0
+    }));
+  }
+  return rows;
 }
 
 async function loadUsers(ids) {
@@ -309,6 +362,24 @@ function normalizeRelation(value) {
 
 function normalizeValue(collection, attr, raw, schema) {
   if (raw === undefined || raw === null || raw === "") return null;
+  const subfields = SUBTABLE_ALLOWLIST[collection] && SUBTABLE_ALLOWLIST[collection][attr];
+  if (subfields) {
+    return parseMaybeArray(raw).map((item) => {
+      let row = item;
+      if (typeof row === "string") {
+        try { row = JSON.parse(row); } catch { return null; }
+      }
+      if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+      const values = row.data && typeof row.data === "object" && !Array.isArray(row.data) ? row.data : row;
+      const normalized = {};
+      for (const subfield of subfields) {
+        const value = normalizeValue(collection, `${attr}.${subfield}`, values[subfield], schema);
+        if (value === null || value === "" || (Array.isArray(value) && !value.length)) continue;
+        normalized[subfield] = value;
+      }
+      return Object.keys(normalized).length ? normalized : null;
+    }).filter(Boolean);
+  }
   const key = `${collection}.${attr}`;
   if (RELATION_FIELDS.has(key)) return normalizeRelation(raw);
   if (REDACTED_TEXT_FIELDS.has(key)) return redactText(raw).slice(0, 500);
@@ -328,6 +399,14 @@ function fieldCatalog(collection, schema) {
       label: field ? field.name : (SYSTEM_LABELS[attr] || attr),
       options: field ? Object.fromEntries(field.items) : {}
     };
+    for (const subfield of (SUBTABLE_ALLOWLIST[collection] && SUBTABLE_ALLOWLIST[collection][attr]) || []) {
+      const nestedAttr = `${attr}.${subfield}`;
+      const nested = schema && schema.get(nestedAttr);
+      catalog[nestedAttr] = {
+        label: nested ? nested.name : nestedAttr,
+        options: nested ? Object.fromEntries(nested.items) : {}
+      };
+    }
   }
   return catalog;
 }
@@ -367,20 +446,27 @@ function normalizeUser(user) {
 
 async function buildLiveDataset(month) {
   const range = monthRange(month);
-  const [metadata, performanceRaw, oppOrdersRaw, coursesRaw, bookingsRaw, opportunitiesRaw, followsRaw] = await Promise.all([
+  const [metadata, performanceRaw, oppOrdersRaw, coursesRaw, deliveryBookingsRaw, opportunitiesRaw, followsRaw] = await Promise.all([
     loadMetadata(),
-    listAll(ENDPOINT.paas, { formId: FORM.performance, conditions: dateConditions("date_1", range), viewApproval: 0 }),
-    listAll(ENDPOINT.paas, { formId: FORM.oppOrder, conditions: dateConditions("date_1", range), viewApproval: 0 }),
-    listAll(ENDPOINT.paas, { formId: FORM.course, conditions: dateConditions("date_1", range), viewApproval: 0 }),
-    listAll(ENDPOINT.paas, { formId: FORM.booking, conditions: dateConditions("date_3", range), viewApproval: 0 }),
-    listAll(ENDPOINT.opportunity, { formId: FORM.opportunity, conditions: dateConditions("addTime", range), viewApproval: 0 }),
-    listAll(ENDPOINT.follow, { conditions: dateConditions("date_1", range), viewApproval: 0 })
+    loadNamedCollection("performance", FORM.performance, () => listAll(ENDPOINT.contract, { formId: FORM.performance, conditions: dateConditions("date_1", range), viewApproval: 0 })),
+    loadNamedCollection("oppOrder", FORM.oppOrder, () => listAll(ENDPOINT.paas, { formId: FORM.oppOrder, conditions: dateConditions("date_1", range), viewApproval: 0 })),
+    loadNamedCollection("course", FORM.course, () => listAll(ENDPOINT.paas, { formId: FORM.course, conditions: dateConditions("date_1", range), viewApproval: 0 })),
+    loadNamedCollection("deliveryBooking", FORM.deliveryBooking, () => listAll(ENDPOINT.paas, { formId: FORM.deliveryBooking, conditions: dateConditions("date_3", range), viewApproval: 0 })),
+    loadNamedCollection("opportunity", FORM.opportunity, () => listAll(ENDPOINT.opportunity, { formId: FORM.opportunity, conditions: dateConditions("addTime", range), viewApproval: 0 })),
+    loadNamedCollection("follow", FORM.follow, () => listAll(ENDPOINT.follow, { conditions: dateConditions("date_1", range), viewApproval: 0 }))
   ]);
+
+  const courseIds = coursesRaw.map((row) => row.dataId).filter(Boolean);
+  const bookingsRaw = courseIds.length
+    ? await loadNamedCollection("booking", FORM.booking, () => loadPaasByRelation(FORM.booking, "text_5", courseIds))
+    : [];
 
   const performance = performanceRaw.map(flattenRecord).filter((row) => inRange(row, "date_1", range));
   const oppOrder = oppOrdersRaw.map(flattenRecord).filter((row) => inRange(row, "date_1", range));
   const course = coursesRaw.map(flattenRecord).filter((row) => inRange(row, "date_1", range));
-  const booking = bookingsRaw.map(flattenRecord).filter((row) => inRange(row, "date_3", range));
+  const courseIdSet = new Set(courseIds.map(asText));
+  const booking = bookingsRaw.map(flattenRecord).filter((row) => courseIdSet.has(relationId(row.text_5)));
+  const deliveryBooking = deliveryBookingsRaw.map(flattenRecord).filter((row) => inRange(row, "date_3", range));
   const opportunity = opportunitiesRaw.map(flattenRecord).filter((row) => inRange(row, "addTime", range));
   const follow = followsRaw.map(flattenRecord).filter((row) => inRange(row, "date_1", range));
 
@@ -398,7 +484,7 @@ async function buildLiveDataset(month) {
     range,
     loadedAt: new Date().toISOString(),
     metadata,
-    collections: { performance, oppOrder, course, booking, product, opportunity, follow },
+    collections: { performance, oppOrder, course, booking, deliveryBooking, product, opportunity, follow },
     users
   };
 }
@@ -435,6 +521,7 @@ function buildSourceBundle(dataset) {
       formIds: FORM,
       endpoints: [
         "/pro/v2/api/paas/list",
+        "/pro/v2/api/contract/list",
         "/pro/v2/api/opportunity/list",
         "/pro/v2/api/communicate/list",
         "/pro/v2/api/product/list",

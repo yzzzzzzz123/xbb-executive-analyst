@@ -7,7 +7,7 @@
 - 明文事实包是单次运行临时文件，必须在成功或失败后删除。运行密钥、访问策略、日志与状态不得写入仓库。
 - 企业微信用户必须先通过访问策略授权，再进入模型或销帮帮查询；公司级用户只能查询明确授权的公司。
 - 国内版企业微信正式接入使用普通员工可在客户端创建的智能机器人 WebSocket 长连接，只读取 Bot ID 与 DPAPI 保护的 Secret；不得要求公网回调、管理员自建应用、Token 或 EncodingAESKey。
-- 本项目不使用 Git worktree、RAG 或多 Agent 编排。
+- 本项目不使用 Git worktree 或多 Agent 编排。企业微信 Agent 只允许使用 `shared/rag` 的本地内存 Skill RAG；RAG 只索引 Skill 与合同，不缓存经营事实，也不接入外部向量库。
 - 企业微信正式模型链路只允许常驻 Codex App Server + 持久 Thread；禁止恢复每消息一次的 `codex exec`、外部 Chat Completions 或无状态模型 JSON 循环。
 
 # 验证要求

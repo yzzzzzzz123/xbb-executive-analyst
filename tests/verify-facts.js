@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const { buildFactPack, classifyProduct } = require("../shared/xbb/build-fact-pack.js");
+const { buildSourceBundle } = require("../shared/xbb/export-live-data.js");
 
 const rel = (id) => ({ id: `rel_${id}` });
 const record = (collection, id, fields, extra = {}) => ({
@@ -19,20 +20,25 @@ const record = (collection, id, fields, extra = {}) => ({
 function sourceFixture() {
   const records = {
     performance: [
-      record("performance", "pf1", { date_1: 1767258000, text_3: "公司A", text_26: rel("p1"), num_3: 1, num_6: 100 }),
-      record("performance", "pf2", { date_1: 1767344400, text_3: "公司A", text_26: rel("p2"), num_3: 1, num_6: 50 }),
-      record("performance", "pf3", { date_1: 1767430800, text_3: "公司A", text_26: rel("p4"), num_3: 2, num_6: 200 }),
-      record("performance", "pf4", { date_1: 1767517200, text_3: "公司B", text_26: rel("p1"), num_3: 1, num_6: 80 })
+      record("performance", "pf1", { date_1: 1767258000, text_63: "公司A", text_28: rel("c1"), num_1: 500, array_4: [{ text_10: "课程", text_1: "经营训练营", num_3: 1, num_5: 100 }] }),
+      record("performance", "pf2", { date_1: 1767344400, text_63: "公司A", array_4: [{ text_10: "咨询", text_1: "管理咨询", num_3: 1, num_5: 50 }] }),
+      record("performance", "pf3", { date_1: 1767430800, text_63: "公司A", array_4: [{ text_10: "课程", text_1: "商业操盘", num_3: 2, num_5: 200 }] }),
+      record("performance", "pf4", { date_1: 1767517200, text_63: "公司B", array_4: [{ text_10: "课程", text_1: "经营训练营", num_3: 1, num_5: 80 }] }),
+      record("performance", "pf5", { date_1: 1767603600, text_63: "公司A", array_4: [{ text_10: "课程", text_1: "商业操盘复训", num_3: 1, num_5: 60 }] })
     ],
     oppOrder: [
-      record("oppOrder", "oo1", { date_1: 1767258000, text_6: "公司A", text_10: rel("p3"), num_1: 3, num_5: 300 })
+      record("oppOrder", "oo1", { date_1: 1767258000, text_31: "公司A", array_4: [{ text_1: "OPP门票", num_3: 3, num_5: 300 }] })
     ],
     course: [
-      record("course", "c1", { date_1: 1767258000, text_1: "交付一班", text_7: "已结束", text_10: "交付课程", num_3: 2, num_6: 1, num_9: 500, num_10: 400 })
+      record("course", "c1", { date_1: 1767258000, text_1: "交付一班", text_5: "公司A", text_7: "已结束", text_10: "交付课程", num_10: 400 })
     ],
     booking: [
-      record("booking", "b1", { date_3: 1767258000, text_2: rel("c1"), text_7: "业绩订单", text_8: rel("order1"), text_26: "公司A", text_36: "客户企业1", num_1: 1, num_2: 1, num_3: 100 }),
-      record("booking", "b2", { date_3: 1767258000, text_2: rel("c1"), text_7: "业绩订单", text_8: rel("order1"), text_26: "公司A", text_36: "客户企业1", num_1: 1, num_2: 1, num_3: 100 })
+      record("booking", "b1", { text_5: rel("c1"), text_22: "老板", text_36: "客户企业1" }),
+      record("booking", "b2", { text_5: rel("c1"), text_22: "员工", text_36: "客户企业2" })
+    ],
+    deliveryBooking: [
+      record("deliveryBooking", "db1", { date_3: 1767258000, text_2: rel("c1"), text_7: "业绩订单", text_8: rel("order1"), text_26: "公司A", text_36: "客户企业1", num_1: 1, num_2: 1, num_3: 100 }),
+      record("deliveryBooking", "db2", { date_3: 1767258000, text_2: rel("c1"), text_7: "业绩订单", text_8: rel("order1"), text_26: "公司A", text_36: "客户企业1", num_1: 1, num_2: 1, num_3: 100 })
     ],
     product: [
       record("product", "p1", { text_1: "经营训练营", text_6: "训练营", text_15: "前端" }),
@@ -62,7 +68,7 @@ function sourceFixture() {
       live: true,
       readOnly: true,
       dataSource: "xbb-openapi",
-      formIds: { performance: 6404920, oppOrder: 6707824, course: 7452529, booking: 7452855, product: 5614247, opportunity: 5614253, follow: 5614251 },
+      formIds: { performance: 5614255, oppOrder: 6707824, course: 7452529, booking: 7642173, deliveryBooking: 7452855, product: 5614247, opportunity: 5614253, follow: 5614251 },
       recordCounts: Object.fromEntries(Object.entries(records).map(([key, rows]) => [key, rows.length]))
     },
     privacy: { telephoneFieldsExported: false, credentialFieldsExported: false },
@@ -72,21 +78,41 @@ function sourceFixture() {
 }
 
 function main() {
+  const normalized = buildSourceBundle({
+    month: "2026-01",
+    range: { month: "2026-01", start: 1767196800, end: 1769875199 },
+    loadedAt: "2026-01-31T10:00:00.000Z",
+    metadata: Object.fromEntries(["performance", "oppOrder", "course", "booking", "deliveryBooking", "product", "opportunity", "follow"].map((name) => [name, new Map()])),
+    collections: {
+      performance: [{ dataId: "raw-pf1", serialNo: "PF-1", date_1: 1767258000, text_63: "公司A", array_4: JSON.stringify([{ text_10: "课程", text_1: "经营训练营", num_3: 2, num_5: 200 }]) }],
+      oppOrder: [], course: [], booking: [], deliveryBooking: [], product: [], opportunity: [], follow: []
+    },
+    users: []
+  });
+  assert.equal(normalized.provenance.formIds.performance, 5614255);
+  assert.equal(normalized.provenance.formIds.booking, 7642173);
+  assert.deepEqual(normalized.records.performance[0].fields.array_4, [{ text_10: "课程", num_5: 200, text_1: "经营训练营", num_3: 2 }]);
+
   const source = sourceFixture();
   const pack = buildFactPack(source, { domains: "all" });
   assert.equal(pack.status, "ready");
-  assert.equal(pack.facts.performance.summary.total, 430);
-  assert.equal(pack.facts.performance.summary.course, 180);
+  assert.equal(pack.facts.performance.summary.total, 490);
+  assert.equal(pack.facts.performance.summary.course, 440);
   assert.equal(pack.facts.performance.summary.consulting, 50);
-  assert.equal(pack.facts.performance.summary.other, 200);
+  assert.equal(pack.facts.performance.summary.other, 0);
   assert.equal(pack.facts.productSales.summary.ticketCount, 3);
   assert.equal(pack.facts.productSales.summary.oppOrderQuantity, 3);
-  assert.equal(pack.facts.productSales.summary.commercialCount, 2);
+  assert.equal(pack.facts.productSales.summary.commercialCount, 3);
+  assert.equal(pack.facts.productSales.summary.commercialInitialCount, 2);
+  assert.equal(pack.facts.productSales.summary.commercialRetrainingCount, 1);
   assert.equal(pack.facts.productSales.summary.openOppRevenue, 300);
   assert.equal(pack.facts.courses.summary.courseCount, 1);
-  assert.equal(pack.facts.courses.summary.firms, 1);
-  assert.equal(pack.facts.courses.summary.bosses, 2);
+  assert.equal(pack.facts.courses.summary.firms, 2);
+  assert.equal(pack.facts.courses.summary.bosses, 1);
+  assert.equal(pack.facts.courses.summary.students, 2);
+  assert.equal(pack.facts.courses.summary.dealAmount, 500);
   assert.equal(pack.facts.courses.summary.conversionRate, 50);
+  assert.equal(pack.facts.courses.courses[0].primaryCompanyBasis, "课程表举办方 text_5");
   assert.equal(pack.facts.delivery.summary.invitations, 2);
   assert.equal(pack.facts.delivery.summary.attributedPaidAmount, 100);
   assert.equal(pack.facts.opportunities.summary.createdCount, 1);
@@ -109,7 +135,7 @@ function main() {
   assert.ok(ambiguous.entityResolution.company.candidates.length >= 2);
   assert.deepEqual(ambiguous.facts, {});
 
-  process.stdout.write(`${JSON.stringify({ success: true, checks: 28, factPackSha256: pack.integrity.factPackSha256 })}\n`);
+  process.stdout.write(`${JSON.stringify({ success: true, checks: 37, factPackSha256: pack.integrity.factPackSha256 })}\n`);
 }
 
 main();

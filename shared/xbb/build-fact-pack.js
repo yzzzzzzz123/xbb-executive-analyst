@@ -118,21 +118,105 @@ function bookingCompany(booking) {
   return recordCompany(booking, "text_26", "text_25", "text_36");
 }
 
-function classifyProduct(product, fallbackName = "") {
+function classifyProduct(product, fallbackName = "", explicitCategory = "") {
   const name = asText(field(product, "text_1")) || asText(fallbackName) || "未命名产品";
-  const categoryRaw = asText(field(product, "text_6"));
+  const categoryRaw = asText(explicitCategory) || asText(field(product, "text_6"));
   const category = categoryRaw.toLocaleLowerCase("zh-CN");
   const frontBack = asText(field(product, "text_15")) || "未分类";
-  const classificationBasis = product ? "product-master" : (asText(fallbackName) ? "business-record-product-name" : "unclassified");
+  const classificationBasis = asText(explicitCategory)
+    ? "sales-order-line-category"
+    : product
+      ? "product-master"
+      : (asText(fallbackName) ? "business-record-product-name" : "unclassified");
   let businessType = "其他";
-  if (COURSE_CATEGORIES.has(category)) businessType = "课程";
-  else if (CONSULT_CATEGORIES.has(category)) businessType = "咨询";
+  if (COURSE_CATEGORIES.has(category) || /课程|训练营|考培|会员卡|内训|游学|认证|工作坊|商业操盘/.test(category)) businessType = "课程";
+  else if (CONSULT_CATEGORIES.has(category) || /咨询|顾问|专项|调研|服务/.test(category)) businessType = "咨询";
   else if (/(课程|研讨会|训练营|私训营|游学|沙龙|门票|opp|班|通$)/i.test(name)) businessType = "课程";
   else if (/(咨询|顾问|专项|调研|服务)/i.test(name)) businessType = "咨询";
   const isOpen = frontBack === "前端" || frontBack === "OPP" || category === "opp" || /(门票|开源|opp)/i.test(name);
   const isTicket = /门票|票务/.test(name) || (category === "opp" && /票|opp/i.test(name));
   const isCommercial = /商业操盘/.test(name);
-  return { name, category: categoryRaw || "未分类", frontBack, businessType, isOpen, isTicket, isCommercial, classificationBasis };
+  const isCommercialRetraining = isCommercial && /复训/.test(name);
+  return {
+    name,
+    category: categoryRaw || "未分类",
+    frontBack,
+    businessType,
+    isOpen,
+    isTicket,
+    isCommercial,
+    isCommercialInitial: isCommercial && !isCommercialRetraining,
+    isCommercialRetraining,
+    classificationBasis
+  };
+}
+
+function subtableItems(record, attr = "array_4") {
+  const value = field(record, attr);
+  if (!Array.isArray(value)) return [];
+  return value.filter((item) => item && typeof item === "object" && !Array.isArray(item));
+}
+
+function performanceLineRows(source, products) {
+  const rows = [];
+  for (const record of source.records.performance || []) {
+    const company = recordCompany(record, "text_63", "text_3");
+    const date = localDate(field(record, "date_1"));
+    const items = subtableItems(record);
+    if (items.length) {
+      for (const item of items) {
+        rows.push({
+          record,
+          company,
+          amount: safeNumber(item.num_5),
+          quantity: safeNumber(item.num_3),
+          date,
+          product: classifyProduct(undefined, item.text_1, item.text_10)
+        });
+      }
+      continue;
+    }
+    rows.push({
+      record,
+      company,
+      amount: safeNumber(field(record, "num_6")),
+      quantity: safeNumber(field(record, "num_3")),
+      date,
+      product: classifyProduct(productFor(record, "text_26", products), field(record, "text_5"))
+    });
+  }
+  return rows;
+}
+
+function oppOrderLineRows(source, products) {
+  const rows = [];
+  for (const record of source.records.oppOrder || []) {
+    const company = recordCompany(record, "text_31", "text_6");
+    const date = localDate(field(record, "date_1"));
+    const items = subtableItems(record);
+    if (items.length) {
+      for (const item of items) {
+        rows.push({
+          record,
+          company,
+          quantity: safeNumber(item.num_3),
+          revenue: safeNumber(item.num_5),
+          date,
+          product: classifyProduct(undefined, item.text_1)
+        });
+      }
+      continue;
+    }
+    rows.push({
+      record,
+      company,
+      quantity: safeNumber(field(record, "num_1")),
+      revenue: safeNumber(field(record, "num_5")),
+      date,
+      product: classifyProduct(productFor(record, "text_10", products), field(record, "text_3"))
+    });
+  }
+  return rows;
 }
 
 function productMap(source) {
@@ -172,32 +256,55 @@ function dayTrend(rows, dateFn, valueFns) {
 function buildCourseFacts(source) {
   const courses = source.records.course || [];
   const bookings = source.records.booking || [];
-  const bookingsByCourse = groupBy(bookings, (booking) => relationId(field(booking, "text_2")));
+  const deliveryBookings = source.records.deliveryBooking || [];
+  const performanceOrders = source.records.performance || [];
+  const bookingsByCourse = groupBy(bookings, (booking) => relationId(field(booking, "text_5")) || relationId(field(booking, "text_2")));
+  const deliveryBookingsByCourse = groupBy(deliveryBookings, (booking) => relationId(field(booking, "text_2")));
+  const ordersByCourse = groupBy(performanceOrders, (order) => relationId(field(order, "text_28")));
   return courses.map((course) => {
     const linkedBookings = bookingsByCourse.get(entityId(course)) || [];
-    const bookedCustomers = safeNumber(field(course, "num_3")) || linkedBookings.length;
-    const dealOrders = safeNumber(field(course, "num_6"));
-    const primaryCompany = mostFrequent(linkedBookings.map(bookingCompany));
+    const linkedDeliveryBookings = deliveryBookingsByCourse.get(entityId(course)) || [];
+    const linkedOrders = ordersByCourse.get(entityId(course)) || [];
+    const checklistBookings = linkedBookings.some((booking) => field(booking, "text_5"));
+    const bookedCustomers = checklistBookings ? linkedBookings.length : (safeNumber(field(course, "num_3")) || linkedBookings.length);
+    const roleValues = linkedBookings.map((booking) => asText(field(booking, "text_22"))).filter(Boolean);
+    const dealOrders = linkedOrders.length || safeNumber(field(course, "num_6"));
+    const organizer = recordCompany(course, "text_5");
+    const inferredCompany = mostFrequent((linkedDeliveryBookings.length ? linkedDeliveryBookings : linkedBookings).map(bookingCompany));
+    const primaryCompany = organizer !== "未标公司" ? organizer : inferredCompany;
+    const dealAmount = linkedOrders.length
+      ? sum(linkedOrders, (order) => field(order, "num_1"))
+      : safeNumber(field(course, "num_9"));
+    const firmNames = unique(linkedBookings.map((booking) => asText(field(booking, "text_36"))));
     return {
       entityId: entityId(course),
       evidenceRef: course.evidenceRef,
-      evidenceRefs: unique([course.evidenceRef, ...evidenceRefs(linkedBookings)]),
+      evidenceRefs: unique([course.evidenceRef, ...evidenceRefs(linkedBookings), ...evidenceRefs(linkedDeliveryBookings), ...evidenceRefs(linkedOrders)]),
       name: asText(field(course, "text_1")) || "未命名课程",
       type: asText(field(course, "text_10")) || "未分类课程",
       status: asText(field(course, "text_7")) || "未标状态",
       date: localDate(field(course, "date_1")),
       timestamp: safeNumber(field(course, "date_1")),
       primaryCompany,
-      primaryCompanyBasis: "同一课程约课记录中订单所属公司出现次数最多者；不是课程组织公司字段",
+      primaryCompanyBasis: organizer !== "未标公司"
+        ? "课程表举办方 text_5"
+        : "课程举办方缺失，回退为同一课程邀约记录中订单所属公司的众数",
       bookedCustomers,
-      firms: new Set(linkedBookings.map((booking) => asText(field(booking, "text_36")) || booking.recordId)).size,
-      bosses: sum(linkedBookings, (booking) => field(booking, "num_1")),
-      students: sum(linkedBookings, (booking) => field(booking, "num_2")),
+      firms: firmNames.length,
+      bosses: roleValues.length
+        ? roleValues.filter((role) => role === "老板" || role.includes("老板")).length
+        : sum(linkedBookings, (booking) => field(booking, "num_1")),
+      students: roleValues.length ? linkedBookings.length : sum(linkedBookings, (booking) => field(booking, "num_2")),
       dealOrders,
-      dealAmount: safeNumber(field(course, "num_9")),
+      dealAmount,
       paidAmount: safeNumber(field(course, "num_10")),
       conversionRate: percentage(dealOrders, bookedCustomers),
-      linkedBookings
+      conversionBasis: linkedOrders.length
+        ? "关联业绩订单数 ÷ 学员约课明细数"
+        : "课程表成交订单数 num_6 ÷ 已预约客户数 num_3",
+      linkedBookings,
+      linkedDeliveryBookings,
+      linkedOrders
     };
   });
 }
@@ -211,8 +318,8 @@ function collectCompanyCandidates(source, courseFacts) {
     row.domains.add(domain);
     counts.set(value, row);
   };
-  for (const row of source.records.performance || []) add(field(row, "text_3"), "performance");
-  for (const row of source.records.oppOrder || []) add(field(row, "text_6"), "product-sales");
+  for (const row of source.records.performance || []) add(recordCompany(row, "text_63", "text_3"), "performance");
+  for (const row of source.records.oppOrder || []) add(recordCompany(row, "text_31", "text_6"), "product-sales");
   for (const row of source.records.booking || []) add(bookingCompany(row), "courses");
   for (const row of courseFacts) add(row.primaryCompany, "courses");
   for (const row of source.records.opportunity || []) add(field(row, "text_11"), "opportunities");
@@ -255,16 +362,7 @@ function resolveEntity(input, candidates, type) {
 }
 
 function buildPerformance(source, products, company) {
-  const normalized = (source.records.performance || []).map((record) => {
-    const product = classifyProduct(productFor(record, "text_26", products), field(record, "text_5"));
-    return {
-      record,
-      company: recordCompany(record, "text_3"),
-      amount: safeNumber(field(record, "num_6")),
-      date: localDate(field(record, "date_1")),
-      product
-    };
-  });
+  const normalized = performanceLineRows(source, products);
   const selected = company ? normalized.filter((row) => row.company === company) : normalized;
   const ranking = Array.from(groupBy(selected, (row) => row.company).entries()).map(([name, rows]) => {
     const total = sum(rows, (row) => row.amount);
@@ -289,9 +387,9 @@ function buildPerformance(source, products, company) {
   const other = total - course - consulting;
   return {
     definitions: {
-      amount: "业绩回款表 num_6，按业务日期 date_1 归月",
-      company: "业绩回款表 text_3",
-      mix: "优先依据关联产品主数据；产品主数据不可用时，仅按业务记录中的明确产品名称关键词分类，其余进入其他"
+      amount: "业绩订单 5614255 的产品明细 array_4.num_5（售价小计），按签订日期 date_1 归月",
+      company: "业绩订单所属公司 text_63",
+      mix: "优先使用产品明细分类 array_4.text_10 区分课程、咨询和其他；分类缺失时只按明确产品名称关键词补充识别"
     },
     summary: { total, companyCount: ranking.length, course, consulting, other, courseShare: percentage(course, total), consultingShare: percentage(consulting, total), otherShare: percentage(other, total) },
     ranking,
@@ -306,30 +404,8 @@ function buildPerformance(source, products, company) {
 
 function buildProductSales(source, products, company) {
   const rows = [];
-  for (const record of source.records.oppOrder || []) {
-    const product = classifyProduct(productFor(record, "text_10", products), field(record, "text_3"));
-    rows.push({
-      record,
-      source: "oppOrder",
-      company: recordCompany(record, "text_6"),
-      quantity: safeNumber(field(record, "num_1")),
-      revenue: safeNumber(field(record, "num_5")),
-      date: localDate(field(record, "date_1")),
-      product
-    });
-  }
-  for (const record of source.records.performance || []) {
-    const product = classifyProduct(productFor(record, "text_26", products), field(record, "text_5"));
-    rows.push({
-      record,
-      source: "performance",
-      company: recordCompany(record, "text_3"),
-      quantity: safeNumber(field(record, "num_3")),
-      revenue: safeNumber(field(record, "num_6")),
-      date: localDate(field(record, "date_1")),
-      product
-    });
-  }
+  for (const row of oppOrderLineRows(source, products)) rows.push({ ...row, source: "oppOrder" });
+  for (const row of performanceLineRows(source, products)) rows.push({ ...row, source: "performance", revenue: row.amount });
   const selected = company ? rows.filter((row) => row.company === company) : rows;
   const ranking = Array.from(groupBy(selected, (row) => row.company).entries()).map(([name, companyRows]) => {
     const oppRows = companyRows.filter((row) => row.source === "oppOrder");
@@ -341,6 +417,8 @@ function buildProductSales(source, products, company) {
       oppOrderRevenue: sum(oppRows, (row) => row.revenue),
       ticketCount: sum(oppRows.filter((row) => row.product.isTicket), (row) => row.quantity),
       commercialCount: sum(performanceRows.filter((row) => row.product.isCommercial), (row) => row.quantity),
+      commercialInitialCount: sum(performanceRows.filter((row) => row.product.isCommercialInitial), (row) => row.quantity),
+      commercialRetrainingCount: sum(performanceRows.filter((row) => row.product.isCommercialRetraining), (row) => row.quantity),
       openOppQuantity: sum(oppRows.filter((row) => row.product.isOpen), (row) => row.quantity),
       openOppRevenue: sum(oppRows.filter((row) => row.product.isOpen), (row) => row.revenue),
       openPerformanceQuantity: sum(performanceRows.filter((row) => row.product.isOpen), (row) => row.quantity),
@@ -369,7 +447,7 @@ function buildProductSales(source, products, company) {
   return {
     definitions: {
       ticket: "仅统计 OPP 订单中产品主数据明确为门票/票务，或 OPP 分类且产品名称含票/OPP 的销量",
-      commercial: "仅统计业绩回款记录中产品主数据名称明确包含商业操盘的销量",
+      commercial: "仅统计业绩订单产品明细中名称明确包含商业操盘的销量；商业操盘与商业操盘复训分别汇总",
       openProduct: "优先按产品主数据前端/OPP 分类；主数据不可用时仅按业务记录产品名中明确的门票、OPP、开源关键词",
       nameFallback: "产品主数据没有返回记录时，只用业务记录中明确出现的门票、商业操盘、OPP/开源等产品名关键词；未命中仍为未分类",
       crossForm: "OPP 订单与业绩回款缺少统一订单主键，分别呈现，不相加冒充去重成交额"
@@ -380,6 +458,8 @@ function buildProductSales(source, products, company) {
       oppOrderRevenue: sum(ranking, (row) => row.oppOrderRevenue),
       ticketCount: sum(ranking, (row) => row.ticketCount),
       commercialCount: sum(ranking, (row) => row.commercialCount),
+      commercialInitialCount: sum(ranking, (row) => row.commercialInitialCount),
+      commercialRetrainingCount: sum(ranking, (row) => row.commercialRetrainingCount),
       openOppQuantity: sum(ranking, (row) => row.openOppQuantity),
       openOppRevenue: sum(ranking, (row) => row.openOppRevenue),
       openPerformanceQuantity: sum(ranking, (row) => row.openPerformanceQuantity),
@@ -408,6 +488,7 @@ function buildCourses(courseFacts, company) {
     status: row.status,
     date: row.date,
     primaryCompany: row.primaryCompany,
+    primaryCompanyBasis: row.primaryCompanyBasis,
     bookedCustomers: row.bookedCustomers,
     firms: row.firms,
     bosses: row.bosses,
@@ -415,7 +496,8 @@ function buildCourses(courseFacts, company) {
     dealOrders: row.dealOrders,
     dealAmount: row.dealAmount,
     paidAmount: row.paidAmount,
-    conversionRate: row.conversionRate
+    conversionRate: row.conversionRate,
+    conversionBasis: row.conversionBasis
   })).sort((a, b) => a.date.localeCompare(b.date) || a.name.localeCompare(b.name, "zh-CN"));
   const companies = Array.from(groupBy(courseFacts, (row) => row.primaryCompany).entries()).map(([name, rows]) => ({
     company: name,
@@ -433,10 +515,11 @@ function buildCourses(courseFacts, company) {
   return {
     definitions: {
       courseCount: "课程开始日期落在所选月份的课程记录数",
-      company: "课程表缺少可靠组织公司字段；按同课约课记录中订单所属公司的众数归集",
-      conversionRate: "课程成交订单数 num_6 ÷ 已预约客户数 num_3；不使用未可靠同步的签到字段",
-      firms: "约课记录中的客户所属公司去重",
-      dealAmount: "课程下游订单成交金额 num_9"
+      company: "优先按课程表举办方 text_5 归属；举办方缺失时才回退为同课邀约订单所属公司的众数",
+      conversionRate: "优先按关联业绩订单数 ÷ 学员约课明细数；没有关联数据时回退为课程成交订单数 num_6 ÷ 已预约客户数 num_3",
+      bosses: "学员约课明细 7642173 中职位 text_22 为老板的记录数",
+      firms: "约课记录存在客户公司字段时去重；该字段缺失时不推测企业数",
+      dealAmount: "业绩订单 5614255 中对应课程 text_28 关联当前课程后汇总合同金额 num_1"
     },
     summary: {
       selectedCompany: company || null,
@@ -468,7 +551,8 @@ function buildDelivery(courseFacts, company) {
   const courseRows = [];
   for (const course of deliveryCourses) {
     const perCourse = new Map();
-    for (const booking of course.linkedBookings) {
+    const deliveryBookings = course.linkedDeliveryBookings.length ? course.linkedDeliveryBookings : course.linkedBookings;
+    for (const booking of deliveryBookings) {
       const bookingOwner = bookingCompany(booking);
       const amount = safeNumber(field(booking, "num_3"));
       const orderId = relationId(field(booking, "text_8")) || relationId(field(booking, "text_9")) || `booking:${booking.recordId}`;
@@ -492,7 +576,7 @@ function buildDelivery(courseFacts, company) {
       evidenceRef: course.evidenceRef,
       name: course.name,
       date: course.date,
-      invitations: course.linkedBookings.length,
+      invitations: deliveryBookings.length,
       bosses: course.bosses,
       dealOrders: course.dealOrders,
       courseDealAmount: course.dealAmount,
