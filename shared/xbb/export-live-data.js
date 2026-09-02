@@ -119,6 +119,15 @@ function flattenRecord(record) {
   }, record.data || {});
 }
 
+function structuralShape(value, depth = 0) {
+  if (Array.isArray(value)) {
+    return { type: "array", length: value.length, item: value.length && depth < 8 ? structuralShape(value[0], depth + 1) : null };
+  }
+  if (!value || typeof value !== "object") return typeof value;
+  if (depth >= 8) return "object";
+  return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, structuralShape(child, depth + 1)]));
+}
+
 function monthRange(month) {
   if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
     throw new Error("月份格式必须为 YYYY-MM");
@@ -455,6 +464,10 @@ async function buildLiveDataset(month) {
     loadNamedCollection("opportunity", FORM.opportunity, () => listAll(ENDPOINT.opportunity, { formId: FORM.opportunity, conditions: dateConditions("addTime", range), viewApproval: 0 })),
     loadNamedCollection("follow", FORM.follow, () => listAll(ENDPOINT.follow, { conditions: dateConditions("date_1", range), viewApproval: 0 }))
   ]);
+
+  if (process.env.XBB_DIAGNOSTIC_SHAPE === "1") {
+    process.stderr.write(`${JSON.stringify({ performanceRaw: structuralShape(performanceRaw), courseRaw: structuralShape(coursesRaw) })}\n`);
+  }
 
   const courseIds = coursesRaw.map((row) => row.dataId).filter(Boolean);
   const bookingsRaw = courseIds.length
