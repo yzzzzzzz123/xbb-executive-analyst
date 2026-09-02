@@ -272,16 +272,13 @@ function buildCourseFacts(source) {
     ]);
     const linkedDeliveryBookings = deliveryBookingsByCourse.get(entityId(course)) || [];
     const linkedOrders = ordersByCourse.get(entityId(course)) || [];
-    const checklistBookings = linkedBookings.some((booking) => field(booking, "text_5"));
-    const bookedCustomers = checklistBookings ? linkedBookings.length : (safeNumber(field(course, "num_3")) || linkedBookings.length);
+    const bookedCustomers = linkedBookings.length;
     const roleValues = linkedBookings.map((booking) => asText(field(booking, "text_22"))).filter(Boolean);
-    const dealOrders = linkedOrders.length || safeNumber(field(course, "num_6"));
+    const dealOrders = linkedOrders.length;
     const organizer = recordCompany(course, "text_5");
     const inferredCompany = mostFrequent((linkedDeliveryBookings.length ? linkedDeliveryBookings : linkedBookings).map(bookingCompany));
     const primaryCompany = organizer !== "未标公司" ? organizer : inferredCompany;
-    const dealAmount = linkedOrders.length
-      ? sum(linkedOrders, (order) => field(order, "num_1"))
-      : safeNumber(field(course, "num_9"));
+    const dealAmount = sum(linkedOrders, (order) => field(order, "num_1"));
     const firmNames = unique(linkedBookings.map((booking) => asText(field(booking, "text_36"))));
     return {
       entityId: entityId(course),
@@ -298,17 +295,13 @@ function buildCourseFacts(source) {
         : "课程举办方缺失，回退为同一课程邀约记录中订单所属公司的众数",
       bookedCustomers,
       firms: firmNames.length,
-      bosses: roleValues.length
-        ? roleValues.filter((role) => role === "老板" || role.includes("老板")).length
-        : sum(linkedBookings, (booking) => field(booking, "num_1")),
-      students: roleValues.length ? linkedBookings.length : sum(linkedBookings, (booking) => field(booking, "num_2")),
+      bosses: roleValues.filter((role) => role === "老板" || role.includes("老板")).length,
+      students: linkedBookings.length,
       dealOrders,
       dealAmount,
       paidAmount: safeNumber(field(course, "num_10")),
       conversionRate: percentage(dealOrders, bookedCustomers),
-      conversionBasis: linkedOrders.length
-        ? "关联业绩订单数 ÷ 学员约课明细数"
-        : "课程表成交订单数 num_6 ÷ 已预约客户数 num_3",
+      conversionBasis: "关联业绩订单数 ÷ 学员约课明细数",
       linkedBookings,
       linkedDeliveryBookings,
       linkedOrders
@@ -523,7 +516,7 @@ function buildCourses(courseFacts, company) {
     definitions: {
       courseCount: "课程开始日期落在所选月份的课程记录数",
       company: "优先按课程表举办方 text_5 归属；举办方缺失时才回退为同课邀约订单所属公司的众数",
-      conversionRate: "优先按关联业绩订单数 ÷ 学员约课明细数；没有关联数据时回退为课程成交订单数 num_6 ÷ 已预约客户数 num_3",
+      conversionRate: "关联业绩订单数 ÷ 学员约课明细数；缺少任一可靠关联时保持为 0 并说明数据边界，不使用课程表旧汇总字段补算",
       bosses: "学员约课明细 7642173 中职位 text_22 为老板的记录数",
       firms: "约课记录存在客户公司字段时去重；该字段缺失时不推测企业数",
       dealAmount: "业绩订单 5614255 中对应课程 text_28 关联当前课程后汇总合同金额 num_1"
