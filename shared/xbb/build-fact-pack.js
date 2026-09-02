@@ -171,7 +171,11 @@ function performanceLineRows(source, products) {
           amount: safeNumber(item.num_5),
           quantity: safeNumber(item.num_3),
           date,
-          product: classifyProduct(undefined, item.text_1, item.text_10)
+          product: classifyProduct(
+            products.get(relationId(item.text_1)),
+            typeof item.text_1 === "object" ? asText(item.text_1 && item.text_1.name) : asText(item.text_1),
+            item.text_10
+          )
         });
       }
       continue;
@@ -179,10 +183,10 @@ function performanceLineRows(source, products) {
     rows.push({
       record,
       company,
-      amount: safeNumber(field(record, "num_6")),
-      quantity: safeNumber(field(record, "num_3")),
+      amount: safeNumber(field(record, "num_1")),
+      quantity: 0,
       date,
-      product: classifyProduct(productFor(record, "text_26", products), field(record, "text_5"))
+      product: classifyProduct(undefined)
     });
   }
   return rows;
@@ -258,11 +262,14 @@ function buildCourseFacts(source) {
   const bookings = source.records.booking || [];
   const deliveryBookings = source.records.deliveryBooking || [];
   const performanceOrders = source.records.performance || [];
-  const bookingsByCourse = groupBy(bookings, (booking) => relationId(field(booking, "text_5")) || relationId(field(booking, "text_2")));
+  const bookingsByCourse = groupBy(bookings, (booking) => asText(field(booking, "text_5")) || relationId(field(booking, "text_2")));
   const deliveryBookingsByCourse = groupBy(deliveryBookings, (booking) => relationId(field(booking, "text_2")));
   const ordersByCourse = groupBy(performanceOrders, (order) => relationId(field(order, "text_28")));
   return courses.map((course) => {
-    const linkedBookings = bookingsByCourse.get(entityId(course)) || [];
+    const linkedBookings = unique([
+      ...(bookingsByCourse.get(entityId(course)) || []),
+      ...(bookingsByCourse.get(asText(course.serialNo)) || [])
+    ]);
     const linkedDeliveryBookings = deliveryBookingsByCourse.get(entityId(course)) || [];
     const linkedOrders = ordersByCourse.get(entityId(course)) || [];
     const checklistBookings = linkedBookings.some((booking) => field(booking, "text_5"));

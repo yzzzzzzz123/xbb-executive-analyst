@@ -22,15 +22,17 @@ const FORM = Object.freeze({
 const ENDPOINT = Object.freeze({
   paas: "/api/paas/list",
   contract: "/api/contract/list",
+  contractDetail: "/api/contract/detail",
   opportunity: "/api/opportunity/list",
   follow: "/api/communicate/list",
   product: "/api/product/list",
   user: "/api/user/list",
+  department: "/api/department/list",
   form: "/api/form/get"
 });
 
 const FIELD_ALLOWLIST = Object.freeze({
-  performance: ["date_1", "text_63", "text_28", "num_1", "array_4", "text_3", "text_5", "text_26", "num_3", "num_6"],
+  performance: ["date_1", "text_63", "text_28", "num_1", "array_4"],
   oppOrder: ["date_1", "text_31", "array_4", "text_3", "text_6", "text_10", "num_1", "num_5"],
   course: ["date_1", "date_2", "text_1", "text_5", "text_7", "text_10", "num_3", "num_6", "num_9", "num_10"],
   booking: ["date_1", "date_3", "text_5", "text_22", "text_2", "text_36", "num_1", "num_2"],
@@ -47,7 +49,7 @@ const SUBTABLE_ALLOWLIST = Object.freeze({
 
 const RELATION_FIELDS = new Set([
   "performance.text_28",
-  "performance.text_26",
+  "performance.array_4.text_1",
   "oppOrder.text_10",
   "booking.text_5",
   "booking.text_2",
@@ -117,15 +119,6 @@ function flattenRecord(record) {
     creatorId: record.creatorId,
     ownerId: record.ownerId
   }, record.data || {});
-}
-
-function structuralShape(value, depth = 0) {
-  if (Array.isArray(value)) {
-    return { type: "array", length: value.length, item: value.length && depth < 8 ? structuralShape(value[0], depth + 1) : null };
-  }
-  if (!value || typeof value !== "object") return typeof value;
-  if (depth >= 8) return "object";
-  return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, structuralShape(child, depth + 1)]));
 }
 
 function monthRange(month) {
@@ -295,6 +288,13 @@ async function loadNamedCollection(name, formId, loader) {
   }
 }
 
+async function loadContractDetails(records) {
+  return Promise.all(records.map((record) => xbbPost(ENDPOINT.contractDetail, {
+    dataId: record.dataId,
+    queryFlag: 0
+  })));
+}
+
 async function loadProducts(ids) {
   const unique = Array.from(new Set(ids.map(asText).filter(Boolean)));
   const rows = [];
@@ -311,11 +311,11 @@ async function loadProducts(ids) {
 async function loadPaasByRelation(formId, attr, ids) {
   const unique = Array.from(new Set(ids.map(asText).filter(Boolean)));
   const rows = [];
-  for (let index = 0; index < unique.length; index += 50) {
-    const batch = unique.slice(index, index + 50).map((value) => /^\d+$/.test(value) ? Number(value) : value);
+  for (const id of unique) {
+    const value = /^\d+$/.test(id) ? Number(id) : id;
     rows.push(...await listAll(ENDPOINT.paas, {
       formId,
-      conditions: [{ attr, value: batch, symbol: "equal" }],
+      conditions: [{ attr, value: [value], symbol: "equal" }],
       viewApproval: 0
     }));
   }
@@ -338,6 +338,19 @@ async function loadUsers(ids) {
       isLeader: Number(department.isLeader) || 0
     })).filter((department) => department.name)
   }));
+}
+
+async function loadDepartments(ids) {
+  const unique = Array.from(new Set(ids.map(asText).filter(Boolean)));
+  const departments = [];
+  for (let index = 0; index < unique.length; index += 100) {
+    const departmentIdIn = unique.slice(index, index + 100).map((value) => /^\d+$/.test(value) ? Number(value) : value);
+    departments.push(...await listAll(ENDPOINT.department, { departmentIdIn }, "depList"));
+  }
+  return departments.map((department) => ({
+    id: asText(department.id),
+    name: asText(department.name)
+  })).filter((department) => department.id && department.name);
 }
 
 function publicId(namespace, value) {
@@ -390,6 +403,7 @@ function normalizeValue(collection, attr, raw, schema) {
     }).filter(Boolean);
   }
   const key = `${collection}.${attr}`;
+  if (key === "performance.array_4.text_1" && typeof raw === "string" && !/^\d+$/.test(raw.trim())) return redactText(raw);
   if (RELATION_FIELDS.has(key)) return normalizeRelation(raw);
   if (REDACTED_TEXT_FIELDS.has(key)) return redactText(raw).slice(0, 500);
   const field = schema && schema.get(attr);
@@ -455,7 +469,7 @@ function normalizeUser(user) {
 
 async function buildLiveDataset(month) {
   const range = monthRange(month);
-  const [metadata, performanceRaw, oppOrdersRaw, coursesRaw, deliveryBookingsRaw, opportunitiesRaw, followsRaw] = await Promise.all([
+  const [metadata, performanceListRaw, oppOrdersRaw, coursesRaw, deliveryBookingsRaw, opportunitiesRaw, followsRaw] = await Promise.all([
     loadMetadata(),
     loadNamedCollection("performance", FORM.performance, () => listAll(ENDPOINT.contract, { formId: FORM.performance, conditions: dateConditions("date_1", range), viewApproval: 0 })),
     loadNamedCollection("oppOrder", FORM.oppOrder, () => listAll(ENDPOINT.paas, { formId: FORM.oppOrder, conditions: dateConditions("date_1", range), viewApproval: 0 })),
@@ -465,32 +479,37 @@ async function buildLiveDataset(month) {
     loadNamedCollection("follow", FORM.follow, () => listAll(ENDPOINT.follow, { conditions: dateConditions("date_1", range), viewApproval: 0 }))
   ]);
 
-  if (process.env.XBB_DIAGNOSTIC_SHAPE === "1") {
-    process.stderr.write(`${JSON.stringify({ performanceRaw: structuralShape(performanceRaw), courseRaw: structuralShape(coursesRaw) })}\n`);
-  }
-
-  const courseIds = coursesRaw.map((row) => row.dataId).filter(Boolean);
+  const performanceRaw = performanceListRaw.length
+    ? await loadNamedCollection("performance-detail", FORM.performance, () => loadContractDetails(performanceListRaw))
+    : [];
+  const courseBase = coursesRaw.map(flattenRecord).filter((row) => inRange(row, "date_1", range));
+  const courseIds = courseBase.map((row) => row.dataId).filter(Boolean);
+  const courseIdSet = new Set(courseIds.map(asText));
   const bookingsRaw = courseIds.length
     ? await loadNamedCollection("booking", FORM.booking, () => loadPaasByRelation(FORM.booking, "text_5", courseIds))
     : [];
 
   const performance = performanceRaw.map(flattenRecord).filter((row) => inRange(row, "date_1", range));
   const oppOrder = oppOrdersRaw.map(flattenRecord).filter((row) => inRange(row, "date_1", range));
-  const course = coursesRaw.map(flattenRecord).filter((row) => inRange(row, "date_1", range));
-  const courseIdSet = new Set(courseIds.map(asText));
   const booking = bookingsRaw.map(flattenRecord).filter((row) => courseIdSet.has(relationId(row.text_5)));
   const deliveryBooking = deliveryBookingsRaw.map(flattenRecord).filter((row) => inRange(row, "date_3", range));
   const opportunity = opportunitiesRaw.map(flattenRecord).filter((row) => inRange(row, "addTime", range));
   const follow = followsRaw.map(flattenRecord).filter((row) => inRange(row, "date_1", range));
 
   const productIds = [
-    ...performance.map((row) => relationId(row.text_26)),
+    ...performance.flatMap((row) => parseMaybeArray(row.array_4).map((item) => relationId(item && item.text_1))),
     ...oppOrder.map((row) => relationId(row.text_10))
   ];
+  const courseOrganizerIds = courseBase.map((row) => asText(row.text_5)).filter((value) => /^\d+$/.test(value));
   const userIds = [];
   for (const row of opportunity) userIds.push(asText(row.creatorId), ...parseMaybeArray(row.ownerId).map(asText));
   for (const row of follow) userIds.push(asText(row.creatorId));
-  const [product, users] = await Promise.all([loadProducts(productIds), loadUsers(userIds)]);
+  const [product, users, departments] = await Promise.all([loadProducts(productIds), loadUsers(userIds), loadDepartments(courseOrganizerIds)]);
+  const departmentById = new Map(departments.map((department) => [department.id, department.name]));
+  const course = courseBase.map((row) => {
+    const organizerId = asText(row.text_5);
+    return departmentById.has(organizerId) ? { ...row, text_5: departmentById.get(organizerId) } : row;
+  });
 
   return {
     month,
@@ -535,10 +554,12 @@ function buildSourceBundle(dataset) {
       endpoints: [
         "/pro/v2/api/paas/list",
         "/pro/v2/api/contract/list",
+        "/pro/v2/api/contract/detail",
         "/pro/v2/api/opportunity/list",
         "/pro/v2/api/communicate/list",
         "/pro/v2/api/product/list",
         "/pro/v2/api/user/list",
+        "/pro/v2/api/department/list",
         "/pro/v2/api/form/get"
       ],
       recordCounts,
