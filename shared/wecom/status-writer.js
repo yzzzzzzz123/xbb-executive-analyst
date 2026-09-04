@@ -4,18 +4,25 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const ALLOWED_STATUSES = new Set([
-  "connecting", "ready", "disconnected", "reconnecting", "connection_error", "message_failed", "agent_failed",
-  "message_received", "agent_busy", "turn_started", "tool_started", "tool_completed", "tool_failed",
-  "turn_completed", "turn_failed", "agent_warming", "agent_warmed", "agent_warm_failed",
-  "chart_generated", "chart_uploaded", "chart_delivered", "chart_failed", "reply_completed"
+  "connecting", "ready", "disconnected", "reconnecting", "connection_error", "connection_stalled", "lease_write_failed", "message_failed", "agent_failed",
+  "message_received", "turn_started", "turn_steered", "turn_queued", "tool_started", "tool_completed", "tool_failed",
+  "turn_completed", "turn_failed", "context_resumed", "context_rotated", "context_invalidated", "answer_recovered", "agent_warming", "agent_warmed", "agent_warm_failed",
+  "chart_generated", "chart_uploaded", "chart_upload_failed", "chart_media_delivery_failed", "chart_inline_delivered", "chart_delivered", "chart_failed", "reply_completed"
 ]);
+const SAFE_INSTANCE_ID_PATTERN = /^[A-Za-z0-9-]{16,128}$/;
+
+function safeInstanceId(value) {
+  return typeof value === "string" && SAFE_INSTANCE_ID_PATTERN.test(value) ? value : null;
+}
 
 function safeStatus(value) {
   const status = String(value?.status || "");
   if (!ALLOWED_STATUSES.has(status)) throw new Error("不允许写入未知机器人状态。");
   const result = { at: new Date().toISOString(), status, transport: "wecom-websocket" };
+  const instanceId = safeInstanceId(value?.instanceId);
+  if (status === "ready" && instanceId !== null) result.instanceId = instanceId;
   if (status === "reconnecting" && Number.isInteger(value?.attempt)) result.attempt = value.attempt;
-  if (["tool_completed", "tool_failed", "turn_completed", "turn_failed", "agent_warmed", "reply_completed"].includes(status)
+  if (["connection_stalled", "tool_completed", "tool_failed", "turn_completed", "turn_failed", "answer_recovered", "agent_warmed", "reply_completed"].includes(status)
       && Number.isInteger(value?.elapsedMs) && value.elapsedMs >= 0) result.elapsedMs = value.elapsedMs;
   return result;
 }
@@ -38,4 +45,4 @@ function createStatusWriter({ logPath, output = process.stdout, maxBytes = 64 * 
   };
 }
 
-module.exports = { ALLOWED_STATUSES, createStatusWriter, rotateStatusLog, safeStatus };
+module.exports = { ALLOWED_STATUSES, SAFE_INSTANCE_ID_PATTERN, createStatusWriter, rotateStatusLog, safeInstanceId, safeStatus };

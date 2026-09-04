@@ -10,6 +10,7 @@ const API_TOKEN = String(process.env.XBB_API_TOKEN || "");
 
 const FORM = Object.freeze({
   performance: 5614255,
+  courseOrders: 5614255,
   oppOrder: 6707824,
   course: 7452529,
   booking: 7642173,
@@ -33,6 +34,7 @@ const ENDPOINT = Object.freeze({
 
 const FIELD_ALLOWLIST = Object.freeze({
   performance: ["date_1", "text_63", "text_28", "num_1", "array_4"],
+  courseOrders: ["date_1", "text_28", "num_1"],
   oppOrder: ["date_1", "text_31", "array_4", "text_3", "text_6", "text_10", "num_1", "num_5"],
   course: ["date_1", "date_2", "text_1", "text_5", "text_7", "text_10", "num_3", "num_6", "num_9", "num_10"],
   booking: ["date_1", "date_3", "text_5", "text_22", "text_2", "text_36", "num_1", "num_2"],
@@ -49,6 +51,7 @@ const SUBTABLE_ALLOWLIST = Object.freeze({
 
 const RELATION_FIELDS = new Set([
   "performance.text_28",
+  "courseOrders.text_28",
   "performance.array_4.text_1",
   "oppOrder.text_10",
   "booking.text_5",
@@ -70,6 +73,16 @@ const REDACTED_TEXT_FIELDS = new Set(["deliveryBooking.text_39", "follow.text_6"
 const SYSTEM_LABELS = Object.freeze({
   creatorId: "创建人",
   ownerId: "负责人"
+});
+const LIST_PAGE_SIZE = 100;
+const MAX_LIST_PAGES = 1000;
+const ALLOWED_DOMAINS = new Set(["performance", "product-sales", "courses", "delivery", "opportunities"]);
+const DOMAIN_COLLECTIONS = Object.freeze({
+  performance: Object.freeze(["performance", "product"]),
+  "product-sales": Object.freeze(["performance", "oppOrder", "product"]),
+  courses: Object.freeze(["course", "booking", "deliveryBooking", "courseOrders"]),
+  delivery: Object.freeze(["course", "deliveryBooking", "courseOrders"]),
+  opportunities: Object.freeze(["opportunity", "follow", "user"])
 });
 let xbbRequestChain = Promise.resolve();
 let xbbNextRequestAt = 0;
@@ -121,15 +134,19 @@ function flattenRecord(record) {
   }, record.data || {});
 }
 
-function monthRange(month) {
+function monthRange(month, now = new Date()) {
   if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
     throw new Error("月份格式必须为 YYYY-MM");
   }
   const [year, monthNumber] = month.split("-").map(Number);
+  if (year < 1900) throw new Error("月份年份不得早于 1900");
+  const currentMonth = currentMonthShanghai(now);
+  if (month > currentMonth) throw new Error(`不能查询晚于当前上海月份 ${currentMonth} 的月份`);
   const nextYear = monthNumber === 12 ? year + 1 : year;
   const nextMonth = monthNumber === 12 ? 1 : monthNumber + 1;
   const start = Math.floor(Date.parse(`${month}-01T00:00:00+08:00`) / 1000);
   const next = Math.floor(Date.parse(`${nextYear}-${String(nextMonth).padStart(2, "0")}-01T00:00:00+08:00`) / 1000);
+  if (!Number.isFinite(start) || !Number.isFinite(next)) throw new Error("月份超出可处理的日期范围");
   return {
     month,
     start,
@@ -144,12 +161,12 @@ function monthRange(month) {
   };
 }
 
-function currentMonthShanghai() {
+function currentMonthShanghai(now = new Date()) {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Shanghai",
     year: "numeric",
     month: "2-digit"
-  }).formatToParts(new Date());
+  }).formatToParts(now);
   const year = parts.find((part) => part.type === "year").value;
   const month = parts.find((part) => part.type === "month").value;
   return `${year}-${month}`;
@@ -160,6 +177,21 @@ function dateConditions(attr, range) {
     { attr, value: [range.start], symbol: "greaterequal" },
     { attr, value: [range.end], symbol: "lessequal" }
   ];
+}
+
+function apiIdValue(id) {
+  const text = asText(id);
+  const number = Number(text);
+  return /^\d+$/.test(text) && Number.isSafeInteger(number) ? number : text;
+}
+
+function relationEqualCondition(attr, id) {
+  return { attr, value: [apiIdValue(id)], symbol: "equal" };
+}
+
+function followOpportunityConditions(range, opportunityId) {
+  if (!asText(opportunityId)) throw new Error("查询商机跟进时必须提供商机 dataId");
+  return [...dateConditions("date_1", range), relationEqualCondition("text_5", opportunityId)];
 }
 
 function inRange(record, attr, range) {
@@ -181,6 +213,18 @@ function reserveXbbRequestSlot() {
   return slot;
 }
 
+function retryBackoffMs(attempt, random = Math.random) {
+  return Math.min(5000, 250 * (2 ** Math.max(0, Number(attempt) || 0))) + Math.floor(random() * 200);
+}
+
+function isRetryableHttpStatus(status) {
+  return [408, 425, 429, 500, 502, 503, 504].includes(Number(status));
+}
+
+function isRetryableApiMessage(message) {
+  return /(?:20\s*次\s*\/\s*秒|请求频率|限流|系统繁忙|服务暂不可用|请求超时)/i.test(String(message || ""));
+}
+
 async function xbbPost(endpoint, payload) {
   if (!configured()) throw new Error("销帮帮接口凭证尚未加载");
   const body = JSON.stringify(Object.assign({ corpid: CORPID }, payload));
@@ -197,19 +241,34 @@ async function xbbPost(endpoint, payload) {
         body,
         signal: controller.signal
       });
+    } catch (error) {
+      if (attempt < 5) {
+        await new Promise((resolve) => setTimeout(resolve, retryBackoffMs(attempt)));
+        continue;
+      }
+      throw new Error("销帮帮接口网络请求持续失败", { cause: error });
     } finally {
       clearTimeout(timer);
     }
-    if (response.status === 429 && attempt < 5) {
-      await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+    if (isRetryableHttpStatus(response.status) && attempt < 5) {
+      await new Promise((resolve) => setTimeout(resolve, retryBackoffMs(attempt)));
       continue;
     }
     if (!response.ok) throw new Error(`销帮帮接口 HTTP ${response.status}`);
-    const json = await response.json();
+    let json;
+    try {
+      json = await response.json();
+    } catch (error) {
+      if (attempt < 5) {
+        await new Promise((resolve) => setTimeout(resolve, retryBackoffMs(attempt)));
+        continue;
+      }
+      throw new Error("销帮帮接口持续返回无效 JSON", { cause: error });
+    }
     if (json && json.success === true) return json.result || {};
     const message = asText(json && json.msg) || "未知错误";
-    if (/(?:20\s*次\s*\/\s*秒|请求频率|限流)/i.test(message) && attempt < 5) {
-      await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+    if (isRetryableApiMessage(message) && attempt < 5) {
+      await new Promise((resolve) => setTimeout(resolve, retryBackoffMs(attempt)));
       continue;
     }
     throw new Error(`销帮帮接口返回失败：${message}`);
@@ -217,13 +276,92 @@ async function xbbPost(endpoint, payload) {
   throw new Error("销帮帮接口请求超过限流重试次数");
 }
 
+function optionalPaginationInteger(result, key) {
+  const raw = result && result[key];
+  if (raw === undefined || raw === null || raw === "") return null;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`分页字段 ${key} 不是有效的非负整数`);
+  return value;
+}
+
+function paginationRows(result, listKey, page) {
+  if (!result || typeof result !== "object" || !Array.isArray(result[listKey])) {
+    throw new Error(`分页第 ${page} 页缺少数组字段 ${listKey}`);
+  }
+  return result[listKey];
+}
+
+function paginationPlan(result, listKey = "list", requestedPageSize = LIST_PAGE_SIZE, maxPages = MAX_LIST_PAGES) {
+  if (!Number.isSafeInteger(requestedPageSize) || requestedPageSize <= 0) throw new Error("分页 pageSize 必须为正整数");
+  if (!Number.isSafeInteger(maxPages) || maxPages <= 0) throw new Error("分页安全上限必须为正整数");
+  const firstRows = paginationRows(result, listKey, 1);
+  const totalCount = optionalPaginationInteger(result, "totalCount");
+  const declaredTotalPage = optionalPaginationInteger(result, "totalPage");
+  const declaredPageSize = optionalPaginationInteger(result, "pageSize");
+  if (declaredPageSize === 0) throw new Error("分页字段 pageSize 不能为 0");
+  if (declaredTotalPage === 0 && (firstRows.length || (totalCount !== null && totalCount > 0))) {
+    throw new Error("分页元数据 totalPage=0 与返回记录不一致");
+  }
+
+  let totalPages = null;
+  let effectivePageSize = declaredPageSize || requestedPageSize;
+  if (declaredTotalPage !== null) {
+    totalPages = Math.max(1, declaredTotalPage);
+  } else if (totalCount !== null) {
+    if (totalCount > 0 && firstRows.length === 0) throw new Error("分页元数据显示存在记录，但第 1 页为空");
+    if (totalCount > firstRows.length && firstRows.length > 0 && firstRows.length < effectivePageSize) {
+      effectivePageSize = firstRows.length;
+    }
+    totalPages = Math.max(1, Math.ceil(totalCount / effectivePageSize));
+  }
+  if (totalPages !== null && totalPages > maxPages) {
+    throw new Error(`分页总页数 ${totalPages} 超过安全上限 ${maxPages}，拒绝返回可能截断的数据`);
+  }
+  if (totalCount !== null && firstRows.length > totalCount) {
+    throw new Error(`分页第 1 页返回 ${firstRows.length} 条，超过 totalCount=${totalCount}`);
+  }
+  return { firstRows, totalCount, declaredTotalPage, totalPages, effectivePageSize, maxPages };
+}
+
+function assertStablePagination(result, plan, page) {
+  const totalCount = optionalPaginationInteger(result, "totalCount");
+  const totalPage = optionalPaginationInteger(result, "totalPage");
+  if (plan.totalCount !== null && totalCount !== null && totalCount !== plan.totalCount) {
+    throw new Error(`分页过程中 totalCount 从 ${plan.totalCount} 变为 ${totalCount}`);
+  }
+  if (plan.declaredTotalPage !== null && totalPage !== null && totalPage !== plan.declaredTotalPage) {
+    throw new Error(`分页过程中 totalPage 从 ${plan.declaredTotalPage} 变为 ${totalPage}`);
+  }
+  return paginationRows(result, plan.listKey, page);
+}
+
 async function listAll(endpoint, payload, listKey = "list") {
-  const first = await xbbPost(endpoint, Object.assign({}, payload, { page: 1, pageSize: 100 }));
-  const rows = Array.isArray(first[listKey]) ? first[listKey].slice() : [];
-  const totalPage = Math.min(Math.max(1, Number(first.totalPage) || 1), 100);
-  for (let page = 2; page <= totalPage; page += 1) {
-    const result = await xbbPost(endpoint, Object.assign({}, payload, { page, pageSize: 100 }));
-    if (Array.isArray(result[listKey])) rows.push(...result[listKey]);
+  const requestPage = (page) => xbbPost(endpoint, Object.assign({}, payload, { page, pageSize: LIST_PAGE_SIZE }));
+  const first = await requestPage(1);
+  const plan = Object.assign(paginationPlan(first, listKey), { listKey });
+  const rows = plan.firstRows.slice();
+
+  if (plan.totalPages !== null) {
+    for (let page = 2; page <= plan.totalPages; page += 1) {
+      const pageRows = assertStablePagination(await requestPage(page), plan, page);
+      if (!pageRows.length) throw new Error(`分页元数据显示共 ${plan.totalPages} 页，但第 ${page} 页为空`);
+      rows.push(...pageRows);
+    }
+  } else {
+    let page = 1;
+    let pageRows = plan.firstRows;
+    while (pageRows.length) {
+      if (page >= plan.maxPages) {
+        throw new Error(`分页未提供 totalPage/totalCount，且达到安全上限 ${plan.maxPages} 页，拒绝返回可能截断的数据`);
+      }
+      page += 1;
+      pageRows = paginationRows(await requestPage(page), listKey, page);
+      rows.push(...pageRows);
+    }
+  }
+
+  if (plan.totalCount !== null && rows.length !== plan.totalCount) {
+    throw new Error(`分页完整性校验失败：返回 ${rows.length} 条，totalCount=${plan.totalCount}`);
   }
   return rows;
 }
@@ -268,8 +406,23 @@ function decode(schema, attr, raw) {
   }).filter(Boolean).join("、");
 }
 
-async function loadMetadata() {
-  const entries = await Promise.all(Object.entries(FORM).map(async ([name, formId]) => {
+function normalizeDomains(value) {
+  const requested = (Array.isArray(value) ? value : asText(value).split(",")).map(asText).filter(Boolean);
+  if (!requested.length) return [...ALLOWED_DOMAINS];
+  const domains = [...new Set(requested)];
+  for (const domain of domains) if (domain !== "all" && !ALLOWED_DOMAINS.has(domain)) throw new Error(`不支持的数据域：${domain}`);
+  if (domains.includes("all") && domains.length !== 1) throw new Error("all 不能与其他数据域同时使用");
+  if (domains[0] === "all") return [...ALLOWED_DOMAINS];
+  return domains;
+}
+
+function collectionsForDomains(value) {
+  const domains = normalizeDomains(value);
+  return new Set(domains.flatMap((domain) => DOMAIN_COLLECTIONS[domain]));
+}
+
+async function loadMetadata(collections = new Set(Object.keys(FORM))) {
+  const entries = await Promise.all(Object.entries(FORM).filter(([name]) => collections.has(name)).map(async ([name, formId]) => {
     try {
       const result = await xbbPost(ENDPOINT.form, { formId });
       return [name, buildSchema(result.explainList)];
@@ -295,11 +448,34 @@ async function loadContractDetails(records) {
   })));
 }
 
+function uniqueRecordsByDataId(records) {
+  const seen = new Set();
+  return records.filter((record) => {
+    const id = asText(record && record.dataId);
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
+async function loadContractsByRelation(attr, ids) {
+  const unique = Array.from(new Set(ids.map(asText).filter(Boolean)));
+  const rows = [];
+  for (const id of unique) {
+    rows.push(...await listAll(ENDPOINT.contract, {
+      formId: FORM.courseOrders,
+      conditions: [relationEqualCondition(attr, id)],
+      viewApproval: 0
+    }));
+  }
+  return uniqueRecordsByDataId(rows);
+}
+
 async function loadProducts(ids) {
   const unique = Array.from(new Set(ids.map(asText).filter(Boolean)));
   const rows = [];
   for (let index = 0; index < unique.length; index += 50) {
-    const batch = unique.slice(index, index + 50).map((value) => /^\d+$/.test(value) ? Number(value) : value);
+    const batch = unique.slice(index, index + 50).map(apiIdValue);
     rows.push(...await listAll(ENDPOINT.product, {
       conditions: [{ attr: "dataId", value: batch, symbol: "equal" }],
       viewApproval: 0
@@ -312,24 +488,35 @@ async function loadPaasByRelation(formId, attr, ids) {
   const unique = Array.from(new Set(ids.map(asText).filter(Boolean)));
   const rows = [];
   for (const id of unique) {
-    const value = /^\d+$/.test(id) ? Number(id) : id;
     rows.push(...await listAll(ENDPOINT.paas, {
       formId,
-      conditions: [{ attr, value: [value], symbol: "equal" }],
+      conditions: [relationEqualCondition(attr, id)],
       viewApproval: 0
     }));
   }
   return rows;
 }
 
-async function loadUsers(ids) {
-  const unique = Array.from(new Set(ids.map(asText).filter(Boolean)));
-  const users = [];
-  for (let index = 0; index < unique.length; index += 100) {
-    const userIdIn = unique.slice(index, index + 100);
-    users.push(...await listAll(ENDPOINT.user, { userIdIn }, "userList"));
+async function loadFollowsByOpportunity(range, opportunityIds) {
+  const unique = Array.from(new Set(opportunityIds.map(asText).filter(Boolean)));
+  const rows = [];
+  for (const opportunityId of unique) {
+    rows.push(...await listAll(ENDPOINT.follow, {
+      conditions: followOpportunityConditions(range, opportunityId),
+      viewApproval: 0
+    }));
   }
-  return users.map((user) => ({
+  return uniqueRecordsByDataId(rows);
+}
+
+function normalizeUsers(users) {
+  const seen = new Set();
+  return users.filter((user) => {
+    const id = asText(user && user.userId);
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  }).map((user) => ({
     userId: asText(user.userId),
     name: asText(user.name) || "未命名员工",
     departments: (user.departmentList || []).map((department) => ({
@@ -340,11 +527,15 @@ async function loadUsers(ids) {
   }));
 }
 
+async function loadUserDirectory() {
+  return normalizeUsers(await listAll(ENDPOINT.user, {}, "userList"));
+}
+
 async function loadDepartments(ids) {
   const unique = Array.from(new Set(ids.map(asText).filter(Boolean)));
   const departments = [];
   for (let index = 0; index < unique.length; index += 100) {
-    const departmentIdIn = unique.slice(index, index + 100).map((value) => /^\d+$/.test(value) ? Number(value) : value);
+    const departmentIdIn = unique.slice(index, index + 100).map(apiIdValue);
     departments.push(...await listAll(ENDPOINT.department, { departmentIdIn }, "depList"));
   }
   return departments.map((department) => ({
@@ -467,16 +658,16 @@ function normalizeUser(user) {
   };
 }
 
-async function buildLiveDataset(month) {
+async function buildLiveDataset(month, domains = "all") {
   const range = monthRange(month);
-  const [metadata, performanceListRaw, oppOrdersRaw, coursesRaw, deliveryBookingsRaw, opportunitiesRaw, followsRaw] = await Promise.all([
-    loadMetadata(),
-    loadNamedCollection("performance", FORM.performance, () => listAll(ENDPOINT.contract, { formId: FORM.performance, conditions: dateConditions("date_1", range), viewApproval: 0 })),
-    loadNamedCollection("oppOrder", FORM.oppOrder, () => listAll(ENDPOINT.paas, { formId: FORM.oppOrder, conditions: dateConditions("date_1", range), viewApproval: 0 })),
-    loadNamedCollection("course", FORM.course, () => listAll(ENDPOINT.paas, { formId: FORM.course, conditions: dateConditions("date_1", range), viewApproval: 0 })),
-    loadNamedCollection("deliveryBooking", FORM.deliveryBooking, () => listAll(ENDPOINT.paas, { formId: FORM.deliveryBooking, conditions: dateConditions("date_3", range), viewApproval: 0 })),
-    loadNamedCollection("opportunity", FORM.opportunity, () => listAll(ENDPOINT.opportunity, { formId: FORM.opportunity, conditions: dateConditions("addTime", range), viewApproval: 0 })),
-    loadNamedCollection("follow", FORM.follow, () => listAll(ENDPOINT.follow, { conditions: dateConditions("date_1", range), viewApproval: 0 }))
+  const required = collectionsForDomains(domains);
+  const loadIf = (collection, loader) => required.has(collection) ? loader() : Promise.resolve([]);
+  const [metadata, performanceListRaw, oppOrdersRaw, coursesRaw, opportunitiesRaw] = await Promise.all([
+    loadMetadata(required),
+    loadIf("performance", () => loadNamedCollection("performance", FORM.performance, () => listAll(ENDPOINT.contract, { formId: FORM.performance, conditions: dateConditions("date_1", range), viewApproval: 0 }))),
+    loadIf("oppOrder", () => loadNamedCollection("oppOrder", FORM.oppOrder, () => listAll(ENDPOINT.paas, { formId: FORM.oppOrder, conditions: dateConditions("date_1", range), viewApproval: 0 }))),
+    loadIf("course", () => loadNamedCollection("course", FORM.course, () => listAll(ENDPOINT.paas, { formId: FORM.course, conditions: dateConditions("date_1", range), viewApproval: 0 }))),
+    loadIf("opportunity", () => loadNamedCollection("opportunity", FORM.opportunity, () => listAll(ENDPOINT.opportunity, { formId: FORM.opportunity, conditions: dateConditions("addTime", range), viewApproval: 0 })))
   ]);
 
   const performanceRaw = performanceListRaw.length
@@ -485,15 +676,31 @@ async function buildLiveDataset(month) {
   const courseBase = coursesRaw.map(flattenRecord).filter((row) => inRange(row, "date_1", range));
   const courseIds = courseBase.map((row) => row.dataId).filter(Boolean);
   const courseIdSet = new Set(courseIds.map(asText));
-  const bookingsRaw = courseIds.length
-    ? await loadNamedCollection("booking", FORM.booking, () => loadPaasByRelation(FORM.booking, "text_5", courseIds))
+  const opportunity = uniqueRecordsByDataId(opportunitiesRaw).map(flattenRecord).filter((row) => inRange(row, "addTime", range));
+  const opportunityIds = opportunity.map((row) => row.dataId).filter(Boolean);
+  const [bookingsRaw, deliveryBookingsRaw, courseOrderListRaw] = await Promise.all([
+    required.has("booking") && courseIds.length
+      ? loadNamedCollection("booking", FORM.booking, () => loadPaasByRelation(FORM.booking, "text_5", courseIds))
+      : Promise.resolve([]),
+    required.has("deliveryBooking") && courseIds.length
+      ? loadNamedCollection("deliveryBooking", FORM.deliveryBooking, () => loadPaasByRelation(FORM.deliveryBooking, "text_2", courseIds))
+      : Promise.resolve([]),
+    required.has("courseOrders") && courseIds.length
+      ? loadNamedCollection("courseOrders", FORM.courseOrders, () => loadContractsByRelation("text_28", courseIds))
+      : Promise.resolve([])
+  ]);
+  const courseOrderDetailsRaw = courseOrderListRaw.length
+    ? await loadNamedCollection("courseOrders-detail", FORM.courseOrders, () => loadContractDetails(courseOrderListRaw))
     : [];
 
   const performance = performanceRaw.map(flattenRecord).filter((row) => inRange(row, "date_1", range));
+  const courseOrders = courseOrderDetailsRaw.map(flattenRecord).filter((row) => courseIdSet.has(relationId(row.text_28)));
   const oppOrder = oppOrdersRaw.map(flattenRecord).filter((row) => inRange(row, "date_1", range));
-  const booking = bookingsRaw.map(flattenRecord).filter((row) => courseIdSet.has(relationId(row.text_5)));
-  const deliveryBooking = deliveryBookingsRaw.map(flattenRecord).filter((row) => inRange(row, "date_3", range));
-  const opportunity = opportunitiesRaw.map(flattenRecord).filter((row) => inRange(row, "addTime", range));
+  const booking = uniqueRecordsByDataId(bookingsRaw).map(flattenRecord).filter((row) => courseIdSet.has(relationId(row.text_5)));
+  const deliveryBooking = uniqueRecordsByDataId(deliveryBookingsRaw).map(flattenRecord).filter((row) => courseIdSet.has(relationId(row.text_2)));
+  const followsRaw = required.has("follow") && opportunityIds.length
+    ? await loadNamedCollection("follow", FORM.follow, () => loadFollowsByOpportunity(range, opportunityIds))
+    : [];
   const follow = followsRaw.map(flattenRecord).filter((row) => inRange(row, "date_1", range));
 
   const productIds = [
@@ -501,22 +708,25 @@ async function buildLiveDataset(month) {
     ...oppOrder.map((row) => relationId(row.text_10))
   ];
   const courseOrganizerIds = courseBase.map((row) => asText(row.text_5)).filter((value) => /^\d+$/.test(value));
-  const userIds = [];
-  for (const row of opportunity) userIds.push(asText(row.creatorId), ...parseMaybeArray(row.ownerId).map(asText));
-  for (const row of follow) userIds.push(asText(row.creatorId));
-  const [product, users, departments] = await Promise.all([loadProducts(productIds), loadUsers(userIds), loadDepartments(courseOrganizerIds)]);
+  const [product, users, departments] = await Promise.all([
+    required.has("product") ? loadProducts(productIds) : [],
+    required.has("user") ? loadUserDirectory() : [],
+    required.has("course") ? loadDepartments(courseOrganizerIds) : []
+  ]);
   const departmentById = new Map(departments.map((department) => [department.id, department.name]));
   const course = courseBase.map((row) => {
     const organizerId = asText(row.text_5);
     return departmentById.has(organizerId) ? { ...row, text_5: departmentById.get(organizerId) } : row;
   });
 
+  const available = { performance, courseOrders, oppOrder, course, booking, deliveryBooking, product, opportunity, follow };
+  const collections = Object.fromEntries([...required].filter((name) => name !== "user").map((name) => [name, available[name] || []]));
   return {
     month,
     range,
     loadedAt: new Date().toISOString(),
     metadata,
-    collections: { performance, oppOrder, course, booking, deliveryBooking, product, opportunity, follow },
+    collections,
     users
   };
 }
@@ -539,7 +749,7 @@ function buildSourceBundle(dataset) {
   const recordCounts = Object.fromEntries(Object.entries(records).map(([name, rows]) => [name, rows.length]));
   const canonicalRecords = JSON.stringify(records);
   return {
-    schemaVersion: "3.0",
+    schemaVersion: "3.1",
     skill: "xbb-executive-analyst",
     mode: "live-readonly-source",
     month: dataset.month,
@@ -550,7 +760,7 @@ function buildSourceBundle(dataset) {
       readOnly: true,
       dataSource: "xbb-openapi",
       fetchedBy: "xbb-executive-analyst/scripts/export-live-data.js",
-      formIds: FORM,
+      formIds: Object.fromEntries(Object.entries(FORM).filter(([name]) => Object.hasOwn(records, name))),
       endpoints: [
         "/pro/v2/api/paas/list",
         "/pro/v2/api/contract/list",
@@ -584,7 +794,7 @@ function parseArguments(argv) {
   const parsed = {};
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index];
-    if (key === "--month" || key === "--output") {
+    if (key === "--month" || key === "--output" || key === "--domains") {
       parsed[key.slice(2)] = argv[index + 1];
       index += 1;
     } else {
@@ -612,7 +822,7 @@ function atomicWriteJson(outputPath, payload) {
 
 async function main() {
   const args = parseArguments(process.argv.slice(2));
-  const dataset = await buildLiveDataset(args.month);
+  const dataset = await buildLiveDataset(args.month, args.domains || "all");
   const bundle = buildSourceBundle(dataset);
   const output = atomicWriteJson(args.output, bundle);
   const sourceSha256 = crypto.createHash("sha256").update(fs.readFileSync(output)).digest("hex");
@@ -634,8 +844,18 @@ if (require.main === module) {
 }
 
 module.exports = {
+  apiIdValue,
+  collectionsForDomains,
   buildLiveDataset,
   buildSourceBundle,
+  followOpportunityConditions,
+  normalizeDomains,
   monthRange,
+  paginationPlan,
+  isRetryableApiMessage,
+  isRetryableHttpStatus,
+  relationEqualCondition,
+  retryBackoffMs,
+  uniqueRecordsByDataId,
   redactText
 };

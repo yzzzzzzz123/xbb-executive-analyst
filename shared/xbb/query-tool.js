@@ -1,13 +1,14 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { MAX_QUERY_MONTHS } = require("./fast-query-plan.js");
 
 const QUERY_XBB_INPUT_SCHEMA = Object.freeze({
   type: "object",
   additionalProperties: false,
   required: ["months", "domains"],
   properties: {
-    months: { type: "array", minItems: 1, maxItems: 12, items: { type: "string", pattern: "^\\d{4}-(0[1-9]|1[0-2])$" } },
+    months: { type: "array", minItems: 1, maxItems: MAX_QUERY_MONTHS, description: "上海自然月，不得晚于当前上海月份。业绩订单和 OPP 订单仅支持 2026-01 及以后。", items: { type: "string", pattern: "^\\d{4}-(0[1-9]|1[0-2])$" } },
     domains: { type: "array", minItems: 1, maxItems: 5, uniqueItems: true, items: { enum: ["all", "performance", "product-sales", "courses", "delivery", "opportunities"] } },
     company: { type: "string", description: "仅当用户明确点名时填写准确公司名称。" },
     person: { type: "string", description: "仅当用户明确点名时填写准确人员名称。" },

@@ -1,8 +1,8 @@
 {
   "name": "xbb-executive-analyst",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "private": true,
-  "description": "基于真实只读销帮帮数据的经营分析 Skill 与企业微信智能机器人服务",
+  "description": "企业微信通用 Codex Agent 与按需调用的真实只读销帮帮经营分析 Skill",
   "type": "commonjs",
   "engines": {
     "node": ">=22"
@@ -11,7 +11,7 @@
     "start": "node shared/wecom/server.js",
     "smoke:app-server": "node scripts/smoke-codex-app-server.js",
     "smoke:business": "node scripts/smoke-codex-app-server.js --business",
-    "test": "node tests/verify-facts.js && node tests/verify-charts.js && node tests/verify-access-control.js && node tests/verify-rag-knowledge-base.js && node tests/verify-codex-app-server.js && node tests/verify-wecom-long-connection.js && powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\tests\\verify-secure-config.ps1",
+    "test": "node tests/verify-facts.js && node tests/verify-multi-period-consumers.js && node tests/verify-charts.js && node tests/verify-access-control.js && node tests/verify-rag-knowledge-base.js && node tests/verify-recovery-answer.js && node tests/verify-state-recovery.js && node tests/verify-codex-app-server.js && node tests/verify-message-store.js && node tests/verify-wecom-long-connection.js && powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\tests\\verify-secure-config.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\tests\\verify-hidden-task.ps1",
     "verify": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\verify-skill.ps1"
   },
   "dependencies": {

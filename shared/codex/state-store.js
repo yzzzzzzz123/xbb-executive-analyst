@@ -15,13 +15,39 @@ function validateState(value) {
     if (!/^[a-f0-9]{64}$/.test(principalKey) || !thread || typeof thread.threadId !== "string" || !thread.threadId || typeof thread.contractHash !== "string") {
       throw new Error("Codex Agent 线程状态无效。");
     }
+    if (thread.lastMode != null && !["general", "xbb"].includes(thread.lastMode)) throw new Error("Codex Agent 最近能力路由无效。");
+    if (thread.lastModeSource != null && thread.lastModeSource !== "user") throw new Error("Codex Agent 最近能力路由来源无效。");
+    if (thread.turnCount != null && (!Number.isInteger(thread.turnCount) || thread.turnCount < 0 || thread.turnCount > 1000000)) {
+      throw new Error("Codex Agent 线程轮次数无效。");
+    }
+    if (thread.estimatedInputBytes != null && (!Number.isInteger(thread.estimatedInputBytes) || thread.estimatedInputBytes < 0 || thread.estimatedInputBytes > 1024 * 1024 * 1024)) {
+      throw new Error("Codex Agent 线程输入预算无效。");
+    }
+    if (thread.turnInProgress != null && typeof thread.turnInProgress !== "boolean") {
+      throw new Error("Codex Agent 线程活动状态无效。");
+    }
   }
   return value;
 }
 
 function loadAgentState(statePath) {
   if (!fs.existsSync(statePath)) return emptyState();
-  return validateState(JSON.parse(fs.readFileSync(statePath, "utf8")));
+  try {
+    return validateState(JSON.parse(fs.readFileSync(statePath, "utf8")));
+  } catch (error) {
+    // Thread 状态不含经营事实，也不是服务启动的必要数据。损坏时先原子隔离原件，
+    // 再从空状态安全启动；继续卡在同一个坏 JSON 会造成计划任务无限重启。
+    const quarantine = `${path.resolve(statePath)}.corrupt-${Date.now()}-${process.pid}`;
+    try {
+      fs.renameSync(statePath, quarantine);
+    } catch (quarantineError) {
+      throw new Error("Codex Agent 状态文件损坏且无法隔离。", { cause: quarantineError });
+    }
+    const recovered = emptyState();
+    Object.defineProperty(recovered, "recoveredFromCorruption", { value: true, enumerable: false });
+    Object.defineProperty(recovered, "quarantinedPath", { value: quarantine, enumerable: false });
+    return recovered;
+  }
 }
 
 function saveAgentState(statePath, state) {

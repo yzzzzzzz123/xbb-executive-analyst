@@ -22,10 +22,13 @@ if ($stored.PSObject.Properties.Name -contains 'modelEndpoint') { $stored.PSObje
 if ($stored.PSObject.Properties.Name -contains 'modelName') { $stored.PSObject.Properties.Remove('modelName') }
 if ($stored.PSObject.Properties.Name -contains 'modelApiKeyDpapi') { throw 'External model API key config cannot be migrated. Run configure-bot.ps1.' }
 if ($stored.PSObject.Properties.Name -contains 'agentTurnTimeoutMs') { $stored.agentTurnTimeoutMs = 300000 } else { $stored | Add-Member -NotePropertyName agentTurnTimeoutMs -NotePropertyValue 300000 }
+if ($stored.PSObject.Properties.Name -contains 'generalTurnTimeoutMs') { $stored.generalTurnTimeoutMs = 900000 } else { $stored | Add-Member -NotePropertyName generalTurnTimeoutMs -NotePropertyValue 900000 }
 $statePath = [IO.Path]::GetFullPath((Join-Path $parent 'agent-state.json'))
 if ($stored.PSObject.Properties.Name -contains 'agentStatePath') { $stored.agentStatePath = $statePath } else { $stored | Add-Member -NotePropertyName agentStatePath -NotePropertyValue $statePath }
 $statusLogPath = [IO.Path]::GetFullPath((Join-Path $parent 'status.jsonl'))
 if ($stored.PSObject.Properties.Name -contains 'statusLogPath') { $stored.statusLogPath = $statusLogPath } else { $stored | Add-Member -NotePropertyName statusLogPath -NotePropertyValue $statusLogPath }
+$serviceLeasePath = [IO.Path]::GetFullPath((Join-Path $parent 'service-lease.json'))
+if ($stored.PSObject.Properties.Name -contains 'serviceLeasePath') { $stored.serviceLeasePath = $serviceLeasePath } else { $stored | Add-Member -NotePropertyName serviceLeasePath -NotePropertyValue $serviceLeasePath }
 
 $json = $stored | ConvertTo-Json -Depth 10
 $temporary = "$resolved.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"

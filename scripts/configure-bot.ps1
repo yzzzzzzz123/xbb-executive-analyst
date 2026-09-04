@@ -35,6 +35,7 @@ $parent = [IO.Path]::GetDirectoryName($resolved)
 [IO.Directory]::CreateDirectory($parent) | Out-Null
 $agentStatePath = [IO.Path]::GetFullPath((Join-Path $parent 'agent-state.json'))
 $statusLogPath = [IO.Path]::GetFullPath((Join-Path $parent 'status.jsonl'))
+$serviceLeasePath = [IO.Path]::GetFullPath((Join-Path $parent 'service-lease.json'))
 
 $stored = [ordered]@{
     schemaVersion = '4.0'
@@ -48,8 +49,10 @@ $stored = [ordered]@{
     codexModel = 'gpt-5.6-sol'
     codexReasoningEffort = 'medium'
     agentTurnTimeoutMs = 300000
+    generalTurnTimeoutMs = 900000
     agentStatePath = $agentStatePath
     statusLogPath = $statusLogPath
+    serviceLeasePath = $serviceLeasePath
     accessPolicyPath = $resolvedPolicy
 }
 $json = $stored | ConvertTo-Json -Depth 10
@@ -63,4 +66,4 @@ try {
     if ([IO.File]::Exists($backup)) { [IO.File]::Delete($backup) }
 }
 
-Write-Output ([ordered]@{ success = $true; transport = 'wecom-websocket'; modelProvider = 'codex-app-server'; botId = $WecomBotId; configPath = $resolved; accessPolicyPath = $resolvedPolicy; agentStatePath = $agentStatePath; statusLogPath = $statusLogPath; secrets = 'DPAPI CurrentUser' } | ConvertTo-Json -Compress)
+Write-Output ([ordered]@{ success = $true; transport = 'wecom-websocket'; modelProvider = 'codex-app-server'; botId = $WecomBotId; configPath = $resolved; accessPolicyPath = $resolvedPolicy; agentStatePath = $agentStatePath; statusLogPath = $statusLogPath; serviceLeasePath = $serviceLeasePath; secrets = 'DPAPI CurrentUser' } | ConvertTo-Json -Compress)

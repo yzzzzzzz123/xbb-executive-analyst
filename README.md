@@ -1,27 +1,29 @@
 # xbb-executive-analyst
 
-基于真实只读销帮帮数据的经营分析 Skill，以及面向国内版企业微信普通员工的智能机器人 WebSocket 长连接服务。
+面向国内版企业微信普通员工的通用 Codex Agent，以及按公司经营问题自动调用的真实只读销帮帮经营分析 Skill。
 
-正式 Skill 唯一入口：`skills/xbb-executive-analyst/SKILL.md`。企业微信只是对话通道；同一个真实只读 runner 同时服务于 Codex 对话和企微智能客服。项目不提供 HTML、驾驶舱、工作台、固定报告、样例回退或 CRM 写操作。
+当前版本为 `1.3.0`。本版重点强化长上下文、自动恢复、回复速度和持续在线：静态规则使用分层混合 RAG；所有实时事实在进入模型前投影到严格 96 KiB 预算；持久 Thread 根据 token、累计输入与轮次主动换新；完整事实已就绪时，模型即使输出技术性拒答、无效结构或超时，也由确定性事实回答接管；企微断连与进程卡死分别由进程内连接看门狗和独立租约看门狗恢复。所有销帮帮经营答复都同时发送图片：有可比较事实时发送真实经营图，不适合成图、需要消歧或实时链路处于恢复状态时发送不新增经营数字的结论/状态卡。
+
+正式经营入口唯一是 `skills/xbb-executive-analyst/SKILL.md`；可比较事实的销帮帮经营图由同轮依赖 `skills/xbb-executive-chart/SKILL.md` 判断、选型并生成严格规格，桥接层只在没有合格图表规格时生成受控结论/状态卡，通用 Turn 不生成经营图片。企业微信只是对话通道；同一个真实只读 runner 同时服务于 Codex 对话和企微智能客服。项目不提供 HTML、驾驶舱、工作台、固定报告、样例回退或 CRM 写操作。
 
 ## 架构
 
 ```text
 国内版企业微信智能机器人
         ↕ 官方 WebSocket 长连接
-shared/wecom
-        ↓ USERID 访问控制
-shared/rag（完整 Skill/合同切块、索引与内存缓存）
-        ↓ 每轮检索适用原文规则并确定基础数据域/月度
-shared/xbb（同一受控 query_xbb 网关实时预取）
-        ↓ 已校验本轮事实包
-shared/codex（回环 App Server + 每授权主体持久 Thread）
-        ↓ 规则片段 + 实时事实 + 问题 + 授权元数据
-Codex Agent（ChatGPT 登录，gpt-5.6-sol；事实 none / 深分析 medium）
-        ↓ 唯一动态工具 query_xbb
-skills/xbb-executive-analyst/scripts/query-xbb.ps1
-        ↓
-真实只读销帮帮数据
+shared/wecom → USERID 访问控制 → 能力路由
+        ├─ 通用问题 → Codex 通用能力（只读；可联网）
+        └─ 公司经营问题
+             ↓ 同 Turn 注入 xbb-executive-analyst + xbb-executive-chart
+          shared/rag（强制合同层 + 本地 TF-IDF/词法混合检索）
+             ↓
+          shared/xbb（受控 query_xbb 实时预取）
+             ↓ 已校验完整事实 → 96 KiB 模型事实视图
+          shared/codex（回环 App Server + 隔离 Thread + 预算轮换/事实恢复）
+             ↓ 唯一业务动态工具 query_xbb
+          skills/xbb-executive-analyst/scripts/query-xbb.ps1
+             ↓
+          真实只读销帮帮数据
 ```
 
 机器人进程主动连接 `wss://openws.work.weixin.qq.com`。不需要企业管理后台、自建应用、公网 IP、域名、HTTPS 回调、Nginx、Token、EncodingAESKey 或入站端口。
@@ -168,11 +170,17 @@ Secret 使用 Windows DPAPI CurrentUser 加密，保存到：
 对集团业绩按照公司名称做个排名，并区分课程和咨询占比
 ```
 
-群聊中先添加机器人，再通过 `@机器人名称` 提问。正确结果应先显示真实运行状态，随后由完整最终答复覆盖；模型或 runner 失败时只返回失败，不使用固定文案数据、样例或旧结果。
+群聊中先添加机器人，再通过 `@机器人名称` 提问。正确结果应先显示真实运行状态，随后由完整最终答复覆盖。已取得并校验事实时，模型结构错误、技术性拒答或生成超时由确定性事实答案接管；实时源仍不可用时明确进入自动恢复，不使用样例、旧结果或编造数字。
 
-机器人后端是一个真正的专用 Codex Agent：桥接进程启动仅监听 `127.0.0.1` 的本机 App Server，并按“USERID + 当前授权范围”的不可逆摘要维护持久 Thread；进程重启后恢复 Thread，上下文不会跨用户共享。服务在企微连接就绪前把完整 `xbb-executive-analyst` Skill 和全部引用合同按章节切块、索引并缓存在内存中，并为每个授权主体执行一次禁止取数的后台 Thread 预热；首次规则升级可能在后台耗时，完成后日常问题复用持久 Thread。后续每轮只检索与当前问题相关的原文规则。对于可确定月份和数据域的问题，桥接层在启动模型 Turn 前通过同一受控 `query_xbb` 网关实时预取事实，Codex 直接完成分析；事实不足或需要实体消歧时仍保留动态工具调用。空闲时使用 `turn/start`；同一用户已有问题仍在处理时，新消息会立即收到忙碌提示，不会通过 `turn/steer` 改写或延长原任务。RAG 与 Thread 预热不缓存经营事实；经营事实仍由每个问题实时查询。
+机器人后端是一个真正的通用 Codex Agent：桥接进程启动仅监听 `127.0.0.1` 的本机 App Server，并按“USERID + 当前授权范围”的不可逆摘要维护隔离 Thread；进程重启后只登记历史 Thread，相关用户第一次发消息时才以 `excludeTurns=true` 懒恢复，授权人数不会拖慢机器人上线。若状态标记显示重启前仍有未完成 Turn，则直接丢弃未知状态 Thread 并新建，绝不继续发布没有调用方或可能带旧事实的结果。普通问答、写作、解释、翻译、方案、代码等问题直接使用 Codex 通用能力，不会注入经营 RAG 或查询销帮帮。只有识别为公司经营、业绩、产品、课程、交付、商机，或已知销帮帮表单/字段的问题，才在同一个 Turn 显式附带 `xbb-executive-analyst` 与 `xbb-executive-chart`、检索相关原文规则并按需预取实时事实；纯表单、字段、口径和使用方式说明直接使用版本化 RAG，不做无意义的 CRM 取数。前者负责事实和经营结论，后者负责辅助图的数据充足性、选型、结构和最小规格，二者不是两个 Agent。短数字选择、继续、为什么、要求更真实/客观/直接等追问会继承经营路由。模型即使在通用轮次误请求 `query_xbb`，桥接层也会拒绝。启动关键路径只校验并缓存本地混合 RAG，不再逐授权用户做模型预热；空闲时使用 `turn/start`，活动 Turn 的同路由追问用 `turn/steer` 接管，跨路由消息自动排队。
 
-App Server 使用内存中的随机 capability token；命令行只有 token 的 SHA-256 校验值。模型运行在只读、无网络、永不申请批准的沙箱中。公司权限和 `query_xbb` 执行仍由桥接服务层强制，明文事实包由工具网关在 `finally` 中清除。
+静态规则检索由“必需合同层 + 本地词法/TF-IDF 稀疏向量余弦”融合完成，按快速计划的数据域与月份数锁定必须章节，严格限制为 14,000 UTF-8 字节，超大章节按 Unicode 安全切块。它不调用第二个模型、外部 embedding 服务或网络。Thread 监听 App Server 的 token usage；达到上下文窗口 70%、累计输入 256 KiB 或 24 个 Turn 前主动新建 Thread，并只携带最多两条脱敏的最近意图帮助理解短追问，旧经营数字不作为新事实。完整事实包仅在桥接内存中通过安全校验，模型与动态工具只接收不超过 96 KiB 的确定性视图；同参数重复工具请求只返回复用标记，不再重复注入事实。
+
+全年、最近 12 个月等跨月问题由 bundled runner 按月取数，并在本机确定性汇总成单一管理事实包；模型不会接收或拼接多个月份的原始明细。聚合包保留汇总、占比、全部月份的核心趋势和至少前 10 的核心排名，极端控量时按覆盖元数据明示省略项且不做字符串截断。某实体在部分月份唯一确认、其他月份没有活动时，零活动月会作为零值进入趋势，不再把整段查询误判为实体不存在。并发的完全相同查询使用 single-flight 共用同一个 runner；不同范围默认串行，最多 32 个范围排队且排队窗口为 12 分钟，避免并发放大销帮帮限流。每个经营请求另有不滑动的 20 分钟总截止；模型生成的 5 分钟预算在工具取数期间暂停并在返回后重置。取消、超时或范围被追问替代时会回收整棵 Windows PowerShell/Node runner 进程树。API 对 408、429、5xx、网络中断和无效 JSON 做指数退避重试，runner 首次瞬时失败会利用已完成月份的加密缓存自动续跑。
+
+企微等待状态不是笼统进度条：桥接层显示已识别的期间、实体范围和数据域，并根据 runner 的真实 JSONL 事件更新当前月份、已完成月份数、实时/五分钟加密缓存来源、跨月汇总和隐私/完整性校验；数据就绪后显示正在比较的经营维度，结论完成后显示实际图表类型及生成/上传阶段。状态不包含业务数字、事实明细、模型内部推理或虚构百分比。密集事件在企微发送层合并为最新状态，45 秒心跳保留当前具体阶段并追加已用时。
+
+App Server 使用内存中的随机 capability token；命令行只有 token 的 SHA-256 校验值。模型始终运行在只读、永不申请批准的沙箱中；通用 Turn 可联网，经营 Turn 关闭网络。公司权限、能力路由和 `query_xbb` 执行仍由桥接服务层强制，明文事实包由工具网关在 `finally` 中清除。
 
 至少验证：
 
@@ -190,10 +198,15 @@ App Server 使用内存中的随机 capability token；命令行只有 token 的
 & .\scripts\install-wecom-task.ps1
 ```
 
+安装脚本会建立主任务和 `-Watchdog` 外部看门狗任务。主任务在当前 Windows 用户登录时启动，使用 Windows 原生 `RestartOnFailure` 和每分钟恢复触发；企微连续 120 秒未重新认证时进程主动退出。服务初始化前先写入带随机代际 ID 的 `starting` 租约，运行时就绪后切换为 `running`，并每 30 秒原子刷新；独立看门狗每分钟联合校验任务归属、完整进程命令行、PID、代际、状态持续时间和租约新鲜度，过期或假活时只终止严格确认的旧实例并等待新代际 `running`。启动宽限不依赖会被 `IgnoreNew` 重复触发刷新的 `LastRunTime`。任务使用 `IgnoreNew`，进程内命名管道锁阻止第二实例抢占连接。安装升级会先备份双任务 XML，失败时恢复旧任务；若需长期停用，必须同时禁用或卸载两个计划任务。
+
 查看：
 
 ```powershell
 Get-ScheduledTask -TaskName 'Codex-XBB-Executive-Analyst-WeCom' |
+  Select-Object TaskName,State
+
+Get-ScheduledTask -TaskName 'Codex-XBB-Executive-Analyst-WeCom-Watchdog' |
   Select-Object TaskName,State
 ```
 
@@ -203,7 +216,7 @@ Get-ScheduledTask -TaskName 'Codex-XBB-Executive-Analyst-WeCom' |
 & .\scripts\uninstall-wecom-task.ps1
 ```
 
-任务以配置凭据的同一个 Windows 用户、有限权限和隐藏窗口直接执行 Node 服务入口，登录后自动启动。直接执行避免停止计划任务时遗留 Node/App Server 子进程。电脑关机、睡眠、休眠、断网或用户尚未登录时机器人不在线；当前脚本不是开机前运行的 Windows Service。
+任务以配置凭据的同一个 Windows 用户和有限权限直接运行仓库外生成的 `nodew.exe`。它是当前 `node.exe` 的逐字副本，只把 PE Subsystem 从 Console 改为 Windows GUI；安装脚本用源文件 SHA-256 跟踪 Node 升级并自动重建。计划任务固定传入仓库外安全配置绝对路径，并清除继承的全部 `XBB_*` 覆盖，避免升级或临时环境变量让租约、状态或凭据路径漂移。任务仍由 Node 本身作为根进程，因此桌面不出现可关闭的黑框，同时停止任务会连同 App Server 一起结束，不经过长期 PowerShell、WSH 或自定义启动器宿主。锁屏不影响已登录会话；电脑关机、睡眠、休眠、断网、注销或用户尚未登录时机器人会离线。要求跨注销和重启前持续在线时，应把同一部署迁移到常开 Windows 主机和经过 DPAPI/Codex 登录验证的专用服务账号；同一 Bot ID 不能双活。
 
 ## 环境变量部署
 
@@ -216,9 +229,11 @@ Get-ScheduledTask -TaskName 'Codex-XBB-Executive-Analyst-WeCom' |
 - `XBB_WECOM_HEARTBEAT_MS`
 - `XBB_WECOM_REQUEST_TIMEOUT_MS`
 - `XBB_MODEL_PROVIDER`，正式运行时只能是 `codex-app-server`
-- `XBB_AGENT_TURN_TIMEOUT_MS`，默认 300000 毫秒
+- `XBB_AGENT_TURN_TIMEOUT_MS`，销帮帮经营 Turn 超时，默认 300000 毫秒
+- `XBB_GENERAL_TURN_TIMEOUT_MS`，通用 Codex Turn 超时，默认 900000 毫秒；复杂证明、长文和代码任务不会再套用经营查询的 5 分钟限制
 - `XBB_AGENT_STATE_PATH`，默认 `%LOCALAPPDATA%\Codex\xbb-executive-analyst\agent-state.json`
 - `XBB_STATUS_LOG_PATH`，默认 `%LOCALAPPDATA%\Codex\xbb-executive-analyst\status.jsonl`，只记录固定连接/Agent 状态枚举和阶段耗时，不记录用户或业务内容
+- `XBB_SERVICE_LEASE_PATH`，默认 `%LOCALAPPDATA%\Codex\xbb-executive-analyst\service-lease.json`，仅保存进程号、运行状态和最后心跳时间，供外部看门狗判断卡死
 - `XBB_CODEX_COMMAND`，仅在无法自动定位 Codex CLI 时指定绝对可执行文件路径
 - `XBB_CODEX_MODEL`，正式默认 `gpt-5.6-sol`
 - `XBB_CODEX_REASONING_EFFORT`，正式默认 `medium`，作为复杂问题的深分析强度；已完成事实计算的简单问题固定走 `none`；配置仍支持 `none`、`minimal`、`low`、`high`、`xhigh` 或 `max`
@@ -235,7 +250,7 @@ npm test
 & .\scripts\verify-skill.ps1
 ```
 
-验证覆盖事实编译、图表安全、完整 Skill RAG 切块与按域检索、访问控制、App Server 协议、capability token 边界、持久 Thread 恢复与隔离、忙碌隔离、受控工具循环、长连接消息处理、排重、流式回复、独立图片发送、隐私日志、连接配置和一次性 USERID 识别。测试构造数据只验证确定性代码，不会进入生产 runner 或作为答复回退。
+验证覆盖事实编译、单月/跨月大包压力、零活动月份、96 KiB 模型视图、混合 RAG 的强制规则/向量近邻/硬字节边界、访问控制、App Server token 预算轮换与懒恢复、技术性拒答接管、范围变化后的迟到查询隔离、受控工具循环、企微重连看门狗、代际租约、外部计划任务看门狗、安装回滚、排重缓存容量、未授权消息洪泛、群内 `@` 路由、流式回复、经营图/结论图/应急图三级降级、媒体与内联发送、隐私日志和一次性 USERID 识别。测试构造数据只验证确定性代码，不会进入生产 runner 或作为经营事实回退。
 
 ## 运行边界
 
@@ -243,8 +258,8 @@ npm test
 - 仓库外状态日志只记录时间、连接状态和重试次数，不记录 USERID、消息正文、线程 ID、Secret 或业务事实。
 - 明文事实包只存在于单次临时目录，成功或失败后删除。
 - 五分钟业务缓存使用 Windows 当前用户 DPAPI 加密。
-- 为实现持久上下文，用户问题和通过隐私/完整性校验的工具结果会进入该授权主体自己的本机 Codex Thread 历史；它们不进入项目仓库、状态 JSONL 或企微 SDK 日志，也不会跨 USERID/授权范围共享。明文 runner 文件仍会在 `finally` 删除。
+- 用户问题和经过预算投影的本轮事实视图会进入该授权主体自己的本机 Codex Thread；完整事实包不会进入 Thread。Thread 达到预算会主动轮换，旧经营数字不得作为当前事实；内容不进入项目仓库、状态 JSONL 或企微 SDK 日志，也不会跨 USERID/授权范围共享。明文 runner 文件仍会在 `finally` 删除。
 - 未脱敏跟进原文、Bot Secret、模型 Key 和销帮帮凭证不进入 Codex Thread 或服务日志。
-- 本机 Codex 使用 ChatGPT 登录，不单独配置模型 API Key；调用采用持久 Thread、只读无网络沙箱和环境变量白名单。
+- 本机 Codex 使用 ChatGPT 登录，不单独配置模型 API Key；调用采用持久 Thread、环境变量白名单和逐轮只读沙箱。通用 Turn 可联网，经营 Turn 关闭网络并只从 `query_xbb` 获取业务事实。
 - 机器人只读，不发送 CRM 消息、不创建记录、不推进商机、不写回销帮帮。
 - 一个 Bot ID 同时只运行一个正式长连接；新进程会使旧连接离线。

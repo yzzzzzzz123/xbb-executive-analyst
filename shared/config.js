@@ -113,8 +113,10 @@ function loadConfig(options = {}) {
     codexModel: validateCodexModel(envValue(env, "XBB_CODEX_MODEL", stored.codexModel || "gpt-5.6-sol")),
     codexReasoningEffort: validateReasoningEffort(envValue(env, "XBB_CODEX_REASONING_EFFORT", stored.codexReasoningEffort || "medium")),
     agentTurnTimeoutMs: parseInteger(envValue(env, "XBB_AGENT_TURN_TIMEOUT_MS", stored.agentTurnTimeoutMs || 300000), "Codex Agent 单轮超时", 30000, 1800000),
+    generalTurnTimeoutMs: parseInteger(envValue(env, "XBB_GENERAL_TURN_TIMEOUT_MS", stored.generalTurnTimeoutMs || 900000), "Codex 通用问答单轮超时", 60000, 3600000),
     agentStatePath: requireOutsideProject(envValue(env, "XBB_AGENT_STATE_PATH", stored.agentStatePath || path.join(localRoot, "agent-state.json")), "Codex Agent 状态文件"),
     statusLogPath: requireOutsideProject(envValue(env, "XBB_STATUS_LOG_PATH", stored.statusLogPath || path.join(localRoot, "status.jsonl")), "机器人状态日志"),
+    serviceLeasePath: requireOutsideProject(envValue(env, "XBB_SERVICE_LEASE_PATH", stored.serviceLeasePath || path.join(localRoot, "service-lease.json")), "机器人服务租约"),
     accessPolicyPath: path.resolve(envValue(env, "XBB_ACCESS_POLICY_PATH", stored.accessPolicyPath || path.join(localRoot, "access-policy.json")))
   };
 

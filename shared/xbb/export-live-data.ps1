@@ -4,6 +4,8 @@ param(
     [ValidatePattern('^\d{4}-(0[1-9]|1[0-2])$')]
     [string]$Month,
 
+    [string[]]$Domains = @('all'),
+
     [Parameter(Mandatory = $true)]
     [string]$OutputPath
 )
@@ -48,7 +50,7 @@ try {
     $env:XBB_API_BASE = [string]$credential.baseUrl
     $env:XBB_CORPID = [string]$credential.corpid
     $env:XBB_API_TOKEN = $apiToken
-    & node $extractor --month $Month --output $resolvedOutput
+    & node $extractor --month $Month --domains ($Domains -join ',') --output $resolvedOutput
     if ($LASTEXITCODE -ne 0) {
         throw "Live XBB data export failed with exit code $LASTEXITCODE."
     }

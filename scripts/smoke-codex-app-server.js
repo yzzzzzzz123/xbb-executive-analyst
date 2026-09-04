@@ -22,6 +22,7 @@ async function runSmoke() {
     projectRoot,
     agentStatePath: path.join(tempRoot, "agent-state.json"),
     agentTurnTimeoutMs: 300000,
+    generalTurnTimeoutMs: 900000,
     codexModel: "gpt-5.6-sol",
     codexReasoningEffort: "medium"
   };
@@ -40,7 +41,7 @@ async function runSmoke() {
 
     const question = business
       ? "对集团2026年9月业绩按照公司名称排名，并区分课程和咨询占比。结论给老板看，尽量简短，并配一张图。"
-      : "你好。请只用一句中文说明你的专用身份，不要查询销帮帮。";
+      : "你好。请只用一句中文说明你是通用 Codex Agent，也可以按需调用销帮帮经营 Skill；不要查询销帮帮。";
     const runs = [];
     for (let index = 0; index < repeat; index += 1) {
       const answerStartedAtMs = Date.now();
@@ -71,8 +72,8 @@ async function runSmoke() {
       codexVersion,
       model: config.codexModel,
       configuredEffort: config.codexReasoningEffort,
-      turnEffort: chooseTurnEffort(question, config.codexReasoningEffort),
-      skill: "xbb-executive-analyst",
+      turnEffort: business ? chooseTurnEffort(question, config.codexReasoningEffort) : config.codexReasoningEffort,
+      skills: business ? ["xbb-executive-analyst", "xbb-executive-chart"] : [],
       warmMs,
       runs
     })}\n`);

@@ -36,8 +36,10 @@ try {
     if ([string]$full.codexModel -ne 'gpt-5.6-sol') { throw 'Local Codex model round trip failed.' }
     if ([string]$full.codexReasoningEffort -ne 'medium') { throw 'Local Codex reasoning effort round trip failed.' }
     if ([int]$full.agentTurnTimeoutMs -ne 300000) { throw 'Codex Agent timeout round trip failed.' }
+    if ([int]$full.generalTurnTimeoutMs -ne 900000) { throw 'Codex general turn timeout round trip failed.' }
     if ([string]$full.agentStatePath -ne [IO.Path]::GetFullPath((Join-Path $testRoot 'agent-state.json'))) { throw 'Codex Agent state path round trip failed.' }
     if ([string]$full.statusLogPath -ne [IO.Path]::GetFullPath((Join-Path $testRoot 'status.jsonl'))) { throw 'Status log path round trip failed.' }
+    if ([string]$full.serviceLeasePath -ne [IO.Path]::GetFullPath((Join-Path $testRoot 'service-lease.json'))) { throw 'Service lease path round trip failed.' }
 
     $transport = (& $reader -Path $configPath -WecomOnly) | ConvertFrom-Json
     if ($transport.PSObject.Properties.Name -contains 'modelApiKey') { throw 'Transport-only read exposed the model key.' }
@@ -60,8 +62,10 @@ try {
     $legacy.modelProvider = 'local-codex'
     $legacy | Add-Member -NotePropertyName modelTimeoutMs -NotePropertyValue 300000 -Force
     $legacy.PSObject.Properties.Remove('agentTurnTimeoutMs')
+    $legacy.PSObject.Properties.Remove('generalTurnTimeoutMs')
     $legacy.PSObject.Properties.Remove('agentStatePath')
     $legacy.PSObject.Properties.Remove('statusLogPath')
+    $legacy.PSObject.Properties.Remove('serviceLeasePath')
     [IO.File]::WriteAllText($configPath, (($legacy | ConvertTo-Json -Depth 10) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
     & $migrate -Path $configPath | Out-Null
     $migrated = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -69,6 +73,8 @@ try {
     if ([string]$migrated.wecomBotSecretDpapi -ne $legacyCipher) { throw 'App Server config migration changed the DPAPI ciphertext.' }
     $migratedFull = (& $reader -Path $configPath) | ConvertFrom-Json
     if ([string]$migratedFull.wecomBotSecret -ne 'updated-bot-secret-for-test') { throw 'Migrated DPAPI secret no longer decrypts.' }
+    if ([int]$migratedFull.generalTurnTimeoutMs -ne 900000) { throw 'Migrated general turn timeout is invalid.' }
+    if ([string]$migratedFull.serviceLeasePath -ne [IO.Path]::GetFullPath((Join-Path $testRoot 'service-lease.json'))) { throw 'Migrated service lease path is invalid.' }
 
     & $configurePolicy -UserId 'first-user' -AllowAll -Path $policyPath | Out-Null
     & $configurePolicy -UserId 'second-user' -AllowAll -Path $policyPath | Out-Null
@@ -76,7 +82,7 @@ try {
     if ([string]$policy.users.'first-user'.scope -ne 'all' -or [string]$policy.users.'second-user'.scope -ne 'all') { throw 'Atomic access policy replacement did not preserve and add users.' }
     if (@(Get-ChildItem -LiteralPath $testRoot -File | Where-Object { $_.Name -like 'access-policy.json.tmp-*' -or $_.Name -like 'access-policy.json.bak-*' }).Count -ne 0) { throw 'Atomic access policy replacement left temporary files.' }
 
-    Write-Output ([ordered]@{ success = $true; checks = 24; schemaVersion = '4.0'; dpapi = 'CurrentUser'; modelProvider = 'codex-app-server'; codexModel = 'gpt-5.6-sol'; reasoning = 'medium'; atomicReplace = 'passed'; migration = '3.0-to-4.0-passed' } | ConvertTo-Json -Compress)
+    Write-Output ([ordered]@{ success = $true; checks = 26; schemaVersion = '4.0'; dpapi = 'CurrentUser'; modelProvider = 'codex-app-server'; codexModel = 'gpt-5.6-sol'; reasoning = 'medium'; atomicReplace = 'passed'; migration = '3.0-to-4.0-passed' } | ConvertTo-Json -Compress)
 } finally {
     if ([IO.Directory]::Exists($testRoot)) {
         $verified = [IO.Path]::GetFullPath($testRoot)
