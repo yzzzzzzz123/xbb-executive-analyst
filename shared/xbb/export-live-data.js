@@ -794,16 +794,42 @@ function parseArguments(argv) {
   const parsed = {};
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index];
-    if (key === "--month" || key === "--output" || key === "--domains") {
+    if (key === "--request-stdin") {
+      if (parsed["request-stdin"] === true) throw new Error("--request-stdin 不能重复提供");
+      parsed["request-stdin"] = true;
+    } else if (key === "--month" || key === "--output" || key === "--domains" || key === "--isolation-token") {
+      if (index + 1 >= argv.length || String(argv[index + 1]).startsWith("--")) throw new Error(`参数缺少值：${key}`);
+      if (Object.hasOwn(parsed, key.slice(2))) throw new Error(`参数不能重复：${key}`);
       parsed[key.slice(2)] = argv[index + 1];
       index += 1;
     } else {
       throw new Error(`不支持的参数：${key}`);
     }
   }
-  parsed.month = parsed.month || currentMonthShanghai();
   if (!parsed.output) throw new Error("必须提供 --output");
+  if (parsed["request-stdin"] && (parsed.month !== undefined || parsed.domains !== undefined)) {
+    throw new Error("--request-stdin 不能与 --month 或 --domains 同时使用");
+  }
+  if (parsed["isolation-token"] !== undefined && !/^[a-f0-9]{64}$/.test(parsed["isolation-token"])) {
+    throw new Error("runner isolation token 格式无效。");
+  }
   return parsed;
+}
+
+function readScopeRequestFromStdin() {
+  const raw = fs.readFileSync(0);
+  if (!raw.length || raw.length > 8192) throw new Error("stdin 查询范围缺失或超过安全大小");
+  let request;
+  try { request = JSON.parse(raw.toString("utf8")); } catch (_) { throw new Error("stdin 查询范围不是有效 JSON"); }
+  if (!request || typeof request !== "object" || Array.isArray(request)
+      || JSON.stringify(Object.keys(request).sort()) !== JSON.stringify(["domains", "month"])) {
+    throw new Error("stdin 查询范围不符合精确 schema");
+  }
+  if (typeof request.month !== "string" || !Array.isArray(request.domains)
+      || request.domains.some((value) => typeof value !== "string")) {
+    throw new Error("stdin 查询范围字段类型无效");
+  }
+  return { month: request.month, domains: request.domains };
 }
 
 function atomicWriteJson(outputPath, payload) {
@@ -822,7 +848,10 @@ function atomicWriteJson(outputPath, payload) {
 
 async function main() {
   const args = parseArguments(process.argv.slice(2));
-  const dataset = await buildLiveDataset(args.month, args.domains || "all");
+  const request = args["request-stdin"]
+    ? readScopeRequestFromStdin()
+    : { month: args.month || currentMonthShanghai(), domains: args.domains || "all" };
+  const dataset = await buildLiveDataset(request.month, request.domains);
   const bundle = buildSourceBundle(dataset);
   const output = atomicWriteJson(args.output, bundle);
   const sourceSha256 = crypto.createHash("sha256").update(fs.readFileSync(output)).digest("hex");

@@ -26,10 +26,29 @@ const { formatQueryProgress, monthsLabel, normalizeRunnerProgressEvent } = requi
 const { QUERY_XBB_INPUT_SCHEMA } = require("../shared/xbb/query-tool.js");
 const { MAX_MODEL_FACT_VIEW_BYTES, buildModelFactView, utf8Prefix } = require("../shared/xbb/model-fact-view.js");
 const {
+  ISOLATION_SERVICE,
+  ISOLATION_TOKEN_PATTERN,
+  RUNNER_ISOLATION_ERROR_CODE,
+  clearRunnerIsolationMarker,
+  createRunnerIsolationMarker,
+  defaultGatewayWorkRoot,
+  parseRecoveryResult,
+  readRunnerIsolationMarker,
+  recoverRunnerIsolation,
+  recoverRunnerIsolationForTest,
+  runnerIsolationDirectory
+} = require("../shared/xbb/runner-isolation.js");
+const {
   DEFAULT_MAX_CONCURRENT_QUERIES,
+  DEFAULT_MAX_QUEUED_QUERIES,
+  DEFAULT_PROCESS_TREE_TERMINATION_DEADLINE_MS,
   DEFAULT_QUERY_QUEUE_TTL_MS,
+  GATEWAY_FAIL_CLOSED_CODE,
+  PROCESS_TREE_UNCONFIRMED_CODE,
+  RUNNER_EXECUTION_ERROR_CODE,
   assertSafeFactPack,
   createToolGateway,
+  createToolGatewayForTest,
   runRunnerProcess,
   runnerTimeoutMs,
   terminateWindowsProcessTree,
@@ -697,13 +716,177 @@ async function main() {
   assert.equal(runnerTimeoutMs(12), 720000);
   assert.equal(runnerTimeoutMs(120), 900000);
   assert.equal(DEFAULT_MAX_CONCURRENT_QUERIES, 1, "默认只能启动一个不同范围的真实查询，避免突破 API 节流");
-  assert.equal(DEFAULT_QUERY_QUEUE_TTL_MS, 12 * 60 * 1000, "默认排队窗口必须覆盖年度冷查询时长");
-  assert.match(String(terminateWindowsProcessTree), /\["\/PID", String\(pid\), "\/T", "\/F"\]/, "Windows 回收必须覆盖 PowerShell 完整进程树");
+  assert.equal(DEFAULT_MAX_QUEUED_QUERIES, 32, "默认真实查询排队上限不得被放大");
+  assert.ok(DEFAULT_QUERY_QUEUE_TTL_MS > runnerTimeoutMs(120), "默认排队窗口必须覆盖前一个 runner 的最长单次执行");
+  assert.ok(DEFAULT_QUERY_QUEUE_TTL_MS < 20 * 60 * 1000, "默认排队窗口必须服从 Agent 的 20 分钟绝对截止");
+  assert.ok(DEFAULT_PROCESS_TREE_TERMINATION_DEADLINE_MS <= 60 * 1000, "进程树确认必须有短而有限的硬截止");
+  assert.equal(await terminateWindowsProcessTree(2147483646), false,
+    "仅凭 PID 的默认 Windows 回收器必须 fail-closed，不能冒险终止已复用进程");
   assert.equal(QUERY_XBB_INPUT_SCHEMA.properties.months.maxItems, 120);
   assert.throws(() => buildMultiPeriodFactPack(Array.from({ length: 121 }, () => pack)), /120/);
   const runnerSource = fs.readFileSync(path.join(__dirname, "..", "skills", "xbb-executive-analyst", "scripts", "query-xbb.ps1"), "utf8");
   assert.match(runnerSource, /source-v6-\$tenantFingerprint-/);
   assert.match(runnerSource, /baseUrl[\s\S]+corpid[\s\S]+tenantFingerprint/);
+  assert.match(runnerSource, /\[string\]\$IsolationToken/);
+  assert.match(runnerSource, /run-\$IsolationToken/);
+  assert.match(runnerSource, /--isolation-token', \$IsolationToken/);
+  assert.match(runnerSource, /\[switch\]\$RequestFromStdin/);
+  assert.match(runnerSource, /\$builderRequest\s*\|\s*&\s*\$nodePath/);
+  assert.doesNotMatch(runnerSource, /(?:source|facts)-\$selectedMonth/,
+    "传给 Node 的临时路径不得编码月份");
+  assert.doesNotMatch(runnerSource, /\$arguments\s*=\s*@\([^\r\n]+--domains/,
+    "builder 子进程命令行不得携带 domains/company/person");
+  const exporterPowerShellSource = fs.readFileSync(path.join(__dirname, "..", "shared", "xbb", "export-live-data.ps1"), "utf8");
+  assert.match(exporterPowerShellSource, /\$extractRequest\s*\|\s*&\s*node/);
+  assert.doesNotMatch(exporterPowerShellSource, /\$extractorArguments\s*=\s*@\([^\r\n]+--(?:month|domains)/,
+    "exporter Node 命令行不得携带 month/domains");
+  for (const childName of ["export-live-data.js", "build-fact-pack.js", "aggregate-multi-period.js"]) {
+    const childPath = path.join(__dirname, "..", "shared", "xbb", childName);
+    const childSource = fs.readFileSync(childPath, "utf8");
+    assert.match(childSource, /--isolation-token/);
+    assert.match(childSource, /\^\[a-f0-9\]\{64\}\$/);
+    const requiredPaths = childName === "export-live-data.js"
+      ? ["--output", path.join(os.tmpdir(), "unused-source.json")]
+      : childName === "build-fact-pack.js"
+        ? ["--source", path.join(os.tmpdir(), "unused-source.json"), "--output", path.join(os.tmpdir(), "unused-pack.json")]
+        : ["--input", path.join(os.tmpdir(), "unused-aggregate.json"), "--output", path.join(os.tmpdir(), "unused-pack.json")];
+    const invalidTokenRun = childProcess.spawnSync(process.execPath, [childPath, ...requiredPaths, "--isolation-token", "not-a-token"], {
+      encoding: "utf8", windowsHide: true
+    });
+    assert.notEqual(invalidTokenRun.status, 0, `${childName} 必须拒绝无效 isolation token`);
+    assert.match(invalidTokenRun.stderr, /isolation token/);
+    const missingValueRun = childProcess.spawnSync(process.execPath, [childPath, "--isolation-token"], {
+      encoding: "utf8", windowsHide: true
+    });
+    assert.notEqual(missingValueRun.status, 0);
+    assert.match(missingValueRun.stderr, /参数缺少值/);
+    const duplicateOutputRun = childProcess.spawnSync(process.execPath,
+      [childPath, ...requiredPaths, "--output", path.join(os.tmpdir(), "duplicate-output.json"), "--isolation-token", "b".repeat(64)], {
+        encoding: "utf8", windowsHide: true
+      });
+    assert.notEqual(duplicateOutputRun.status, 0);
+    assert.match(duplicateOutputRun.stderr, /参数不能重复/);
+    if (childName !== "aggregate-multi-period.js") {
+      assert.match(childSource, /--request-stdin/);
+      const forbiddenScopeArguments = childName === "export-live-data.js"
+        ? ["--month", "2026-01"]
+        : ["--domains", "all"];
+      const mixedScopeRun = childProcess.spawnSync(process.execPath,
+        [childPath, ...requiredPaths, "--request-stdin", ...forbiddenScopeArguments, "--isolation-token", "b".repeat(64)], {
+          encoding: "utf8", windowsHide: true, input: "{}\n"
+        });
+      assert.notEqual(mixedScopeRun.status, 0);
+      assert.match(mixedScopeRun.stderr, /不能与/);
+    }
+  }
+
+  const isolationUnitRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-isolation-unit-"));
+  try {
+    const serviceLeasePath = path.join(isolationUnitRoot, "runtime", "service-lease.json");
+    const fixedToken = "a".repeat(64);
+    const isolationProjectRoot = path.resolve(__dirname, "..");
+    const isolationRunner = path.join(isolationProjectRoot, "skills", "xbb-executive-analyst", "scripts", "query-xbb.ps1");
+    fs.mkdirSync(defaultGatewayWorkRoot(), { recursive: true });
+    const gatewayWorkDirectory = fs.mkdtempSync(path.join(defaultGatewayWorkRoot(), "request-"));
+    const marker = createRunnerIsolationMarker({
+      serviceLeasePath,
+      projectRoot: isolationProjectRoot,
+      runner: isolationRunner,
+      runRoot: path.join(isolationUnitRoot, "runs"),
+      gatewayWorkDirectory,
+      token: fixedToken,
+      now: () => 1788499200000
+    });
+    assert.equal(marker.directory, runnerIsolationDirectory(serviceLeasePath));
+    assert.equal(fs.existsSync(marker.markerPath), true);
+    const markerPayload = JSON.parse(fs.readFileSync(marker.markerPath, "utf8"));
+    assert.deepEqual(Object.keys(markerPayload).sort(), [
+      "childScriptPaths", "createdAtMs", "gatewayWorkDirectory", "projectRoot", "queryScriptPath", "rootProcess", "runRoot", "schemaVersion", "service", "token"
+    ]);
+    assert.equal(markerPayload.service, ISOLATION_SERVICE);
+    assert.equal(markerPayload.schemaVersion, "2.0");
+    assert.equal(markerPayload.token, fixedToken);
+    assert.equal(markerPayload.rootProcess, null);
+    assert.equal(markerPayload.queryScriptPath, fs.realpathSync.native(isolationRunner));
+    assert.equal(markerPayload.gatewayWorkDirectory, fs.realpathSync.native(gatewayWorkDirectory));
+    assert.equal(markerPayload.childScriptPaths.length, 3);
+    assert.equal(JSON.stringify(markerPayload).includes("2026-"), false, "隔离标记不得保存查询月份或其他经营范围");
+    for (const forbiddenKey of ["months", "domains", "company", "person", "credentials", "apiToken", "facts"]) {
+      assert.equal(Object.hasOwn(markerPayload, forbiddenKey), false, `隔离标记不得保存 ${forbiddenKey}`);
+    }
+    clearRunnerIsolationMarker(marker);
+    assert.equal(fs.existsSync(marker.markerPath), false);
+    fs.rmSync(gatewayWorkDirectory, { recursive: true, force: true });
+
+    assert.deepEqual(parseRecoveryResult('{"success":true,"markersRecovered":2,"processesTerminated":3,"runDirectoriesRemoved":4}\n'), {
+      status: "recovered", markersRecovered: 2, processesTerminated: 3, runDirectoriesRemoved: 4
+    });
+    await assert.rejects(
+      recoverRunnerIsolation({ platform: "linux", serviceLeasePath, projectRoot: path.resolve(__dirname, "..") }),
+      /platform 覆盖已禁用/
+    );
+    assert.deepEqual(await recoverRunnerIsolationForTest({ testOnlyPlatform: "linux", execFile: async () => ({}), serviceLeasePath, projectRoot: path.resolve(__dirname, "..") }), {
+      status: "not_applicable", markersRecovered: 0, processesTerminated: 0, runDirectoriesRemoved: 0
+    });
+    let recoveryInvocation = null;
+    const startupRecovery = await recoverRunnerIsolationForTest({
+      testOnlyPlatform: "win32",
+      serviceLeasePath,
+      projectRoot: path.resolve(__dirname, ".."),
+      execFile: async (command, args, options) => {
+        recoveryInvocation = { command, args, options };
+        return { stdout: '{"success":true,"markersRecovered":0,"processesTerminated":0,"runDirectoriesRemoved":0}\n' };
+      }
+    });
+    assert.equal(startupRecovery.markersRecovered, 0);
+    assert.equal(recoveryInvocation.command, "powershell.exe");
+    assert.equal(recoveryInvocation.args.includes("-IsolationToken"), false, "新代际启动恢复必须扫描全部无业务标记");
+    assert.equal(recoveryInvocation.args[recoveryInvocation.args.indexOf("-MarkerDirectory") + 1], runnerIsolationDirectory(serviceLeasePath));
+    await assert.rejects(recoverRunnerIsolationForTest({
+      testOnlyPlatform: "win32",
+      serviceLeasePath,
+      projectRoot: path.resolve(__dirname, ".."),
+      isolationToken: fixedToken,
+      execFile: async () => ({ stdout: '{"success":true,"markersRecovered":0,"processesTerminated":0,"runDirectoriesRemoved":0}\n' })
+    }), (error) => error?.code === RUNNER_ISOLATION_ERROR_CODE);
+  } finally {
+    fs.rmSync(isolationUnitRoot, { recursive: true, force: true });
+  }
+
+  if (process.platform === "win32") {
+    const bindingTestRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-root-binding-test-"));
+    fs.mkdirSync(defaultGatewayWorkRoot(), { recursive: true });
+    const bindingWorkDirectory = fs.mkdtempSync(path.join(defaultGatewayWorkRoot(), "request-"));
+    const bindingRunner = path.resolve(__dirname, "..", "skills", "xbb-executive-analyst", "scripts", "query-xbb.ps1");
+    const bindingOutput = path.join(bindingWorkDirectory, "fact-pack.json");
+    const bindingMarker = createRunnerIsolationMarker({
+      serviceLeasePath: path.join(bindingTestRoot, "service-lease.json"),
+      projectRoot: path.resolve(__dirname, ".."),
+      runner: bindingRunner,
+      gatewayWorkDirectory: bindingWorkDirectory
+    });
+    const bindingArgs = ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", bindingRunner,
+      "-OutputPath", bindingOutput, "-RequestFromStdin", "-IsolationToken", bindingMarker.token,
+      "-IsolationMarkerPath", bindingMarker.markerPath];
+    const bindingScope = { months: ["2099-01"], domains: ["all"], company: null, person: null, forceRefresh: false };
+    try {
+      for (const businessValue of ["2099-01", "all"]) assert.equal(bindingArgs.includes(businessValue), false);
+      await assert.rejects(runRunnerProcess(util.promisify(childProcess.execFile), "powershell.exe", bindingArgs, {
+        platform: "linux",
+        windowsHide: true,
+        encoding: "utf8",
+        timeoutMs: 10000,
+        stdinText: `${JSON.stringify(bindingScope)}\n`
+      }));
+      const boundMarker = readRunnerIsolationMarker(bindingMarker.markerPath);
+      assert.equal(Number.isInteger(boundMarker.rootProcess?.pid), true,
+        "真实 Windows PowerShell runner 必须从无业务 argv 严格绑定 root PID/creation/exe");
+    } finally {
+      clearRunnerIsolationMarker(bindingMarker);
+      fs.rmSync(bindingWorkDirectory, { recursive: true, force: true });
+      fs.rmSync(bindingTestRoot, { recursive: true, force: true });
+    }
+  }
 
   const annualPlan = { months: ["2026-01", "2026-02", "2026-03"], domains: ["performance"] };
   assert.equal(monthsLabel(annualPlan.months), "2026年1—3月");
@@ -720,12 +903,128 @@ async function main() {
   try {
     const runner = path.join(gatewayRoot, "query-xbb.ps1");
     fs.writeFileSync(runner, "# test runner\n", "utf8");
+    const productionRunner = path.resolve(__dirname, "..", "skills", "xbb-executive-analyst", "scripts", "query-xbb.ps1");
+    const bindTestIsolationRoot = (args, pid) => {
+      const markerPath = args[args.indexOf("-IsolationMarkerPath") + 1];
+      const markerPayload = JSON.parse(fs.readFileSync(markerPath, "utf8"));
+      assert.equal(markerPayload.rootProcess, null);
+      markerPayload.rootProcess = {
+        pid,
+        creationToken: String(638925120000000000n + BigInt(pid)),
+        createdAtMs: markerPayload.createdAtMs + 1,
+        executablePath: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+      };
+      fs.writeFileSync(markerPath, `${JSON.stringify(markerPayload)}\n`, "utf8");
+      return markerPath;
+    };
+    assert.throws(() => createToolGateway({
+      projectRoot: path.resolve(__dirname, ".."), runner: productionRunner, platform: "win32"
+    }), /platform 覆盖已禁用/);
+    assert.throws(() => createToolGateway({
+      projectRoot: path.resolve(__dirname, ".."), runner: productionRunner, testOnlyPlatform: "linux"
+    }), /testOnlyPlatform 只能通过测试专用 gateway/);
+    assert.throws(() => createToolGatewayForTest({
+      projectRoot: path.resolve(__dirname, ".."), runner: productionRunner, testOnlyPlatform: "win32", execFile: async () => ({})
+    }), /fully-qualified serviceLeasePath/);
+    assert.throws(() => createToolGatewayForTest({
+      projectRoot: path.resolve(__dirname, ".."), runner: productionRunner, testOnlyPlatform: "win32", serviceLeasePath: "runtime\\service-lease.json", execFile: async () => ({})
+    }), /fully-qualified serviceLeasePath/);
+    const isolationLeasePath = path.join(gatewayRoot, "runtime", "service-lease.json");
+    let isolationToken = null;
+    let markerObservedBeforeSpawn = false;
+    let normalRecoveryCalls = 0;
+    const isolatedGateway = createToolGatewayForTest({
+      projectRoot: path.resolve(__dirname, ".."),
+      runner: productionRunner,
+      powershell: "powershell-test",
+      testOnlyPlatform: "win32",
+      serviceLeasePath: isolationLeasePath,
+      isolationMarkerRecoverer: async (marker, recoveryOptions) => {
+        normalRecoveryCalls += 1;
+        assert.equal(marker.token, isolationToken);
+        assert.equal(fs.existsSync(marker.markerPath), true, "正常完成后的 CIM 确认必须发生在清 marker 之前");
+        if (recoveryOptions?.confirmationOnly) {
+          assert.equal(fs.existsSync(readRunnerIsolationMarker(marker.markerPath).gatewayWorkDirectory), true);
+          return;
+        }
+        const payload = readRunnerIsolationMarker(marker.markerPath);
+        fs.rmSync(payload.gatewayWorkDirectory, { recursive: true, force: true });
+        clearRunnerIsolationMarker(marker); // 测试替身代表“严格候选已二次确认为零且临时目录已清理”。
+      },
+      execFile: (_command, args, options) => {
+        isolationToken = args[args.indexOf("-IsolationToken") + 1];
+        assert.match(isolationToken, ISOLATION_TOKEN_PATTERN);
+        for (const forbiddenSwitch of ["-Month", "-Domains", "-Company", "-Person", "-ForceRefresh"]) {
+          assert.equal(args.includes(forbiddenSwitch), false, `Windows runner argv 不得包含 ${forbiddenSwitch}`);
+        }
+        assert.equal(args.includes("-RequestFromStdin"), true);
+        assert.deepEqual(JSON.parse(options.stdinText), {
+          months: ["2026-01"], domains: ["all"], company: null, person: null, forceRefresh: false
+        });
+        const markerPath = args[args.indexOf("-IsolationMarkerPath") + 1];
+        markerObservedBeforeSpawn = fs.existsSync(markerPath);
+        assert.equal(JSON.parse(fs.readFileSync(markerPath, "utf8")).rootProcess, null, "marker-before-spawn 阶段不得伪造根进程身份");
+        bindTestIsolationRoot(args, 46001);
+        const outputPath = args[args.indexOf("-OutputPath") + 1];
+        fs.writeFileSync(outputPath, `${JSON.stringify(pack)}\n`, "utf8");
+        const execution = Promise.resolve({ stdout: "", stderr: "" });
+        execution.child = { pid: 46001, kill: () => true };
+        return execution;
+      }
+    });
+    await isolatedGateway({ months: ["2026-01"], domains: ["all"] }, { scope: "all" });
+    assert.equal(markerObservedBeforeSpawn, true, "随机隔离标记必须先于 Windows runner spawn 原子持久化");
+    assert.equal(normalRecoveryCalls, 2);
+    assert.equal(fs.readdirSync(runnerIsolationDirectory(isolationLeasePath)).filter((name) => name.endsWith(".json")).length, 0);
+
+    let cleanupFailureMarker = null;
+    let cleanupFailureNotified = 0;
+    const cleanupFailureGateway = createToolGatewayForTest({
+      projectRoot: path.resolve(__dirname, ".."),
+      runner: productionRunner,
+      powershell: "powershell-test",
+      testOnlyPlatform: "win32",
+      serviceLeasePath: path.join(gatewayRoot, "cleanup-failure-runtime", "service-lease.json"),
+      onIsolationFailure: () => { cleanupFailureNotified += 1; },
+      isolationMarkerRecoverer: async (marker, recoveryOptions) => {
+        cleanupFailureMarker = marker;
+        if (recoveryOptions?.confirmationOnly) return;
+        throw new Error(`injected gateway directory cleanup failure ${marker.token} 清理机密公司`);
+      },
+      execFile: (_command, args) => {
+        bindTestIsolationRoot(args, 46002);
+        const outputPath = args[args.indexOf("-OutputPath") + 1];
+        fs.writeFileSync(outputPath, `${JSON.stringify(pack)}\n`, "utf8");
+        const execution = Promise.resolve({ stdout: "", stderr: "" });
+        execution.child = { pid: 46002, kill: () => true };
+        return execution;
+      }
+    });
+    await assert.rejects(cleanupFailureGateway(
+      { months: ["2026-01"], domains: ["all"], company: "清理机密公司" }, { scope: "all" }
+    ), (error) => {
+      assert.equal(error?.code, RUNNER_ISOLATION_ERROR_CODE);
+      for (const secret of [cleanupFailureMarker.token, "清理机密公司"]) {
+        assert.equal(error.message.includes(secret), false);
+        assert.equal(JSON.stringify(error).includes(secret), false);
+      }
+      assert.equal(error.cause?.message.includes(cleanupFailureMarker.token), true);
+      return true;
+    });
+    assert.equal(cleanupFailureNotified, 1, "gateway work directory 清理失败必须触发生命周期 fail-close");
+    const cleanupFailurePayload = readRunnerIsolationMarker(cleanupFailureMarker.markerPath);
+    assert.equal(fs.existsSync(cleanupFailureMarker.markerPath), true, "目录清理失败必须保留 marker");
+    assert.equal(fs.existsSync(cleanupFailurePayload.gatewayWorkDirectory), true, "目录清理失败不得伪装已删除明文事实目录");
+    fs.rmSync(cleanupFailurePayload.gatewayWorkDirectory, { recursive: true, force: true });
+    clearRunnerIsolationMarker(cleanupFailureMarker);
+
     const firstProgressEvents = [];
     const secondProgressEvents = [];
     let executionCount = 0;
-    const gateway = createToolGateway({
+    const gateway = createToolGatewayForTest({
       runner,
       powershell: "powershell-test",
+      testOnlyPlatform: "linux",
       progressPollMs: 10,
       execFile: async (_command, args) => {
         executionCount += 1;
@@ -761,9 +1060,10 @@ async function main() {
     assert.equal(executionCount, 2, "预先取消后相同 key 必须仍可正常执行");
 
     let retryExecutionCount = 0;
-    const retryGateway = createToolGateway({
+    const retryGateway = createToolGatewayForTest({
       runner,
       powershell: "powershell-test",
+      testOnlyPlatform: "linux",
       progressPollMs: 10,
       execFile: async (_command, args) => {
         retryExecutionCount += 1;
@@ -777,16 +1077,44 @@ async function main() {
     assert.equal(retryExecutionCount, 2);
     assert.equal(retryPack.integrity.factPackSha256, pack.integrity.factPackSha256);
 
-    const fifoStarts = [];
-    const fifoReleases = [];
-    const fifoGateway = createToolGateway({
+    const hiddenRunnerToken = "c".repeat(64);
+    const hiddenRunnerScope = "绝密公司";
+    const safeFailureGateway = createToolGatewayForTest({
       runner,
       powershell: "powershell-test",
+      testOnlyPlatform: "linux",
+      execFile: async (_command, args, options) => {
+        assert.equal(args.includes(hiddenRunnerScope), false);
+        assert.equal(args.includes("2026-01"), false);
+        assert.equal(JSON.parse(options.stdinText).company, hiddenRunnerScope);
+        throw new Error(`raw runner failure ${hiddenRunnerToken} ${hiddenRunnerScope} 2026-01`);
+      }
+    });
+    await assert.rejects(
+      safeFailureGateway({ months: ["2026-01"], domains: ["all"], company: hiddenRunnerScope }, { scope: "all" }),
+      (error) => {
+        assert.equal(error?.code, RUNNER_EXECUTION_ERROR_CODE);
+        assert.match(error.message, /实时销帮帮查询执行失败/);
+        assert.equal(error.cause?.message.includes(hiddenRunnerToken), true, "原始错误只能保留为内部 cause");
+        for (const secret of [hiddenRunnerToken, hiddenRunnerScope, "2026-01"]) {
+          assert.equal(error.message.includes(secret), false);
+          assert.equal(JSON.stringify(error).includes(secret), false);
+        }
+        return true;
+      }
+    );
+
+    const fifoStarts = [];
+    const fifoReleases = [];
+    const fifoGateway = createToolGatewayForTest({
+      runner,
+      powershell: "powershell-test",
+      testOnlyPlatform: "linux",
       maxConcurrentQueries: 2,
       maxQueuedQueries: 4,
       queueTtlMs: 1000,
       execFile: async (_command, args, options) => new Promise((resolve, reject) => {
-        const company = args.includes("-Company") ? args[args.indexOf("-Company") + 1] : "group";
+        const company = JSON.parse(options.stdinText).company || "group";
         const outputPath = args[args.indexOf("-OutputPath") + 1];
         fifoStarts.push(company);
         const finish = () => {
@@ -812,9 +1140,10 @@ async function main() {
 
     let sharedRunnerSignal;
     let finishSharedRunner;
-    const sharedGateway = createToolGateway({
+    const sharedGateway = createToolGatewayForTest({
       runner,
       powershell: "powershell-test",
+      testOnlyPlatform: "linux",
       maxConcurrentQueries: 1,
       execFile: async (_command, args, options) => new Promise((resolve, reject) => {
         sharedRunnerSignal = options.signal;
@@ -838,9 +1167,10 @@ async function main() {
     assert.equal((await sharedSecond).integrity.factPackSha256, pack.integrity.factPackSha256);
 
     let abandonedRunnerSignal;
-    const abandonedGateway = createToolGateway({
+    const abandonedGateway = createToolGatewayForTest({
       runner,
       powershell: "powershell-test",
+      testOnlyPlatform: "linux",
       maxConcurrentQueries: 1,
       execFile: async (_command, _args, options) => new Promise((_resolve, reject) => {
         abandonedRunnerSignal = options.signal;
@@ -877,73 +1207,187 @@ async function main() {
       enforceWindowsProcessTree: true,
       signal: windowsAbort.signal,
       timeoutMs: 1000,
-      processTreeTerminator: async (pid) => { windowsTreePid = pid; }
+      processTreeTerminator: async (pid) => { windowsTreePid = pid; return true; }
     });
     windowsAbort.abort(new Error("active cancelled"));
     await assert.rejects(windowsExecution, /active cancelled/);
     assert.equal(windowsTreePid, 43210, "Windows 取消必须对 PowerShell PID 执行 taskkill /T 语义");
-    assert.equal(windowsDirectKillCalled, true, "进程树回收后仍应尝试终止直接子进程作为兜底");
+    assert.equal(windowsDirectKillCalled, false, "已验证回收后不得再用可能复用的 ChildProcess PID 补杀");
 
-    if (process.platform === "win32") {
-      const realTreeScript = path.join(gatewayRoot, "verify-process-tree.ps1");
-      const realTreePidPath = path.join(gatewayRoot, "verify-process-tree.pid");
-      const escapedPidPath = realTreePidPath.replace(/'/g, "''");
-      fs.writeFileSync(realTreeScript, [
-        "$ErrorActionPreference = 'Stop'",
-        "$child = Start-Process -FilePath 'ping.exe' -ArgumentList @('-t', '127.0.0.1') -WindowStyle Hidden -PassThru",
-        `[IO.File]::WriteAllText('${escapedPidPath}', [string]$child.Id)`,
-        "Wait-Process -Id $child.Id"
-      ].join("\r\n"), "utf8");
-      const realTreeAbort = new AbortController();
-      const realExecFile = util.promisify(childProcess.execFile);
-      const realExecutionOutcome = runRunnerProcess(
-        realExecFile,
-        "powershell.exe",
-        ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", realTreeScript],
-        {
-          platform: "win32",
-          enforceWindowsProcessTree: true,
-          signal: realTreeAbort.signal,
-          timeoutMs: 5000,
-          windowsHide: true,
-          encoding: "utf8"
+    const confirmedIsolationLease = path.join(gatewayRoot, "confirmed-runtime", "service-lease.json");
+    const confirmedAbort = new AbortController();
+    let markConfirmedRunnerStarted;
+    const confirmedRunnerStarted = new Promise((resolve) => { markConfirmedRunnerStarted = resolve; });
+    let markConfirmedRecoveryDone;
+    const confirmedRecoveryDone = new Promise((resolve) => { markConfirmedRecoveryDone = resolve; });
+    let confirmedMarkerPath = null;
+    const confirmedIsolationGateway = createToolGatewayForTest({
+      projectRoot: path.resolve(__dirname, ".."),
+      runner: productionRunner,
+      powershell: "powershell-test",
+      testOnlyPlatform: "win32",
+      serviceLeasePath: confirmedIsolationLease,
+      enforceWindowsProcessTree: true,
+      processTreeTerminator: async () => true,
+      isolationMarkerRecoverer: async (marker) => {
+        try {
+          confirmedMarkerPath = marker.markerPath;
+          assert.equal(fs.existsSync(marker.markerPath), true);
+          const payload = readRunnerIsolationMarker(marker.markerPath);
+          fs.rmSync(payload.gatewayWorkDirectory, { recursive: true, force: true });
+          clearRunnerIsolationMarker(marker);
+          markConfirmedRecoveryDone(null);
+        } catch (error) {
+          markConfirmedRecoveryDone(error);
+          throw error;
         }
-      ).then((value) => ({ value }), (error) => ({ error }));
-      for (let attempt = 0; attempt < 100 && !fs.existsSync(realTreePidPath); attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
+      },
+      execFile: (_command, args) => {
+        bindTestIsolationRoot(args, 43213);
+        const pending = new Promise(() => {});
+        pending.child = { pid: 43213, kill: () => true };
+        markConfirmedRunnerStarted();
+        return pending;
       }
-      if (!fs.existsSync(realTreePidPath)) {
-        realTreeAbort.abort(new Error("process tree setup failed"));
-        const outcome = await realExecutionOutcome;
-        assert.fail(`Windows 进程树测试未能启动子进程：${outcome.error?.message || "unknown"}`);
-      }
-      const realTreeChildPid = Number(fs.readFileSync(realTreePidPath, "utf8").trim());
-      assert.ok(Number.isInteger(realTreeChildPid) && realTreeChildPid > 0);
-      realTreeAbort.abort(new Error("real process tree cancelled"));
-      const realTreeOutcome = await realExecutionOutcome;
-      assert.match(realTreeOutcome.error?.message || "", /real process tree cancelled/);
-      const isRealTreeChildAlive = () => {
-        try { process.kill(realTreeChildPid, 0); return true; } catch { return false; }
+    });
+    const confirmedCancellation = confirmedIsolationGateway(
+      { months: ["2026-01"], domains: ["all"] },
+      { scope: "all" },
+      { signal: confirmedAbort.signal }
+    );
+    await confirmedRunnerStarted;
+    confirmedAbort.abort(new Error("confirmed tree cancelled"));
+    await assert.rejects(confirmedCancellation, /confirmed tree cancelled/);
+    const confirmedRecoveryError = await confirmedRecoveryDone;
+    if (confirmedRecoveryError) throw confirmedRecoveryError;
+    assert.equal(fs.existsSync(confirmedMarkerPath), false, "整树终止确认并再次核验无候选后必须清理 token 标记");
+
+    for (const [label, terminator] of [
+      ["false", async () => false],
+      ["exception", async () => { throw new Error("taskkill unavailable"); }],
+      ["deadline", async () => new Promise(() => {})]
+    ]) {
+      let unsafeDirectKillCalled = false;
+      const unsafeAbort = new AbortController();
+      const unsafeRunner = () => {
+        const pending = new Promise(() => {});
+        pending.child = { pid: 43211, kill: () => { unsafeDirectKillCalled = true; return true; } };
+        return pending;
       };
-      for (let attempt = 0; attempt < 100 && isRealTreeChildAlive(); attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      if (isRealTreeChildAlive()) {
-        childProcess.spawnSync("taskkill.exe", ["/PID", String(realTreeChildPid), "/T", "/F"], { windowsHide: true });
-      }
-      assert.equal(isRealTreeChildAlive(), false, "Abort 后不得遗留 PowerShell 启动的 exporter 类子进程");
+      const startedAt = Date.now();
+      const unsafeExecution = runRunnerProcess(unsafeRunner, "powershell.exe", ["runner.ps1"], {
+        platform: "win32",
+        enforceWindowsProcessTree: true,
+        signal: unsafeAbort.signal,
+        timeoutMs: 1000,
+        processTreeTerminationDeadlineMs: 20,
+        processTreeTerminator: terminator
+      });
+      unsafeAbort.abort(new Error(`unsafe ${label}`));
+      await assert.rejects(unsafeExecution, (error) => error?.code === PROCESS_TREE_UNCONFIRMED_CODE);
+      assert.ok(Date.now() - startedAt < 500, `${label} 回收失败不得永久占住调用 Promise`);
+      assert.equal(unsafeDirectKillCalled, false, `${label} 未确认整树回收时不得只杀父进程并伪装成功`);
     }
+    const untrackedWindowsRunner = new Promise(() => {});
+    await assert.rejects(
+      runRunnerProcess(() => untrackedWindowsRunner, "powershell.exe", ["runner.ps1"], {
+        platform: "win32",
+        enforceWindowsProcessTree: true,
+        timeoutMs: 1000
+      }),
+      (error) => error?.code === PROCESS_TREE_UNCONFIRMED_CODE
+    );
+
+    const failClosedStarts = [];
+    let isolationFailureCalls = 0;
+    let unsafeIsolationRecoveryCalls = 0;
+    let peerIsolationRecoveryCalls = 0;
+    let peerDirectKillCalled = false;
+    const tokenCompanies = new Map();
+    const failClosedAbort = new AbortController();
+    const unsafeIsolationLease = path.join(gatewayRoot, "unsafe-runtime", "service-lease.json");
+    const failClosedGateway = createToolGatewayForTest({
+      projectRoot: path.resolve(__dirname, ".."),
+      runner: productionRunner,
+      powershell: "powershell-test",
+      testOnlyPlatform: "win32",
+      serviceLeasePath: unsafeIsolationLease,
+      enforceWindowsProcessTree: true,
+      maxConcurrentQueries: 2,
+      maxQueuedQueries: 2,
+      queueTtlMs: 1000,
+      processTreeTerminationDeadlineMs: 20,
+      isolationMarkerRecoverer: async (marker) => {
+        const company = tokenCompanies.get(marker.token);
+        if (company === "不确定回收") {
+          unsafeIsolationRecoveryCalls += 1;
+          throw new Error("injected CIM uncertainty");
+        }
+        peerIsolationRecoveryCalls += 1;
+        const payload = readRunnerIsolationMarker(marker.markerPath);
+        fs.rmSync(payload.gatewayWorkDirectory, { recursive: true, force: true });
+        clearRunnerIsolationMarker(marker);
+      },
+      onIsolationFailure: (error) => {
+        isolationFailureCalls += 1;
+        assert.equal(error?.code, PROCESS_TREE_UNCONFIRMED_CODE);
+        throw new Error("lifecycle callback failed");
+      },
+      execFile: (_command, args, options) => {
+        const company = JSON.parse(options.stdinText).company;
+        failClosedStarts.push(company);
+        const token = args[args.indexOf("-IsolationToken") + 1];
+        tokenCompanies.set(token, company);
+        const pid = company === "不确定回收" ? 43212 : 43214;
+        bindTestIsolationRoot(args, pid);
+        const pending = new Promise(() => {});
+        pending.child = { pid, kill: () => { if (company === "并行运行中") peerDirectKillCalled = true; return true; } };
+        return pending;
+      }
+    });
+    const unsafeActive = failClosedGateway(
+      { months: ["2026-01"], domains: ["all"], company: "不确定回收" },
+      { scope: "all" },
+      { signal: failClosedAbort.signal }
+    );
+    const parallelActive = failClosedGateway(
+      { months: ["2026-01"], domains: ["all"], company: "并行运行中" },
+      { scope: "all" }
+    );
+    const blockedFollower = failClosedGateway(
+      { months: ["2026-01"], domains: ["all"], company: "禁止启动" },
+      { scope: "all" }
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    failClosedAbort.abort(new Error("caller deadline"));
+    await assert.rejects(unsafeActive, /caller deadline/);
+    await assert.rejects(parallelActive, (error) => error?.code === GATEWAY_FAIL_CLOSED_CODE);
+    await assert.rejects(blockedFollower, (error) => error?.code === GATEWAY_FAIL_CLOSED_CODE);
+    await assert.rejects(
+      failClosedGateway({ months: ["2026-01"], domains: ["all"], company: "关闭后新请求" }, { scope: "all" }),
+      (error) => error?.code === GATEWAY_FAIL_CLOSED_CODE
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(failClosedStarts, ["不确定回收", "并行运行中"], "失败关闭后不得释放槽位启动排队 runner");
+    assert.equal(isolationFailureCalls, 1, "首次失败关闭必须且只能通知一次生命周期回调，回调异常不得掩盖隔离错误");
+    assert.equal(unsafeIsolationRecoveryCalls, 1, "取消时必须尝试 token recovery，但不确定结果不得清理 marker");
+    assert.equal(peerIsolationRecoveryCalls, 1, "一次隔离失败必须取消并回收所有其他 running entries");
+    assert.equal(peerDirectKillCalled, false, "并行 runner recovery 后不得再执行 PID-only ChildProcess.kill");
+    const unsafeMarkers = fs.readdirSync(runnerIsolationDirectory(unsafeIsolationLease)).filter((name) => name.endsWith(".json"));
+    assert.equal(unsafeMarkers.length, 1, "未确认终止必须保留唯一随机 token 标记供新代际恢复");
+    assert.match(unsafeMarkers[0], /^[a-f0-9]{64}\.json$/);
 
     const queuedCancellationStarts = [];
     const queuedCancellationReleases = new Map();
-    const queuedCancellationGateway = createToolGateway({
+    const queuedCancellationGateway = createToolGatewayForTest({
       runner,
       powershell: "powershell-test",
+      testOnlyPlatform: "linux",
       maxConcurrentQueries: 1,
       maxQueuedQueries: 1,
       queueTtlMs: 1000,
       execFile: async (_command, args, options) => new Promise((resolve, reject) => {
-        const company = args[args.indexOf("-Company") + 1];
+        const company = JSON.parse(options.stdinText).company;
         const outputPath = args[args.indexOf("-OutputPath") + 1];
         queuedCancellationStarts.push(company);
         queuedCancellationReleases.set(company, () => {
@@ -978,9 +1422,10 @@ async function main() {
     await replacementAfterCancellation;
 
     let releaseQueueBlocker;
-    const queueGateway = createToolGateway({
+    const queueGateway = createToolGatewayForTest({
       runner,
       powershell: "powershell-test",
+      testOnlyPlatform: "linux",
       maxConcurrentQueries: 1,
       maxQueuedQueries: 1,
       queueTtlMs: 20,
@@ -1008,7 +1453,7 @@ async function main() {
     fs.rmSync(gatewayRoot, { recursive: true, force: true });
   }
 
-  process.stdout.write(`${JSON.stringify({ success: true, checks: 164, factPackSha256: pack.integrity.factPackSha256 })}\n`);
+  process.stdout.write(`${JSON.stringify({ success: true, checks: 183, factPackSha256: pack.integrity.factPackSha256 })}\n`);
 }
 
 main().catch((error) => {

@@ -112,7 +112,7 @@ function formatContextAnalysisProgress() {
 }
 
 function formatGeneralAnalysisProgress() {
-  return "已识别为通用问题，正在组织简洁结论……\n本轮不会读取销帮帮经营数据。";
+  return "已识别为通用问题，正在请求模型回答……\n本轮不会读取销帮帮经营数据。";
 }
 
 function chartTypeLabel(type) {

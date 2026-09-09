@@ -18,6 +18,7 @@ class ServiceLease {
     this.onError = onError;
     this.timer = null;
     this.state = "stopped";
+    this.terminal = false;
     this.stateSinceAtMs = null;
     this.instanceId = crypto.randomUUID();
   }
@@ -60,6 +61,7 @@ class ServiceLease {
 
   start(state = "running") {
     if (!VALID_LEASE_STATES.has(state) || state === "stopped") throw new Error("机器人服务租约启动状态无效。");
+    if (this.terminal) return false;
     if (this.state !== state || !Number.isFinite(this.stateSinceAtMs)) this.stateSinceAtMs = this.now();
     this.state = state;
     const written = this.beat();
@@ -70,6 +72,7 @@ class ServiceLease {
   }
 
   stop() {
+    this.terminal = true;
     if (this.timer !== null) this.clock.clearInterval(this.timer);
     this.timer = null;
     if (this.state !== "stopped" || !Number.isFinite(this.stateSinceAtMs)) this.stateSinceAtMs = this.now();

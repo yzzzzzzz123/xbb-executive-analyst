@@ -6,13 +6,22 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { AppServerClient } = require("../shared/codex/app-server-client.js");
-const { buildAppServerCommand } = require("../shared/codex/app-server-host.js");
+const { LocalAppServerHost, buildAppServerCommand } = require("../shared/codex/app-server-host.js");
 const { PersistentCodexAgent, principalKeyFromUserId } = require("../shared/codex/persistent-agent.js");
 const { sanitizeCodexEnvironment } = require("../shared/codex/runtime.js");
+const { classifyModelError } = require("../shared/codex/model-error.js");
 const { emptyState, loadAgentState, saveAgentState } = require("../shared/codex/state-store.js");
 
 function nextImmediate() {
   return new Promise((resolve) => setImmediate(resolve));
+}
+
+async function waitUntil(predicate, message, attempts = 80) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (predicate()) return;
+    await nextImmediate();
+  }
+  assert.fail(message);
 }
 
 class FakeWebSocket extends EventEmitter {
@@ -41,6 +50,30 @@ class FakeWebSocket extends EventEmitter {
     this.readyState = FakeWebSocket.CLOSED;
     setImmediate(() => this.emit("close"));
   }
+}
+
+class HangingInitializeWebSocket extends EventEmitter {
+  static OPEN = 1;
+  static CLOSED = 3;
+
+  constructor() {
+    super();
+    this.readyState = HangingInitializeWebSocket.OPEN;
+    this.sent = [];
+    this.terminated = false;
+    HangingInitializeWebSocket.instance = this;
+    setImmediate(() => this.emit("open"));
+  }
+
+  send(raw) { this.sent.push(JSON.parse(raw)); }
+
+  terminate() {
+    this.terminated = true;
+    this.readyState = HangingInitializeWebSocket.CLOSED;
+    setImmediate(() => this.emit("close"));
+  }
+
+  close() { this.terminate(); }
 }
 
 class FakeAppServerClient extends EventEmitter {
@@ -96,10 +129,25 @@ class FakeAppServerClient extends EventEmitter {
   assert.deepEqual(command.args, ["app-server", "--listen", "ws://127.0.0.1:43123", "--ws-auth", "capability-token", "--ws-token-sha256", verifier]);
   assert.equal(command.args.some((value) => value.includes("raw-capability-token")), false);
 
-  const safeEnv = sanitizeCodexEnvironment({ PATH: "safe", LOCALAPPDATA: "local", XBB_WECOM_BOT_SECRET: "do-not-inherit", OPENAI_API_KEY: "do-not-inherit" });
+  const proxyEnv = {
+    HTTP_PROXY: "http://127.0.0.1:7890", HTTPS_PROXY: "http://127.0.0.1:7890",
+    ALL_PROXY: "socks5://127.0.0.1:7891", NO_PROXY: "localhost,127.0.0.1",
+    http_proxy: "http://127.0.0.1:7890", https_proxy: "http://127.0.0.1:7890",
+    all_proxy: "socks5://127.0.0.1:7891", no_proxy: "localhost,127.0.0.1"
+  };
+  const safeEnv = sanitizeCodexEnvironment({ ...proxyEnv, PATH: "safe", LOCALAPPDATA: "local", XBB_WECOM_BOT_SECRET: "do-not-inherit", OPENAI_API_KEY: "do-not-inherit" });
   assert.equal(safeEnv.PATH, "safe");
   assert.equal(Object.hasOwn(safeEnv, "XBB_WECOM_BOT_SECRET"), false);
   assert.equal(Object.hasOwn(safeEnv, "OPENAI_API_KEY"), false);
+  for (const [name, value] of Object.entries(proxyEnv)) assert.equal(safeEnv[name], value, `${name} 必须保留部署网络配置`);
+  assert.equal(classifyModelError({ codexErrorInfo: "unauthorized" }), "unauthorized");
+  assert.equal(classifyModelError({ codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } } }), "connection_failed");
+  assert.equal(classifyModelError({ codexErrorInfo: { HttpConnectionFailed: { httpStatusCode: 401 } } }), "unauthorized");
+  assert.equal(classifyModelError({ codexErrorInfo: "UsageLimitExceeded" }), "usage_limit");
+  assert.equal(classifyModelError({ codexErrorInfo: "ContextWindowExceeded" }), "context_limit");
+  assert.equal(classifyModelError({ codexErrorInfo: "BadRequest" }), "invalid_request");
+  assert.equal(classifyModelError({ codexErrorInfo: "InternalServerError" }), "service_error");
+  assert.equal(classifyModelError({ message: "sensitive upstream details", codexErrorInfo: "untrusted-code" }), "unknown");
 
   const client = new AppServerClient({ endpoint: "ws://127.0.0.1:43123", token: "t".repeat(48), WebSocketImpl: FakeWebSocket });
   await client.connect();
@@ -113,6 +161,94 @@ class FakeAppServerClient extends EventEmitter {
   FakeWebSocket.instance.emit("message", Buffer.from(JSON.stringify({ method: "error", params: { willRetry: true, error: { message: "Reconnecting" } } })), false);
   assert.equal(retryNotification.willRetry, true);
   await client.close();
+
+  const connectAbortController = new AbortController();
+  const abortingClient = new AppServerClient({
+    endpoint: "ws://127.0.0.1:43124",
+    token: "u".repeat(48),
+    WebSocketImpl: HangingInitializeWebSocket
+  });
+  const abortedConnect = abortingClient.connect({ signal: connectAbortController.signal });
+  await waitUntil(
+    () => HangingInitializeWebSocket.instance?.sent.some((message) => message.method === "initialize"),
+    "WebSocket 初始化请求应已发出"
+  );
+  const connectAbortError = new Error("startup deadline aborted websocket");
+  connectAbortController.abort(connectAbortError);
+  await assert.rejects(abortedConnect, /startup deadline aborted websocket/);
+  assert.equal(HangingInitializeWebSocket.instance.terminated, true, "AbortSignal 必须主动终止初始化中的 WebSocket");
+  assert.equal(abortingClient.pending.size, 0, "取消初始化后不得残留 RPC pending/timer");
+
+  const hostAbortController = new AbortController();
+  const hostChild = new EventEmitter();
+  hostChild.exitCode = null;
+  hostChild.stderr = null;
+  const hostKillSignals = [];
+  hostChild.kill = (signal) => {
+    hostKillSignals.push(signal || "SIGTERM");
+    hostChild.exitCode = 0;
+    setImmediate(() => hostChild.emit("close"));
+    return true;
+  };
+  let markHostProbeStarted;
+  const hostProbeStarted = new Promise((resolve) => { markHostProbeStarted = resolve; });
+  const abortedHostStart = LocalAppServerHost.start({ projectRoot: process.cwd() }, {
+    signal: hostAbortController.signal,
+    reservePort: async () => 43125,
+    invocation: { command: "codex.exe", argsPrefix: [] },
+    spawn: () => hostChild,
+    probe: () => {
+      markHostProbeStarted();
+      return new Promise(() => {});
+    },
+    readyTimeoutMs: 30000
+  });
+  await hostProbeStarted;
+  hostAbortController.abort(new Error("startup deadline aborted host"));
+  await assert.rejects(abortedHostStart, /startup deadline aborted host/);
+  assert.deepEqual(hostKillSignals, ["SIGTERM"], "取消就绪探测必须回收已经创建的 App Server 子进程");
+
+  const forcedChild = new EventEmitter();
+  forcedChild.exitCode = null;
+  const forcedSignals = [];
+  forcedChild.kill = (signal) => {
+    forcedSignals.push(signal || "SIGTERM");
+    if (signal === "SIGKILL") {
+      forcedChild.exitCode = 1;
+      setImmediate(() => forcedChild.emit("close"));
+    }
+    return true;
+  };
+  const forcedHost = new LocalAppServerHost({
+    process: forcedChild,
+    endpoint: "ws://127.0.0.1:43129",
+    token: "v".repeat(48),
+    port: 43129,
+    closeGraceMs: 5,
+    killConfirmTimeoutMs: 5
+  });
+  await forcedHost.close();
+  assert.deepEqual(forcedSignals, ["SIGTERM", "SIGKILL"], "优雅关闭未确认时必须升级到 SIGKILL 并等待退出事件");
+
+  const unconfirmedChild = new EventEmitter();
+  unconfirmedChild.exitCode = null;
+  const unconfirmedSignals = [];
+  unconfirmedChild.kill = (signal) => {
+    unconfirmedSignals.push(signal || "SIGTERM");
+    return signal === "SIGKILL";
+  };
+  const unconfirmedHost = new LocalAppServerHost({
+    process: unconfirmedChild,
+    endpoint: "ws://127.0.0.1:43130",
+    token: "w".repeat(48),
+    port: 43130,
+    closeGraceMs: 5,
+    killConfirmTimeoutMs: 5
+  });
+  const unconfirmedClose = unconfirmedHost.close();
+  assert.equal(unconfirmedHost.close(), unconfirmedClose, "并发 close 必须共享同一个终止确认 Promise");
+  await assert.rejects(unconfirmedClose, /终止未得到确认/);
+  assert.deepEqual(unconfirmedSignals, ["SIGTERM", "SIGKILL"], "kill 返回失败或 SIGKILL 后无退出确认必须 fail closed");
 
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-app-server-test-"));
   try {
@@ -134,11 +270,132 @@ class FakeAppServerClient extends EventEmitter {
     const config = {
       projectRoot: path.resolve(__dirname, ".."),
       agentStatePath: statePath,
+      serviceLeasePath: path.join(tempRoot, "service-lease.json"),
       agentTurnTimeoutMs: 30000,
       generalTurnTimeoutMs: 900000,
       codexModel: "gpt-5.6-sol",
       codexReasoningEffort: "medium"
     };
+
+    const lateHostController = new AbortController();
+    const lateHostProcess = new EventEmitter();
+    lateHostProcess.exitCode = null;
+    let lateHostCloseCalls = 0;
+    const lateHost = {
+      endpoint: "ws://127.0.0.1:43126",
+      token: "l".repeat(48),
+      process: lateHostProcess,
+      close: async () => { lateHostCloseCalls += 1; }
+    };
+    let resolveLateHost;
+    let lateHostFactorySignal = null;
+    let lateHostClientFactoryCalls = 0;
+    const lateHostAgent = new PersistentCodexAgent({
+      ...config,
+      agentStatePath: path.join(tempRoot, "late-host-state.json")
+    }, {
+      hostFactory: { start: (_config, options) => {
+        lateHostFactorySignal = options.signal;
+        return new Promise((resolve) => { resolveLateHost = resolve; });
+      } },
+      clientFactory: () => { lateHostClientFactoryCalls += 1; return new FakeAppServerClient(); },
+      verifyLogin: () => ({ mode: "chatgpt" }),
+      readVersion: () => "0.151.0",
+      queryXbb: async () => ({ status: "ready" })
+    });
+    let lateHostReadyEvents = 0;
+    lateHostAgent.on("ready", () => { lateHostReadyEvents += 1; });
+    const lateHostStart = lateHostAgent.start({ signal: lateHostController.signal });
+    await nextImmediate();
+    assert.equal(lateHostFactorySignal?.aborted, false);
+    lateHostController.abort(new Error("late host startup cancelled"));
+    assert.equal(lateHostFactorySignal?.aborted, true, "外部启动取消必须传递到 hostFactory");
+    resolveLateHost(lateHost);
+    await assert.rejects(lateHostStart, /late host startup cancelled/);
+    assert.equal(lateHostCloseCalls, 1, "取消后迟到返回的 Host 必须立即关闭");
+    assert.equal(lateHostClientFactoryCalls, 0, "取消后迟到 Host 不得继续创建 Client");
+    assert.equal(lateHostAgent.started, false);
+    assert.equal(lateHostReadyEvents, 0);
+
+    const fatalHostProcess = new EventEmitter();
+    fatalHostProcess.exitCode = null;
+    let fatalHostCloseCalls = 0;
+    const fatalHost = {
+      endpoint: "ws://127.0.0.1:43128",
+      token: "n".repeat(48),
+      process: fatalHostProcess,
+      close: async () => { fatalHostCloseCalls += 1; }
+    };
+    let resolveFatalHost;
+    let fatalHostSignal = null;
+    let triggerStartupFatal;
+    const fatalHostAgent = new PersistentCodexAgent({
+      ...config,
+      agentStatePath: path.join(tempRoot, "fatal-host-state.json")
+    }, {
+      hostFactory: { start: (_config, options) => {
+        fatalHostSignal = options.signal;
+        return new Promise((resolve) => { resolveFatalHost = resolve; });
+      } },
+      clientFactory: () => new FakeAppServerClient(),
+      verifyLogin: () => ({ mode: "chatgpt" }),
+      readVersion: () => "0.151.0",
+      toolGatewayFactory: (options) => {
+        triggerStartupFatal = options.onIsolationFailure;
+        return async () => ({ status: "ready" });
+      }
+    });
+    const fatalHostStart = fatalHostAgent.start();
+    await nextImmediate();
+    triggerStartupFatal();
+    assert.equal(fatalHostSignal?.aborted, true, "fatal 必须主动取消仍挂起的 Host 启动");
+    resolveFatalHost(fatalHost);
+    await assert.rejects(fatalHostStart, /进程隔离状态失效/);
+    assert.equal(fatalHostCloseCalls, 1, "fatal 后迟到 Host 必须关闭");
+    assert.equal(fatalHostAgent.started, false);
+
+    const lateClientController = new AbortController();
+    const lateClientProcess = new EventEmitter();
+    lateClientProcess.exitCode = null;
+    let lateClientHostCloseCalls = 0;
+    const lateClientHost = {
+      endpoint: "ws://127.0.0.1:43127",
+      token: "m".repeat(48),
+      process: lateClientProcess,
+      close: async () => { lateClientHostCloseCalls += 1; }
+    };
+    const lateClient = new FakeAppServerClient();
+    let lateClientSignal = null;
+    let resolveLateClientConnect;
+    let lateClientCloseCalls = 0;
+    lateClient.connect = (options = {}) => {
+      lateClientSignal = options.signal;
+      return new Promise((resolve) => { resolveLateClientConnect = resolve; });
+    };
+    lateClient.close = async () => { lateClientCloseCalls += 1; lateClient.connected = false; };
+    const lateClientAgent = new PersistentCodexAgent({
+      ...config,
+      agentStatePath: path.join(tempRoot, "late-client-state.json")
+    }, {
+      hostFactory: { start: async () => lateClientHost },
+      clientFactory: () => lateClient,
+      verifyLogin: () => ({ mode: "chatgpt" }),
+      readVersion: () => "0.151.0",
+      queryXbb: async () => ({ status: "ready" })
+    });
+    let lateClientReadyEvents = 0;
+    lateClientAgent.on("ready", () => { lateClientReadyEvents += 1; });
+    const lateClientStart = lateClientAgent.start({ signal: lateClientController.signal });
+    await waitUntil(() => typeof resolveLateClientConnect === "function", "Client connect 应已进入等待");
+    lateClientController.abort(new Error("late client startup cancelled"));
+    assert.equal(lateClientSignal?.aborted, true, "外部启动取消必须传递到 AppServerClient.connect");
+    resolveLateClientConnect();
+    await assert.rejects(lateClientStart, /late client startup cancelled/);
+    assert.equal(lateClientCloseCalls, 1, "取消后迟到完成的 Client 必须关闭");
+    assert.equal(lateClientHostCloseCalls, 1, "Client 迟到完成后 Host 也必须关闭");
+    assert.equal(lateClientAgent.started, false);
+    assert.equal(lateClientReadyEvents, 0);
+
     const readyPerformancePack = (month = "2026-09", total = 123) => ({
       status: "ready",
       scope: { month, domains: ["performance"] },
@@ -263,6 +520,64 @@ class FakeAppServerClient extends EventEmitter {
     assert.equal(loadAgentState(statePath).threads[principal].lastMode, "general");
     assert.equal(loadAgentState(statePath).threads[principal].lastModeSource, "user");
     assert.equal(loadAgentState(statePath).threads[principal].turnInProgress, false);
+
+    const modelErrorClient = new FakeAppServerClient();
+    let modelErrorQueryCalls = 0;
+    const modelErrorAgent = isolatedAgent("model-error", modelErrorClient, {
+      queryXbb: async () => { modelErrorQueryCalls += 1; throw new Error("通用问题禁止查询经营数据"); }
+    });
+    const modelProgress = [];
+    const modelActivities = [];
+    modelErrorAgent.on("activity", (event) => modelActivities.push(event));
+    await modelErrorAgent.start();
+    const modelPrincipal = principalKeyFromUserId("model-error-user", access);
+    const retryAnswer = modelErrorAgent.answer({ question: "你好", access, principalKey: modelPrincipal, onProgress: (value) => modelProgress.push(value) });
+    await nextImmediate();
+    modelErrorClient.emit("notification", { method: "error", params: {
+      threadId: "thread-1", turnId: "old-turn", willRetry: true,
+      error: { codexErrorInfo: "unauthorized", message: "must-not-appear" }
+    } });
+    assert.equal(modelActivities.some((event) => event.status === "model_retrying"), false, "迟到错误不得改变当前问题状态");
+    modelErrorClient.emit("notification", { method: "error", params: {
+      threadId: "thread-1", turnId: "turn-1", willRetry: true,
+      error: { codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } }, message: "sensitive-url-and-token" }
+    } });
+    await nextImmediate();
+    assert.match(modelProgress.at(-1), /自动重试/);
+    assert.equal(modelActivities.at(-1).modelErrorCode, "connection_failed");
+    assert.doesNotMatch(JSON.stringify({ modelProgress, modelActivities }), /sensitive-url-and-token/);
+    modelErrorClient.emit("notification", { method: "item/started", params: {
+      threadId: "thread-1", turnId: "turn-1", item: { id: "retry-response", type: "agentMessage" }
+    } });
+    await nextImmediate();
+    assert.match(modelProgress.at(-1), /连接已恢复/);
+    modelErrorClient.complete("thread-1", "turn-1", JSON.stringify({ answer: "你好，连接已恢复。", chart: null }));
+    assert.match((await retryAnswer).answer, /连接已恢复/);
+
+    const unauthorizedAnswer = modelErrorAgent.answer({ question: "解释一下缓存", access, principalKey: modelPrincipal });
+    const unauthorizedResult = assert.rejects(unauthorizedAnswer, (error) => error.routeMode === "general" && error.modelErrorCode === "unauthorized");
+    await nextImmediate();
+    const failedActive = modelErrorAgent.sessions.get(modelPrincipal).active;
+    modelErrorClient.emit("notification", { method: "error", params: {
+      threadId: "thread-1", turnId: "turn-2", willRetry: false,
+      error: { codexErrorInfo: "unauthorized", message: "refresh token private details" }
+    } });
+    modelErrorClient.emit("notification", { method: "turn/completed", params: {
+      threadId: "thread-1", turn: { id: "turn-2", status: "failed", items: [] }
+    } });
+    await unauthorizedResult;
+    assert.equal(modelActivities.at(-1).modelErrorCode, "unauthorized", "最终错误必须保留上游固定类别");
+    assert.equal(modelErrorAgent.sessions.get(modelPrincipal).threadId, null, "失败 Thread 必须清理，登录恢复后才能重新创建");
+    assert.equal(loadAgentState(modelErrorAgent.statePath).threads[modelPrincipal], undefined);
+    assert.equal(failedActive.timeout, null);
+    assert.equal(failedActive.absoluteTimeout, null);
+    const afterLoginAnswer = modelErrorAgent.answer({ question: "你好", access, principalKey: modelPrincipal });
+    await nextImmediate();
+    assert.equal(modelErrorClient.startTurnCalls.at(-1).params.threadId, "thread-2");
+    modelErrorClient.complete("thread-2", "turn-3", JSON.stringify({ answer: "重新登录后正常回答。", chart: null }));
+    assert.match((await afterLoginAnswer).answer, /正常回答/);
+    assert.equal(modelErrorQueryCalls, 0);
+    await modelErrorAgent.close();
 
     const progress = [];
     const businessPromise = agent.answer({ question: "集团9月业绩排名", access, principalKey: principal, messageId: "msg-business", onProgress: async (text) => progress.push(text) });
@@ -425,6 +740,34 @@ class FakeAppServerClient extends EventEmitter {
     await agent.close();
     assert.equal(fakeClient.connected, false);
 
+    const schemaClient = new FakeAppServerClient();
+    let schemaQueryCalls = 0;
+    const schemaAgent = isolatedAgent("schema-only-route", schemaClient, {
+      queryXbb: async () => {
+        schemaQueryCalls += 1;
+        return readyPerformancePack();
+      }
+    });
+    await schemaAgent.start();
+    const schemaPrincipal = principalKeyFromUserId("schema-user", access);
+    const schemaPromise = schemaAgent.answer({
+      question: "业绩订单表 5614255 的 text_63 是什么字段",
+      access,
+      principalKey: schemaPrincipal,
+      messageId: "schema-only-field"
+    });
+    await nextImmediate();
+    assert.equal(schemaQueryCalls, 0, "纯表单字段问法不得发起无价值的实时取数");
+    assert.equal(schemaClient.startTurnCalls.length, 1);
+    assert.equal(schemaClient.startTurnCalls[0].params.input[1].name, "xbb-executive-analyst");
+    assert.match(schemaClient.startTurnCalls[0].params.input[0].text, /销帮帮 Skill RAG 适用规则/);
+    assert.doesNotMatch(schemaClient.startTurnCalls[0].params.input[0].text, /本轮 query_xbb 实时预取事实包/);
+    schemaClient.complete("thread-1", "turn-1", JSON.stringify({ answer: "text_63 是所属公司字段。", chart: null }));
+    const schemaResult = await schemaPromise;
+    assert.equal(schemaResult.routeMode, "xbb");
+    assert.match(schemaResult.answer, /所属公司/);
+    await schemaAgent.close();
+
     const resumedClient = new FakeAppServerClient();
     const resumed = new PersistentCodexAgent(config, {
       hostFactory: { start: async () => fakeHost },
@@ -516,6 +859,487 @@ class FakeAppServerClient extends EventEmitter {
     await assert.rejects(changedScopePromise, /结构化结果/);
     assert.equal(staleQueryCount, 2);
     await staleAgent.close();
+
+    const prefetchClient = new FakeAppServerClient();
+    const prefetchCalls = [];
+    let firstPrefetchSignal;
+    let releaseFirstPrefetch;
+    let markFirstPrefetchStarted;
+    const firstPrefetchStarted = new Promise((resolve) => { markFirstPrefetchStarted = resolve; });
+    const prefetchAgent = isolatedAgent("prefetch-scope-takeover", prefetchClient, {
+      queryXbb: async (args, _access, invocation = {}) => {
+        prefetchCalls.push(args);
+        if (prefetchCalls.length === 1) {
+          firstPrefetchSignal = invocation.signal;
+          markFirstPrefetchStarted();
+          return new Promise((resolve) => { releaseFirstPrefetch = () => resolve(readyPerformancePack(args.months[0], 901)); });
+        }
+        return readyPerformancePack(args.months[0], 802);
+      }
+    });
+    await prefetchAgent.start();
+    const prefetchPrincipal = principalKeyFromUserId("prefetch-takeover-user", access);
+    const supersededPrefetch = prefetchAgent.answer({
+      question: "分析华东公司2026年1—8月业绩排名",
+      access,
+      principalKey: prefetchPrincipal,
+      messageId: "prefetch-old"
+    });
+    await firstPrefetchStarted;
+    const latestPrefetch = prefetchAgent.answer({
+      question: "改成只看9月",
+      access,
+      principalKey: prefetchPrincipal,
+      messageId: "prefetch-new"
+    });
+    assert.match((await supersededPrefetch).answer, /最新一条消息/);
+    for (let index = 0; index < 4; index += 1) await nextImmediate();
+    assert.equal(firstPrefetchSignal.aborted, true, "范围变化必须立即取消旧预取订阅");
+    assert.equal(prefetchCalls.length, 2, "旧预取即便忽略 Abort，新范围也必须立即开始");
+    assert.deepEqual(prefetchCalls[0], { months: ["2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06", "2026-07", "2026-08"], domains: ["performance"] });
+    assert.deepEqual(prefetchCalls[1], { months: ["2026-09"], domains: ["performance"] });
+    assert.equal(prefetchClient.startTurnCalls.length, 1);
+    assert.equal(prefetchClient.startTurnCalls[0].params.clientUserMessageId, "prefetch-new", "最新消息必须成为结果所有者");
+    assert.match(prefetchClient.startTurnCalls[0].params.input[0].text, /启动前仍有效的意图链/);
+    assert.match(prefetchClient.startTurnCalls[0].params.input[0].text, /分析华东公司2026年1—8月业绩排名/);
+    assert.match(prefetchClient.startTurnCalls[0].params.input[0].text, /【用户问题】\n改成只看9月/);
+    assert.match(prefetchClient.startTurnCalls[0].params.input[0].text, /"month":"2026-09"/);
+    assert.match(prefetchClient.startTurnCalls[0].params.input[0].text, /"total":802/);
+    assert.doesNotMatch(prefetchClient.startTurnCalls[0].params.input[0].text, /"total":901/, "旧月份事实不得进入新 Turn");
+    prefetchClient.complete("thread-1", "turn-1", JSON.stringify({ answer: "9月范围已接管并完成。", chart: null }));
+    const latestPrefetchResult = await latestPrefetch;
+    assert.equal(latestPrefetchResult.routeMode, "xbb");
+    assert.match(latestPrefetchResult.answer, /9月范围已接管/);
+    releaseFirstPrefetch();
+    await nextImmediate();
+    assert.equal(prefetchClient.startTurnCalls.length, 1, "迟到的旧预取结果不得二次提交 Turn");
+    assert.equal(prefetchAgent.sessions.get(prefetchPrincipal).requestQueue.length, 0);
+    assert.equal(prefetchAgent.sessions.get(prefetchPrincipal).active, null);
+    await prefetchAgent.close();
+
+    const companyScopeClient = new FakeAppServerClient();
+    const companyScopeCalls = [];
+    let companyOldSignal;
+    let releaseCompanyOldQuery;
+    let markCompanyOldQueryStarted;
+    const companyOldQueryStarted = new Promise((resolve) => { markCompanyOldQueryStarted = resolve; });
+    const companyScopeAgent = isolatedAgent("prefetch-company-scope", companyScopeClient, {
+      queryXbb: async (args, _access, invocation = {}) => {
+        companyScopeCalls.push(args);
+        if (companyScopeCalls.length === 1) {
+          companyOldSignal = invocation.signal;
+          markCompanyOldQueryStarted();
+          return new Promise((resolve) => { releaseCompanyOldQuery = () => resolve(readyPerformancePack(args.months[0], 777)); });
+        }
+        return readyPerformancePack(args.months[0], 606);
+      }
+    });
+    await companyScopeAgent.start();
+    const companyScopePrincipal = principalKeyFromUserId("prefetch-company-user", access);
+    const companyOldAnswer = companyScopeAgent.answer({
+      question: "集团2026年9月业绩排名",
+      access,
+      principalKey: companyScopePrincipal,
+      messageId: "prefetch-company-old"
+    });
+    await companyOldQueryStarted;
+    const companyLatestAnswer = companyScopeAgent.answer({
+      question: "改成只看华南公司",
+      access,
+      principalKey: companyScopePrincipal,
+      messageId: "prefetch-company-new"
+    });
+    assert.match((await companyOldAnswer).answer, /最新一条消息/);
+    await waitUntil(() => companyScopeClient.startTurnCalls.length === 1, "公司范围更正后应立即启动无宽范围预取的新 Turn");
+    assert.equal(companyOldSignal.aborted, true, "公司范围更正即使月份和业务域不变也必须取消旧预取");
+    assert.equal(companyScopeCalls.length, 1, "公司范围更正不得自动执行集团宽范围预取");
+    const companyScopePrompt = companyScopeClient.startTurnCalls[0].params.input[0].text;
+    assert.equal(companyScopeClient.startTurnCalls[0].params.clientUserMessageId, "prefetch-company-new");
+    assert.match(companyScopePrompt, /华南公司/);
+    assert.match(companyScopePrompt, /最新实体范围必须动态查询/);
+    assert.doesNotMatch(companyScopePrompt, /本轮 query_xbb 实时预取事实包/);
+    assert.doesNotMatch(companyScopePrompt, /"total":777/, "旧集团事实不得进入公司范围新 Turn");
+    companyScopeClient.emit("serverRequest", {
+      id: 905,
+      method: "item/tool/call",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        tool: "query_xbb",
+        arguments: { months: ["2026-09"], domains: ["performance"], company: "华南公司" }
+      }
+    });
+    await waitUntil(() => companyScopeClient.responses.some((response) => response.id === 905), "公司动态精确查询应返回事实视图");
+    assert.deepEqual(companyScopeCalls[1], { months: ["2026-09"], domains: ["performance"], company: "华南公司" });
+    companyScopeClient.complete("thread-1", "turn-1", JSON.stringify({ answer: "华南公司范围已动态查询。", chart: null }));
+    assert.match((await companyLatestAnswer).answer, /华南公司范围/);
+    releaseCompanyOldQuery();
+    await nextImmediate();
+    assert.equal(companyScopeClient.startTurnCalls.length, 1, "公司旧预取迟到结果不得再次启动 Turn");
+    await companyScopeAgent.close();
+
+    const personProgressClient = new FakeAppServerClient();
+    const personProgressCalls = [];
+    let releasePersonInitialProgress;
+    let markPersonInitialProgress;
+    let personInitialProgressBlocked = false;
+    const personInitialProgress = new Promise((resolve) => { markPersonInitialProgress = resolve; });
+    const personProgressAgent = isolatedAgent("prefetch-person-progress", personProgressClient, {
+      queryXbb: async (args) => {
+        personProgressCalls.push(args);
+        return readyPerformancePack(args.months[0], 505);
+      }
+    });
+    await personProgressAgent.start();
+    const personProgressPrincipal = principalKeyFromUserId("prefetch-person-user", access);
+    const personOldAnswer = personProgressAgent.answer({
+      question: "集团2026年9月商机质量分析",
+      access,
+      principalKey: personProgressPrincipal,
+      messageId: "prefetch-person-old",
+      onProgress: async () => {
+        if (personInitialProgressBlocked) return;
+        personInitialProgressBlocked = true;
+        markPersonInitialProgress();
+        await new Promise((resolve) => { releasePersonInitialProgress = resolve; });
+      }
+    });
+    await personInitialProgress;
+    const personLatestAnswer = personProgressAgent.answer({
+      question: "换个销售看：张三",
+      access,
+      principalKey: personProgressPrincipal,
+      messageId: "prefetch-person-new"
+    });
+    assert.match((await personOldAnswer).answer, /最新一条消息/);
+    releasePersonInitialProgress();
+    await waitUntil(() => personProgressClient.startTurnCalls.length === 1, "销售范围更正应越过通用路由并启动新 Turn");
+    assert.equal(personProgressCalls.length, 0, "进度通知 await 期间的销售更正必须阻止旧 runner 启动");
+    const personScopePrompt = personProgressClient.startTurnCalls[0].params.input[0].text;
+    assert.match(personScopePrompt, /换个销售看：张三/);
+    assert.match(personScopePrompt, /最新实体范围必须动态查询/);
+    assert.doesNotMatch(personScopePrompt, /本轮 query_xbb 实时预取事实包/);
+    personProgressClient.emit("serverRequest", {
+      id: 906,
+      method: "item/tool/call",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        tool: "query_xbb",
+        arguments: { months: ["2026-09"], domains: ["opportunities"], person: "张三" }
+      }
+    });
+    await waitUntil(() => personProgressClient.responses.some((response) => response.id === 906), "销售动态精确查询应返回事实视图");
+    assert.deepEqual(personProgressCalls[0], { months: ["2026-09"], domains: ["opportunities"], person: "张三" });
+    personProgressClient.complete("thread-1", "turn-1", JSON.stringify({ answer: "张三销售范围已动态查询。", chart: null }));
+    assert.match((await personLatestAnswer).answer, /张三销售范围/);
+    await personProgressAgent.close();
+
+    const correctionChainClient = new FakeAppServerClient();
+    const correctionChainCalls = [];
+    let correctionChainOldSignal;
+    let releaseCorrectionChainOldQuery;
+    let markCorrectionChainOldQueryStarted;
+    const correctionChainOldQueryStarted = new Promise((resolve) => { markCorrectionChainOldQueryStarted = resolve; });
+    const correctionChainAgent = isolatedAgent("prefetch-correction-chain", correctionChainClient, {
+      queryXbb: async (args, _access, invocation = {}) => {
+        correctionChainCalls.push(args);
+        if (correctionChainCalls.length === 1) {
+          correctionChainOldSignal = invocation.signal;
+          markCorrectionChainOldQueryStarted();
+          return new Promise((resolve) => { releaseCorrectionChainOldQuery = () => resolve(readyPerformancePack(args.months[0], 404)); });
+        }
+        return readyPerformancePack(args.months[0], 303);
+      }
+    });
+    await correctionChainAgent.start();
+    const correctionChainPrincipal = principalKeyFromUserId("prefetch-chain-user", access);
+    const correctionChainAnswers = [correctionChainAgent.answer({
+      question: "分析集团2026年1—8月业绩排名",
+      access,
+      principalKey: correctionChainPrincipal,
+      messageId: "prefetch-chain-original"
+    })];
+    await correctionChainOldQueryStarted;
+    correctionChainAnswers.push(correctionChainAgent.answer({
+      question: "改成只看华南公司",
+      access,
+      principalKey: correctionChainPrincipal,
+      messageId: "prefetch-chain-company"
+    }));
+    correctionChainAnswers.push(correctionChainAgent.answer({
+      question: "改成商机分析",
+      access,
+      principalKey: correctionChainPrincipal,
+      messageId: "prefetch-chain-domain"
+    }));
+    correctionChainAnswers.push(correctionChainAgent.answer({
+      question: "再只看8月",
+      access,
+      principalKey: correctionChainPrincipal,
+      messageId: "prefetch-chain-month"
+    }));
+    const correctionChainSettlements = [0, 0, 0, 0];
+    correctionChainAnswers.forEach((promise, index) => promise.then(
+      () => { correctionChainSettlements[index] += 1; },
+      () => { correctionChainSettlements[index] += 1; }
+    ));
+    assert.match((await correctionChainAnswers[0]).answer, /最新一条消息/);
+    assert.match((await correctionChainAnswers[1]).answer, /最新一条消息/);
+    assert.match((await correctionChainAnswers[2]).answer, /最新一条消息/);
+    await waitUntil(() => correctionChainClient.startTurnCalls.length === 1, "连续范围更正后最新消息应启动唯一 Turn");
+    assert.equal(correctionChainOldSignal.aborted, true);
+    assert.equal(correctionChainCalls.length, 1, "实体更正链不得重新执行宽范围自动预取");
+    assert.deepEqual(correctionChainAgent.sessions.get(correctionChainPrincipal).active.queryPlan, {
+      months: ["2026-08"],
+      domains: ["opportunities"]
+    });
+    const correctionChainPrompt = correctionChainClient.startTurnCalls[0].params.input[0].text;
+    assert.equal(correctionChainClient.startTurnCalls[0].params.clientUserMessageId, "prefetch-chain-month");
+    assert.match(correctionChainPrompt, /改成只看华南公司/);
+    assert.match(correctionChainPrompt, /改成商机分析/);
+    assert.match(correctionChainPrompt, /【用户问题】\n再只看8月/);
+    assert.match(correctionChainPrompt, /最新实体范围必须动态查询/);
+    assert.doesNotMatch(correctionChainPrompt, /"total":404/);
+    correctionChainClient.emit("serverRequest", {
+      id: 907,
+      method: "item/tool/call",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        tool: "query_xbb",
+        arguments: { months: ["2026-08"], domains: ["opportunities"], company: "华南公司" }
+      }
+    });
+    await waitUntil(() => correctionChainClient.responses.some((response) => response.id === 907), "连续更正后的动态查询应使用最终合并范围");
+    assert.deepEqual(correctionChainCalls[1], { months: ["2026-08"], domains: ["opportunities"], company: "华南公司" });
+    correctionChainClient.complete("thread-1", "turn-1", JSON.stringify({ answer: "华南公司8月商机已完成。", chart: null }));
+    assert.match((await correctionChainAnswers[3]).answer, /华南公司8月商机/);
+    releaseCorrectionChainOldQuery();
+    await nextImmediate();
+    assert.deepEqual(correctionChainSettlements, [1, 1, 1, 1], "连续 replacement 与迟到旧结果不得造成 waiter 双结算");
+    assert.equal(correctionChainClient.startTurnCalls.length, 1);
+    await correctionChainAgent.close();
+
+    const passiveFollowupClient = new FakeAppServerClient();
+    let passiveFollowupSignal;
+    let releasePassiveFollowupQuery;
+    let markPassiveFollowupQueryStarted;
+    const passiveFollowupQueryStarted = new Promise((resolve) => { markPassiveFollowupQueryStarted = resolve; });
+    const passiveFollowupAgent = isolatedAgent("prefetch-passive-followup", passiveFollowupClient, {
+      queryXbb: async (_args, _access, invocation = {}) => {
+        passiveFollowupSignal = invocation.signal;
+        markPassiveFollowupQueryStarted();
+        return new Promise((resolve) => { releasePassiveFollowupQuery = () => resolve(readyPerformancePack()); });
+      }
+    });
+    await passiveFollowupAgent.start();
+    const passiveFollowupPrincipal = principalKeyFromUserId("prefetch-passive-user", access);
+    const passiveFollowupAnswers = [passiveFollowupAgent.answer({
+      question: "集团2026年9月业绩排名",
+      access,
+      principalKey: passiveFollowupPrincipal,
+      messageId: "prefetch-passive-original"
+    })];
+    await passiveFollowupQueryStarted;
+    passiveFollowupAnswers.push(passiveFollowupAgent.answer({
+      question: "继续",
+      access,
+      principalKey: passiveFollowupPrincipal,
+      messageId: "prefetch-passive-continue"
+    }));
+    passiveFollowupAnswers.push(passiveFollowupAgent.answer({
+      question: "进度",
+      access,
+      principalKey: passiveFollowupPrincipal,
+      messageId: "prefetch-passive-progress"
+    }));
+    passiveFollowupAnswers.push(passiveFollowupAgent.answer({
+      question: "只看公司排名",
+      access,
+      principalKey: passiveFollowupPrincipal,
+      messageId: "prefetch-passive-company-dimension"
+    }));
+    await nextImmediate();
+    const passiveActive = passiveFollowupAgent.sessions.get(passiveFollowupPrincipal).active;
+    assert.equal(passiveFollowupSignal.aborted, false, "继续、进度或公司分组维度不得取消范围未变化的慢预取");
+    assert.equal(passiveActive.preStartReplacement, null, "继续、进度或公司分组维度不得冒充实体 replacement");
+    assert.equal(passiveFollowupAgent.sessions.get(passiveFollowupPrincipal).requestQueue.length, 3);
+    assert.equal(passiveFollowupClient.startTurnCalls.length, 0);
+    const passiveFollowupOutcomes = Promise.allSettled(passiveFollowupAnswers);
+    await passiveFollowupAgent.close();
+    releasePassiveFollowupQuery();
+    assert.equal((await passiveFollowupOutcomes).length, 4);
+    await nextImmediate();
+
+    const takeoverCloseClient = new FakeAppServerClient();
+    let releaseClosingPrefetch;
+    let markClosingPrefetchStarted;
+    const closingPrefetchStarted = new Promise((resolve) => { markClosingPrefetchStarted = resolve; });
+    const takeoverCloseAgent = isolatedAgent("prefetch-takeover-close", takeoverCloseClient, {
+      queryXbb: async (_args, _access, invocation = {}) => {
+        markClosingPrefetchStarted();
+        return new Promise((resolve) => { releaseClosingPrefetch = () => resolve(readyPerformancePack()); });
+      }
+    });
+    await takeoverCloseAgent.start();
+    const takeoverClosePrincipal = principalKeyFromUserId("prefetch-close-user", access);
+    const closingOld = takeoverCloseAgent.answer({ question: "集团2026年9月业绩排名", access, principalKey: takeoverClosePrincipal, messageId: "prefetch-close-old" });
+    await closingPrefetchStarted;
+    const closingLatest = takeoverCloseAgent.answer({ question: "集团2026年8月业绩排名", access, principalKey: takeoverClosePrincipal, messageId: "prefetch-close-new" });
+    const closingTakeoverOutcomes = Promise.allSettled([closingOld, closingLatest]);
+    await takeoverCloseAgent.close();
+    releaseClosingPrefetch();
+    const settledTakeoverClose = await closingTakeoverOutcomes;
+    assert.deepEqual(settledTakeoverClose.map((item) => item.status), ["fulfilled", "rejected"], "关闭时接管 waiter 必须全部结算");
+    assert.equal(takeoverCloseClient.startTurnCalls.length, 0);
+
+    const prefetchQueueClient = new FakeAppServerClient();
+    let releaseQueuedPrefetch;
+    let markQueuedPrefetchStarted;
+    const queuedPrefetchStarted = new Promise((resolve) => { markQueuedPrefetchStarted = resolve; });
+    const prefetchQueueAgent = isolatedAgent("prefetch-cross-route-bound", prefetchQueueClient, {
+      queryXbb: async () => {
+        markQueuedPrefetchStarted();
+        return new Promise((resolve) => { releaseQueuedPrefetch = () => resolve(readyPerformancePack()); });
+      }
+    });
+    await prefetchQueueAgent.start();
+    const prefetchQueuePrincipal = principalKeyFromUserId("prefetch-queue-user", access);
+    const prefetchQueuePromises = [prefetchQueueAgent.answer({
+      question: "集团2026年9月业绩排名",
+      access,
+      principalKey: prefetchQueuePrincipal,
+      messageId: "prefetch-queue-active"
+    })];
+    await queuedPrefetchStarted;
+    for (let index = 0; index < 100; index += 1) {
+      prefetchQueuePromises.push(prefetchQueueAgent.answer({
+        question: `帮我写会议通知${index}`,
+        access,
+        principalKey: prefetchQueuePrincipal,
+        messageId: `prefetch-cross-route-${index}`
+      }));
+    }
+    const prefetchQueueOutcomes = Promise.allSettled(prefetchQueuePromises);
+    await nextImmediate();
+    assert.ok(prefetchQueueAgent.sessions.get(prefetchQueuePrincipal).requestQueue.length <= 8, "预取阻塞期间跨路由队列必须保持硬上限");
+    assert.equal(prefetchQueueClient.startTurnCalls.length, 0);
+    await prefetchQueueAgent.close();
+    releaseQueuedPrefetch();
+    assert.equal((await prefetchQueueOutcomes).length, 101, "关闭时跨路由有界队列不得遗留 waiter");
+
+    const isolationCallbackClient = new FakeAppServerClient();
+    let isolationFailureCallback;
+    let isolationGatewayLeasePath;
+    const isolationCallbackAgent = new PersistentCodexAgent({
+      ...config,
+      agentStatePath: path.join(tempRoot, "gateway-isolation-callback-state.json")
+    }, {
+      hostFactory: { start: async () => ({ endpoint: "ws://127.0.0.1:43126", token: "j".repeat(48), process: Object.assign(new EventEmitter(), { exitCode: null }), close: async () => {} }) },
+      clientFactory: () => isolationCallbackClient,
+      verifyLogin: () => ({ mode: "chatgpt" }),
+      readVersion: () => "0.151.0",
+      toolGatewayFactory: (gatewayOptions) => {
+        isolationFailureCallback = gatewayOptions.onIsolationFailure;
+        isolationGatewayLeasePath = gatewayOptions.serviceLeasePath;
+        return async () => readyPerformancePack();
+      }
+    });
+    const isolationCallbackEvents = [];
+    isolationCallbackAgent.on("fatal", (event) => isolationCallbackEvents.push(event));
+    await isolationCallbackAgent.start();
+    assert.equal(typeof isolationFailureCallback, "function", "默认网关必须接入隔离失败回调");
+    assert.equal(isolationGatewayLeasePath, config.serviceLeasePath, "默认网关必须从租约同目录派生跨代 runner 隔离标记");
+    const isolationCallbackPrincipal = principalKeyFromUserId("gateway-isolation-callback-user", access);
+    let isolationCallbackSettlements = 0;
+    const isolationCallbackAnswer = isolationCallbackAgent.answer({
+      question: "帮我写会议通知",
+      access,
+      principalKey: isolationCallbackPrincipal,
+      messageId: "gateway-isolation-callback"
+    });
+    isolationCallbackAnswer.then(
+      () => { isolationCallbackSettlements += 1; },
+      () => { isolationCallbackSettlements += 1; }
+    );
+    await nextImmediate();
+    isolationFailureCallback(new Error("simulated gateway isolation failure"));
+    await assert.rejects(isolationCallbackAnswer, /隔离状态失效.*自动重启/);
+    await nextImmediate();
+    assert.equal(isolationCallbackSettlements, 1, "隔离失败回调不得双结算活动请求");
+    assert.equal(isolationCallbackEvents.length, 1);
+    assert.equal(isolationCallbackAgent.started, false);
+    await isolationCallbackAgent.close();
+
+    const fatalPrefetchClient = new FakeAppServerClient();
+    const fatalPrefetchAgent = isolatedAgent("runner-termination-prefetch", fatalPrefetchClient, {
+      queryXbb: async () => {
+        const error = new Error("simulated fail-closed query gateway");
+        error.code = "XBB_QUERY_GATEWAY_FAIL_CLOSED";
+        throw error;
+      }
+    });
+    const fatalPrefetchEvents = [];
+    fatalPrefetchAgent.on("fatal", (event) => fatalPrefetchEvents.push(event));
+    await fatalPrefetchAgent.start();
+    const fatalPrefetchPrincipal = principalKeyFromUserId("runner-fatal-prefetch-user", access);
+    let fatalPrefetchSettlements = 0;
+    const fatalPrefetchAnswer = fatalPrefetchAgent.answer({
+      question: "集团2026年9月业绩排名",
+      access,
+      principalKey: fatalPrefetchPrincipal,
+      messageId: "runner-fatal-prefetch"
+    });
+    fatalPrefetchAnswer.then(
+      () => { fatalPrefetchSettlements += 1; },
+      () => { fatalPrefetchSettlements += 1; }
+    );
+    await assert.rejects(fatalPrefetchAnswer, /服务将自动重启/);
+    await nextImmediate();
+    assert.equal(fatalPrefetchSettlements, 1, "预取 fatal 不得双结算原请求");
+    assert.equal(fatalPrefetchEvents.length, 1);
+    assert.equal(fatalPrefetchAgent.started, false);
+    assert.equal(fatalPrefetchClient.startTurnCalls.length, 0);
+    await fatalPrefetchAgent.close();
+
+    const fatalDynamicClient = new FakeAppServerClient();
+    const fatalDynamicAgent = isolatedAgent("runner-termination-dynamic", fatalDynamicClient, {
+      queryXbb: async () => {
+        const error = new Error("simulated unconfirmed process-tree termination");
+        error.code = "XBB_RUNNER_TERMINATION_UNCONFIRMED";
+        throw error;
+      }
+    });
+    const fatalDynamicEvents = [];
+    fatalDynamicAgent.on("fatal", (event) => fatalDynamicEvents.push(event));
+    await fatalDynamicAgent.start();
+    const fatalDynamicPrincipal = principalKeyFromUserId("runner-fatal-dynamic-user", access);
+    let fatalDynamicSettlements = 0;
+    const fatalDynamicAnswer = fatalDynamicAgent.answer({
+      question: "请做集团经营分析",
+      access,
+      principalKey: fatalDynamicPrincipal,
+      messageId: "runner-fatal-dynamic"
+    });
+    fatalDynamicAnswer.then(
+      () => { fatalDynamicSettlements += 1; },
+      () => { fatalDynamicSettlements += 1; }
+    );
+    await nextImmediate();
+    assert.equal(fatalDynamicClient.startTurnCalls.length, 1);
+    fatalDynamicClient.emit("serverRequest", {
+      id: 904,
+      method: "item/tool/call",
+      params: { threadId: "thread-1", turnId: "turn-1", tool: "query_xbb", arguments: { months: ["2026-09"], domains: ["performance"] } }
+    });
+    await assert.rejects(fatalDynamicAnswer, /服务将自动重启/);
+    await nextImmediate();
+    assert.equal(fatalDynamicSettlements, 1, "动态工具 fatal 不得双结算原请求");
+    assert.equal(fatalDynamicEvents.length, 1);
+    assert.equal(fatalDynamicAgent.started, false);
+    assert.equal(fatalDynamicClient.responses.some((response) => response.id === 904), false, "fatal 后不得向失效 Turn 回写工具结果");
+    await fatalDynamicAgent.close();
 
     const timeoutClient = new FakeAppServerClient();
     let releaseInterrupt;
@@ -793,7 +1617,7 @@ class FakeAppServerClient extends EventEmitter {
     assert.match((await overSteerBudget).answer, /新 Turn/);
     await boundsAgent.close();
 
-    process.stdout.write(`${JSON.stringify({ success: true, checks: 128, runtime: "persistent-steerable-general-codex-with-xbb-skill" })}\n`);
+    process.stdout.write(`${JSON.stringify({ success: true, checks: 221, runtime: "persistent-steerable-general-codex-with-xbb-skill" })}\n`);
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }

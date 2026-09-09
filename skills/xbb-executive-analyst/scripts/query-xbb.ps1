@@ -13,6 +13,17 @@ param(
 
     [string]$ProgressPath,
 
+    [ValidatePattern('^[a-f0-9]{64}$')]
+    [string]$IsolationToken,
+
+    [string]$IsolationMarkerPath,
+
+    # The service gateway supplies business scope over the already-created
+    # process stdin so month/company/person values never appear in a process
+    # command line. Direct/manual callers may continue using the legacy
+    # parameters above.
+    [switch]$RequestFromStdin,
+
     [switch]$ForceRefresh
 )
 
@@ -50,6 +61,133 @@ function Write-AtomicText([string]$Path, [string]$Text) {
     Write-AtomicBytes -Path $Path -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($Text))
 }
 
+function Test-CanonicalWindowsPath([string]$Value, [switch]$Directory) {
+    if ([string]::IsNullOrWhiteSpace($Value) -or
+        -not [regex]::IsMatch($Value, '^(?:[A-Za-z]:\\|\\\\[^\\/]+\\[^\\/]+(?:\\|$))')) { return $false }
+    try {
+        $full = [IO.Path]::GetFullPath($Value)
+        $input = $Value
+        if ($Directory) { $full = $full.TrimEnd('\'); $input = $input.TrimEnd('\') }
+        return $full.Equals($input, [StringComparison]::OrdinalIgnoreCase)
+    } catch {
+        return $false
+    }
+}
+
+function ConvertTo-ProcessCreationIdentity($Value) {
+    try {
+        $date = if ($Value -is [DateTime]) {
+            [DateTime]$Value
+        } elseif ([string]$Value -match '^\d{14}\.\d{6}[+-]\d{3}$') {
+            [Management.ManagementDateTimeConverter]::ToDateTime([string]$Value)
+        } else {
+            [DateTime]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
+        }
+        $utc = $date.ToUniversalTime()
+        return [pscustomobject]@{
+            CreatedAtMs = [DateTimeOffset]::new($utc).ToUnixTimeMilliseconds()
+            CreationToken = $utc.Ticks.ToString([Globalization.CultureInfo]::InvariantCulture)
+        }
+    } catch {
+        return $null
+    }
+}
+
+function Bind-RunnerIsolationRoot(
+    [string]$MarkerPath,
+    [string]$Token,
+    [string]$ExpectedProjectRoot,
+    [string]$ExpectedQueryScript,
+    [string[]]$ExpectedChildScripts,
+    [string]$ExpectedOutputPath
+) {
+    $resolvedMarker = [IO.Path]::GetFullPath($MarkerPath)
+    if ([IO.Path]::GetFileName($resolvedMarker) -cne "$Token.json" -or -not [IO.File]::Exists($resolvedMarker)) {
+        throw 'Runner isolation marker path is invalid.'
+    }
+    $marker = Get-Content -LiteralPath $resolvedMarker -Raw -Encoding UTF8 | ConvertFrom-Json
+    $expectedProperties = @('childScriptPaths', 'createdAtMs', 'gatewayWorkDirectory', 'projectRoot', 'queryScriptPath', 'rootProcess', 'runRoot', 'schemaVersion', 'service', 'token')
+    $actualProperties = @($marker.PSObject.Properties.Name | Sort-Object)
+    $markerChildren = @($marker.childScriptPaths)
+    if (($actualProperties -join "`n") -cne ($expectedProperties -join "`n") -or
+        [string]$marker.schemaVersion -cne '2.0' -or
+        [string]$marker.service -cne 'xbb-executive-analyst-runner' -or
+        [string]$marker.token -cne $Token -or
+        -not (Test-CanonicalWindowsPath ([string]$marker.projectRoot) -Directory) -or
+        -not (Test-CanonicalWindowsPath ([string]$marker.queryScriptPath)) -or
+        -not (Test-CanonicalWindowsPath ([string]$marker.gatewayWorkDirectory) -Directory) -or
+        -not (Test-CanonicalWindowsPath ([string]$marker.runRoot) -Directory) -or
+        -not ([IO.Path]::GetFullPath([string]$marker.projectRoot).Equals([IO.Path]::GetFullPath($ExpectedProjectRoot), [StringComparison]::OrdinalIgnoreCase)) -or
+        -not ([IO.Path]::GetFullPath([string]$marker.queryScriptPath).Equals([IO.Path]::GetFullPath($ExpectedQueryScript), [StringComparison]::OrdinalIgnoreCase)) -or
+        $markerChildren.Count -ne $ExpectedChildScripts.Count) {
+        throw 'Runner isolation marker contract is invalid.'
+    }
+    for ($index = 0; $index -lt $ExpectedChildScripts.Count; $index += 1) {
+        if (-not (Test-CanonicalWindowsPath ([string]$markerChildren[$index])) -or
+            -not ([IO.Path]::GetFullPath([string]$markerChildren[$index]).Equals([IO.Path]::GetFullPath($ExpectedChildScripts[$index]), [StringComparison]::OrdinalIgnoreCase))) {
+            throw 'Runner isolation child-script layout is invalid.'
+        }
+    }
+    if ($null -ne $marker.rootProcess) { throw 'Runner isolation root was already bound.' }
+
+    $expectedRunRoot = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) 'Codex\xbb-executive-analyst\runs')).TrimEnd('\')
+    $gatewayWorkRoot = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) 'Codex\xbb-executive-analyst\bot-runs')).TrimEnd('\')
+    $gatewayWorkDirectory = [IO.Path]::GetFullPath([string]$marker.gatewayWorkDirectory).TrimEnd('\')
+    if (-not [IO.Path]::GetFullPath([string]$marker.runRoot).TrimEnd('\').Equals($expectedRunRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [IO.Path]::GetDirectoryName($gatewayWorkDirectory).Equals($gatewayWorkRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($gatewayWorkDirectory) -cnotmatch '^request-[A-Za-z0-9_-]{6,64}$' -or
+        -not [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($ExpectedOutputPath)).Equals($gatewayWorkDirectory, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [IO.Directory]::Exists($gatewayWorkDirectory)) {
+        throw 'Runner isolation temporary-directory layout is invalid.'
+    }
+
+    $selfRows = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $PID" -ErrorAction Stop)
+    if ($selfRows.Count -ne 1) { throw 'Runner root CIM identity is unavailable.' }
+    $self = $selfRows[0]
+    $name = [string]$self.Name
+    $executablePath = [string]$self.ExecutablePath
+    $commandLine = [string]$self.CommandLine
+    $creation = ConvertTo-ProcessCreationIdentity $self.CreationDate
+    $nowAtMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    try { $markerCreatedAtMs = [int64]$marker.createdAtMs } catch { throw 'Runner isolation marker timestamp is invalid.' }
+    if ($markerCreatedAtMs -le 0 -or $markerCreatedAtMs -gt ($nowAtMs + 5000)) { throw 'Runner isolation marker timestamp is invalid.' }
+    if ($name -inotmatch '^(?:powershell|pwsh)\.exe$' -or
+        [string]::IsNullOrWhiteSpace($executablePath) -or -not [IO.Path]::IsPathRooted($executablePath) -or
+        -not [IO.Path]::GetFileName($executablePath).Equals($name, [StringComparison]::OrdinalIgnoreCase) -or
+        [string]::IsNullOrWhiteSpace($commandLine) -or
+        $null -eq $creation -or $creation.CreatedAtMs -gt ($nowAtMs + 5000)) {
+        throw 'Runner root process identity cannot be safely bound.'
+    }
+    try {
+        $invocation = ConvertTo-XbbStrictPowerShellInvocation `
+            -CommandLine $commandLine `
+            -ExpectedExecutablePath $executablePath `
+            -ExpectedProcessName $name `
+            -ExpectedScriptPath $ExpectedQueryScript `
+            -AllowedValueParameters @('-OutputPath', '-ProgressPath', '-IsolationToken', '-IsolationMarkerPath') `
+            -RequiredValueParameters @('-OutputPath', '-IsolationToken', '-IsolationMarkerPath') `
+            -AllowedSwitchParameters @('-RequestFromStdin') `
+            -RequiredSwitchParameters @('-RequestFromStdin')
+    } catch { throw 'Runner root command line cannot be safely verified.' }
+    $progressArgument = [string]$invocation.Values['-ProgressPath']
+    if ([string]$invocation.Values['-IsolationToken'] -cne $Token -or
+        -not (Test-XbbCanonicalCommandPath ([string]$invocation.Values['-IsolationMarkerPath']) $resolvedMarker) -or
+        -not (Test-XbbCanonicalCommandPath ([string]$invocation.Values['-OutputPath']) $ExpectedOutputPath) -or
+        (-not [string]::IsNullOrWhiteSpace($progressArgument) -and
+            (-not (Test-CanonicalWindowsPath $progressArgument) -or
+             -not [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($progressArgument)).Equals($gatewayWorkDirectory, [StringComparison]::OrdinalIgnoreCase) -or
+             [IO.Path]::GetFileName($progressArgument) -cne 'progress.jsonl'))) {
+        throw 'Runner root command identity cannot be safely bound.'
+    }
+    $marker.rootProcess = [ordered]@{
+        pid = [int]$PID
+        creationToken = [string]$creation.CreationToken
+        createdAtMs = [int64]$creation.CreatedAtMs
+        executablePath = [IO.Path]::GetFullPath($executablePath)
+    }
+    Write-AtomicText -Path $resolvedMarker -Text (($marker | ConvertTo-Json -Depth 10 -Compress) + [Environment]::NewLine)
+}
+
 function Write-ProgressEvent(
     [string]$Stage,
     [string]$SelectedMonth,
@@ -75,6 +213,7 @@ $sharedXbbRoot = Join-Path $projectRoot 'shared\xbb'
 $exporter = Join-Path $sharedXbbRoot 'export-live-data.ps1'
 $builder = Join-Path $sharedXbbRoot 'build-fact-pack.js'
 $aggregator = Join-Path $sharedXbbRoot 'aggregate-multi-period.js'
+$processHandleHelper = Join-Path $projectRoot 'scripts\windows-process-handle.ps1'
 $nodePath = (Get-Command node -ErrorAction Stop).Source
 $resolvedOutput = [IO.Path]::GetFullPath($OutputPath)
 $script:resolvedProgress = if ([string]::IsNullOrWhiteSpace($ProgressPath)) { $null } else { [IO.Path]::GetFullPath($ProgressPath) }
@@ -83,10 +222,54 @@ if ($script:resolvedProgress -and $script:resolvedProgress.Equals($resolvedOutpu
 }
 if ($script:resolvedProgress) { Write-AtomicText -Path $script:resolvedProgress -Text '' }
 
-foreach ($requiredFile in @($exporter, $builder, $aggregator)) {
+foreach ($requiredFile in @($exporter, $builder, $aggregator, $processHandleHelper)) {
     if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
         throw "Required Skill file is missing: $requiredFile"
     }
+}
+. $processHandleHelper
+
+if ([string]::IsNullOrWhiteSpace($IsolationToken) -ne [string]::IsNullOrWhiteSpace($IsolationMarkerPath)) {
+    throw 'IsolationToken and IsolationMarkerPath must be supplied together.'
+}
+if (-not [string]::IsNullOrWhiteSpace($IsolationToken)) {
+    Bind-RunnerIsolationRoot -MarkerPath $IsolationMarkerPath -Token $IsolationToken -ExpectedProjectRoot $projectRoot `
+        -ExpectedQueryScript $MyInvocation.MyCommand.Path -ExpectedChildScripts @(
+            (Join-Path $sharedXbbRoot 'export-live-data.js'),
+            $builder,
+            $aggregator
+        ) -ExpectedOutputPath $resolvedOutput
+}
+
+if ($RequestFromStdin) {
+    foreach ($businessParameter in @('Month', 'Domains', 'Company', 'Person', 'ForceRefresh')) {
+        if ($PSBoundParameters.ContainsKey($businessParameter)) {
+            throw 'RequestFromStdin cannot be combined with business-scope command-line parameters.'
+        }
+    }
+    $requestText = [Console]::In.ReadToEnd()
+    if ([string]::IsNullOrWhiteSpace($requestText) -or
+        [Text.UTF8Encoding]::new($false).GetByteCount($requestText) -gt 8192) {
+        throw 'Runner stdin request is missing or exceeds the safe size limit.'
+    }
+    try { $request = $requestText | ConvertFrom-Json } catch { throw 'Runner stdin request is not valid JSON.' }
+    $expectedRequestProperties = @('company', 'domains', 'forceRefresh', 'months', 'person')
+    $actualRequestProperties = @($request.PSObject.Properties.Name | Sort-Object)
+    if (($actualRequestProperties -join "`n") -cne ($expectedRequestProperties -join "`n") -or
+        $request.months -is [string] -or $request.domains -is [string] -or
+        $null -eq $request.months -or $null -eq $request.domains -or
+        $request.forceRefresh -isnot [bool] -or
+        ($null -ne $request.company -and $request.company -isnot [string]) -or
+        ($null -ne $request.person -and $request.person -isnot [string])) {
+        throw 'Runner stdin request does not match the exact scope schema.'
+    }
+    $Month = @($request.months | ForEach-Object { [string]$_ })
+    $Domains = @($request.domains | ForEach-Object { [string]$_ })
+    $Company = if ($null -eq $request.company) { $null } else { [string]$request.company }
+    $Person = if ($null -eq $request.person) { $null } else { [string]$request.person }
+    $ForceRefresh = [bool]$request.forceRefresh
+    $request = $null
+    $requestText = $null
 }
 
 $months = @($Month | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
@@ -144,7 +327,8 @@ foreach ($file in Get-ChildItem -LiteralPath $cacheRootResolved -File -Filter '*
 
 [void][Reflection.Assembly]::LoadWithPartialName('System.Security')
 $entropy = [Text.UTF8Encoding]::new($false).GetBytes('xbb-executive-analyst-cache-v1')
-$runId = "run-$PID-$([DateTime]::UtcNow.ToString('yyyyMMddHHmmssfff'))-$([Guid]::NewGuid().ToString('N').Substring(0,8))"
+$isolationRunPrefix = if ([string]::IsNullOrWhiteSpace($IsolationToken)) { 'run' } else { "run-$IsolationToken" }
+$runId = "$isolationRunPrefix-$PID-$([DateTime]::UtcNow.ToString('yyyyMMddHHmmssfff'))-$([Guid]::NewGuid().ToString('N').Substring(0,8))"
 $runDir = Join-Path $runRoot $runId
 [IO.Directory]::CreateDirectory($runDir) | Out-Null
 $periods = @()
@@ -156,8 +340,11 @@ try {
     foreach ($selectedMonth in $months) {
         $monthIndex += 1
         Write-ProgressEvent -Stage 'month_started' -SelectedMonth $selectedMonth -Index $monthIndex -Completed ($monthIndex - 1) -Total $months.Count
-        $sourcePath = Join-Path $runDir "source-$selectedMonth.json"
-        $factPath = Join-Path $runDir "facts-$selectedMonth.json"
+        # Child-process argv may contain only opaque temporary paths. In
+        # particular, never encode the selected month in a source/output name.
+        $periodFileToken = [Guid]::NewGuid().ToString('N')
+        $sourcePath = Join-Path $runDir "source-$periodFileToken.json"
+        $factPath = Join-Path $runDir "facts-$periodFileToken.json"
         $cacheDomainKey = (($domainList | Sort-Object) -join '-') -replace '[^a-z-]', ''
         $cachePath = Join-Path $cacheRoot "source-v6-$tenantFingerprint-$cacheDomainKey-$selectedMonth.dpapi"
         $cacheHit = $false
@@ -186,7 +373,13 @@ try {
         }
 
         if (-not $cacheHit) {
-            $exportMessages = @(& $exporter -Month $selectedMonth -Domains $domainList -OutputPath $sourcePath)
+            $exportArguments = @{
+                Month = $selectedMonth
+                Domains = $domainList
+                OutputPath = $sourcePath
+            }
+            if (-not [string]::IsNullOrWhiteSpace($IsolationToken)) { $exportArguments['IsolationToken'] = $IsolationToken }
+            $exportMessages = @(& $exporter @exportArguments)
             if (-not [IO.File]::Exists($sourcePath)) {
                 throw "Live XBB export did not create the source bundle for $selectedMonth. $($exportMessages -join ' ')"
             }
@@ -207,10 +400,21 @@ try {
         $readSource = if ($cacheHit) { 'encrypted-cache' } else { 'live' }
         Write-ProgressEvent -Stage 'source_ready' -SelectedMonth $selectedMonth -Index $monthIndex -Completed ($monthIndex - 1) -Total $months.Count -Source $readSource
 
-        $arguments = @($builder, '--source', $sourcePath, '--output', $factPath, '--domains', $domainArgument)
-        if (-not [string]::IsNullOrWhiteSpace($Company)) { $arguments += @('--company', $Company) }
-        if (-not [string]::IsNullOrWhiteSpace($Person)) { $arguments += @('--person', $Person) }
-        $builderOutput = @(& $nodePath @arguments 2>&1)
+        $arguments = @($builder, '--source', $sourcePath, '--output', $factPath, '--request-stdin')
+        if (-not [string]::IsNullOrWhiteSpace($IsolationToken)) { $arguments += @('--isolation-token', $IsolationToken) }
+        $builderRequest = [ordered]@{
+            domains = @($domainList)
+            company = if ([string]::IsNullOrWhiteSpace($Company)) { $null } else { $Company }
+            person = if ([string]::IsNullOrWhiteSpace($Person)) { $null } else { $Person }
+        } | ConvertTo-Json -Depth 4 -Compress
+        $previousOutputEncoding = $OutputEncoding
+        try {
+            $OutputEncoding = [Text.UTF8Encoding]::new($false)
+            $builderOutput = @($builderRequest | & $nodePath @arguments 2>&1)
+        } finally {
+            $OutputEncoding = $previousOutputEncoding
+            $builderRequest = $null
+        }
         if ($LASTEXITCODE -ne 0 -or -not [IO.File]::Exists($factPath)) {
             throw "Fact-pack build failed for $selectedMonth. $($builderOutput -join ' ')"
         }
@@ -238,7 +442,9 @@ try {
             periods = @($periods)
         }
         Write-AtomicText -Path $aggregateInputPath -Text (($aggregateInput | ConvertTo-Json -Depth 100 -Compress) + [Environment]::NewLine)
-        $aggregateMessages = @(& $nodePath $aggregator '--input' $aggregateInputPath '--output' $aggregateOutputPath 2>&1)
+        $aggregateArguments = @($aggregator, '--input', $aggregateInputPath, '--output', $aggregateOutputPath)
+        if (-not [string]::IsNullOrWhiteSpace($IsolationToken)) { $aggregateArguments += @('--isolation-token', $IsolationToken) }
+        $aggregateMessages = @(& $nodePath @aggregateArguments 2>&1)
         if ($LASTEXITCODE -ne 0 -or -not [IO.File]::Exists($aggregateOutputPath)) {
             throw "Multi-period fact aggregation failed. $($aggregateMessages -join ' ')"
         }

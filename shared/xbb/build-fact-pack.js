@@ -1039,7 +1039,12 @@ function parseArguments(argv) {
   const parsed = {};
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index];
-    if (["--source", "--output", "--domains", "--company", "--person"].includes(key)) {
+    if (key === "--request-stdin") {
+      if (parsed["request-stdin"] === true) throw new Error("--request-stdin 不能重复提供");
+      parsed["request-stdin"] = true;
+    } else if (["--source", "--output", "--domains", "--company", "--person", "--isolation-token"].includes(key)) {
+      if (index + 1 >= argv.length || String(argv[index + 1]).startsWith("--")) throw new Error(`参数缺少值：${key}`);
+      if (Object.hasOwn(parsed, key.slice(2))) throw new Error(`参数不能重复：${key}`);
       parsed[key.slice(2)] = argv[index + 1];
       index += 1;
     } else {
@@ -1047,7 +1052,34 @@ function parseArguments(argv) {
     }
   }
   if (!parsed.source || !parsed.output) throw new Error("必须提供 --source 和 --output");
+  if (parsed["request-stdin"] && ["domains", "company", "person"].some((key) => parsed[key] !== undefined)) {
+    throw new Error("--request-stdin 不能与业务范围命令行参数同时使用");
+  }
+  if (parsed["isolation-token"] !== undefined && !/^[a-f0-9]{64}$/.test(parsed["isolation-token"])) {
+    throw new Error("runner isolation token 格式无效。");
+  }
   return parsed;
+}
+
+function readScopeRequestFromStdin() {
+  const raw = fs.readFileSync(0);
+  if (!raw.length || raw.length > 8192) throw new Error("stdin 查询范围缺失或超过安全大小");
+  let request;
+  try { request = JSON.parse(raw.toString("utf8")); } catch (_) { throw new Error("stdin 查询范围不是有效 JSON"); }
+  if (!request || typeof request !== "object" || Array.isArray(request)
+      || JSON.stringify(Object.keys(request).sort()) !== JSON.stringify(["company", "domains", "person"])) {
+    throw new Error("stdin 查询范围不符合精确 schema");
+  }
+  if (!Array.isArray(request.domains) || request.domains.some((value) => typeof value !== "string")
+      || (request.company !== null && typeof request.company !== "string")
+      || (request.person !== null && typeof request.person !== "string")) {
+    throw new Error("stdin 查询范围字段类型无效");
+  }
+  return {
+    domains: request.domains.join(","),
+    company: request.company || undefined,
+    person: request.person || undefined
+  };
 }
 
 function atomicWrite(outputPath, value) {
@@ -1066,6 +1098,7 @@ function atomicWrite(outputPath, value) {
 
 function main() {
   const args = parseArguments(process.argv.slice(2));
+  if (args["request-stdin"]) Object.assign(args, readScopeRequestFromStdin());
   const source = JSON.parse(fs.readFileSync(path.resolve(args.source), "utf8"));
   const pack = buildFactPack(source, args);
   const output = atomicWrite(args.output, pack);

@@ -7,13 +7,19 @@ const { AccessDeniedError } = require("../security/access-control.js");
 const { sanitizeAgentText } = require("../security/output-sanitizer.js");
 const { SOURCE_FILES, SkillKnowledgeBase } = require("../rag/skill-knowledge-base.js");
 const { routeSkill } = require("../rag/skill-router.js");
-const { createToolGateway } = require("../xbb/tool-gateway.js");
+const {
+  GATEWAY_FAIL_CLOSED_CODE,
+  PROCESS_TREE_UNCONFIRMED_CODE,
+  createToolGateway
+} = require("../xbb/tool-gateway.js");
+const { RUNNER_ISOLATION_ERROR_CODE } = require("../xbb/runner-isolation.js");
 const { MAX_MODEL_FACT_VIEW_BYTES, buildModelFactView } = require("../xbb/model-fact-view.js");
 const { QUERY_XBB_DYNAMIC_TOOL, queryToolContractHash } = require("../xbb/query-tool.js");
-const { chooseTurnEffort, planFastQuery } = require("../xbb/fast-query-plan.js");
+const { chooseTurnEffort, hasExplicitPeriod, planFastQuery, validateRequestedMonths } = require("../xbb/fast-query-plan.js");
 const { formatContextAnalysisProgress, formatGeneralAnalysisProgress, formatQueryProgress } = require("../xbb/query-progress.js");
 const { AppServerClient } = require("./app-server-client.js");
 const { LocalAppServerHost } = require("./app-server-host.js");
+const { classifyModelError, safeModelErrorCode } = require("./model-error.js");
 const { buildVerifiedFallbackAnswer, falseTechnicalRefusalReason, hasUsableFacts } = require("./recovery-answer.js");
 const { GENERAL_RESPONSE_SCHEMA, WECOM_RESPONSE_SCHEMA, parseAgentResponse, responseContractHash } = require("./response-contract.js");
 const { loadAgentState, saveAgentState } = require("./state-store.js");
@@ -33,8 +39,18 @@ const MAX_AGENT_MESSAGE_BYTES = 64 * 1024;
 const MAX_AGENT_STREAM_BYTES = 128 * 1024;
 const MAX_CONSECUTIVE_TURN_START_FAILURES = 2;
 const MAX_SESSION_QUEUED_REQUESTS = 8;
+const MAX_PRESTART_CONTEXT_BYTES = 2400;
 const DEFAULT_BUSINESS_TOTAL_TIMEOUT_MS = 20 * 60 * 1000;
 const DEFAULT_GENERAL_TOTAL_TIMEOUT_MS = 15 * 60 * 1000;
+const DOMAIN_QUERY_HINTS = Object.freeze({
+  performance: "业绩",
+  "product-sales": "产品成交",
+  courses: "开课参课",
+  delivery: "交付邀约",
+  opportunities: "商机"
+});
+const PREFETCH_SCOPE_CORRECTION_PATTERN = /^(?:(?:请|麻烦)(?:帮我)?)?(?:改(?:成|为|看)?|换(?:成|为|个|看)?|切换(?:到|为)?|只看|再(?:只)?看|按|重新(?:只)?看|现在(?:只)?看)/u;
+const ENTITY_SCOPE_PATTERN = /(?:分?公司|业务员|员工|人员|负责人|创建人|举办方|销售(?!机会|数量|金额|额|业绩|阶段|趋势|排名|排行|占比|质量|漏斗|预测|分析))/u;
 
 function sha256(value) {
   return crypto.createHash("sha256").update(String(value), "utf8").digest("hex");
@@ -148,6 +164,82 @@ function boundedIntentQuestion(question) {
   return sanitized || "";
 }
 
+function normalizedCorrectionText(question) {
+  return String(question || "").trim().replace(/\s+/g, "");
+}
+
+function isPrefetchScopeCorrection(question) {
+  const text = normalizedCorrectionText(question);
+  if (!text) return false;
+  return PREFETCH_SCOPE_CORRECTION_PATTERN.test(text)
+    || (ENTITY_SCOPE_PATTERN.test(text) && /(?:呢|怎么样|什么情况|情况)[？?!！。.]?$/u.test(text));
+}
+
+function isGenericEntityDimension(question) {
+  const text = normalizedCorrectionText(question).replace(PREFETCH_SCOPE_CORRECTION_PATTERN, "").replace(/^[：:,，]/u, "");
+  return /^(?:(?:集团)?(?:各(?:个)?|全部|所有))(?:分?公司|销售(?:员|人员)?|业务员|员工|人员)(?:排名|排行|占比|分布|情况|汇总|分析|怎么样|呢|看)?[？?!！。.]?$/u.test(text)
+    || /^(?:分?公司|销售(?:员|人员)?|业务员|员工|人员)(?:排名|排行|占比|分布|汇总|分析)[？?!！。.]?$/u.test(text);
+}
+
+function isEntityScopeCorrection(question) {
+  const text = normalizedCorrectionText(question);
+  return isPrefetchScopeCorrection(text) && ENTITY_SCOPE_PATTERN.test(text) && !isGenericEntityDimension(text);
+}
+
+function utf8Suffix(value, maxBytes) {
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  const characters = [...String(value || "")];
+  let result = "";
+  let bytes = 0;
+  for (let index = characters.length - 1; index >= 0; index -= 1) {
+    const character = characters[index];
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maxBytes) break;
+    result = `${character}${result}`;
+    bytes += characterBytes;
+  }
+  return result;
+}
+
+function initialPreStartContext(question) {
+  return `【初始问题】\n${boundedIntentQuestion(question)}`;
+}
+
+function appendPreStartContext(context, question) {
+  const latest = `\n【后续修正】\n${boundedIntentQuestion(question)}`;
+  const remainingBytes = Math.max(0, MAX_PRESTART_CONTEXT_BYTES - Buffer.byteLength(latest, "utf8"));
+  return `${utf8Suffix(context, remainingBytes)}${latest}`;
+}
+
+function inheritedCorrectionPlan(question, activePlan) {
+  if (!activePlan || !Array.isArray(activePlan.months) || !Array.isArray(activePlan.domains)) return planFastQuery(question);
+  const directPlan = planFastQuery(question);
+  const domains = directPlan?.domains?.length ? [...directPlan.domains] : [...activePlan.domains];
+  const text = String(question || "");
+  const standaloneMonth = !hasExplicitPeriod(text)
+    ? [...text.matchAll(/(?<!\d)(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月/g)].at(-1)
+    : null;
+  const hasPeriodCorrection = hasExplicitPeriod(text) || Boolean(standaloneMonth);
+  let months = [...activePlan.months];
+  if (hasPeriodCorrection) {
+    const hints = domains.map((domain) => DOMAIN_QUERY_HINTS[domain] || "").filter(Boolean).join(" ");
+    const inheritedPlan = planFastQuery(`${hints} ${text}`);
+    if (inheritedPlan?.months?.length) months = [...inheritedPlan.months];
+    if (standaloneMonth) {
+      const month = Number(standaloneMonth[2]);
+      if (month < 1 || month > 12) throw new Error("月份必须在 1 至 12 之间。");
+      const contextualYear = String(activePlan.months.at(-1) || "").slice(0, 4);
+      const year = standaloneMonth[1] || contextualYear;
+      months = validateRequestedMonths([`${year}-${String(month).padStart(2, "0")}`]);
+    }
+  }
+  return Object.freeze({
+    ...activePlan,
+    months: Object.freeze(months),
+    domains: Object.freeze(domains)
+  });
+}
+
 function createSession(principalKey, stored = {}) {
   return {
     principalKey,
@@ -173,6 +265,7 @@ class AgentTurnFailureError extends Error {
     super(message, options.cause ? { cause: options.cause } : undefined);
     this.name = "AgentTurnFailureError";
     this.routeMode = routeMode === "xbb" ? "xbb" : "general";
+    this.modelErrorCode = safeModelErrorCode(options.modelErrorCode);
   }
 }
 
@@ -209,7 +302,6 @@ class PersistentCodexAgent extends EventEmitter {
     this.projectRoot = config.projectRoot || path.resolve(__dirname, "..", "..");
     this.knowledgeBase = options.knowledgeBase || new SkillKnowledgeBase(this.projectRoot);
     this.instructions = options.instructions || buildThreadInstructions(this.projectRoot);
-    this.queryXbb = options.queryXbb || createToolGateway({ projectRoot: this.projectRoot });
     this.hostFactory = options.hostFactory || LocalAppServerHost;
     this.clientFactory = options.clientFactory || ((host) => new AppServerClient({ endpoint: host.endpoint, token: host.token }));
     this.verifyLogin = options.verifyLogin || verifyCodexChatGptLogin;
@@ -238,55 +330,111 @@ class PersistentCodexAgent extends EventEmitter {
     this.sessions = new Map();
     this.started = false;
     this.closing = false;
+    this.startPromise = null;
+    this.startupController = null;
+    this.closePromise = null;
     this.fatalError = null;
     this.consecutiveAppServerFailures = 0;
     this.warmedPrincipals = new Set();
+    const toolGatewayFactory = options.toolGatewayFactory || createToolGateway;
+    this.queryXbb = options.queryXbb || toolGatewayFactory({
+      projectRoot: this.projectRoot,
+      serviceLeasePath: this.config.serviceLeasePath,
+      onIsolationFailure: () => this._fatal("销帮帮查询进程隔离状态失效，服务将自动重启。")
+    });
   }
 
   _emit(event, payload) {
     try { return super.emit(event, payload); } catch { return false; }
   }
 
-  async start() {
+  _assertStartupActive(signal) {
+    if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : abortError("Codex Agent 启动已取消。");
+    if (this.fatalError) throw this.fatalError;
+    if (this.closing) throw new Error("Codex Agent 服务正在停止。");
+  }
+
+  async start(options = {}) {
     if (this.started) return;
+    if (this.startPromise) return this.startPromise;
+    const externalSignal = options.signal;
+    const startupController = new AbortController();
+    const relayAbort = () => startupController.abort(
+      externalSignal?.reason instanceof Error ? externalSignal.reason : abortError("Codex Agent 启动已取消。")
+    );
+    if (externalSignal?.aborted) relayAbort();
+    else externalSignal?.addEventListener("abort", relayAbort, { once: true });
+    this.startupController = startupController;
+    const operation = this._startWithSignal(startupController.signal);
+    this.startPromise = operation;
+    try {
+      return await operation;
+    } finally {
+      externalSignal?.removeEventListener("abort", relayAbort);
+      if (this.startupController === startupController) this.startupController = null;
+      if (this.startPromise === operation) this.startPromise = null;
+    }
+  }
+
+  async _startWithSignal(signal) {
+    this._assertStartupActive(signal);
     this.verifyLogin(this.config);
+    this._assertStartupActive(signal);
     const codexVersion = this.readVersion(this.config);
+    this._assertStartupActive(signal);
     this.state = this.loadState(this.statePath);
     this.state.codexVersion = codexVersion;
+    let startupHost = null;
+    let startupClient = null;
     try {
-      this.host = await this.hostFactory.start({ ...this.config, projectRoot: this.projectRoot });
-      this.client = this.clientFactory(this.host);
-      this.client.on("notification", (event) => { void this._handleNotification(event); });
-      this.client.on("serverRequest", (request) => {
+      startupHost = await this.hostFactory.start(
+        { ...this.config, projectRoot: this.projectRoot },
+        { signal }
+      );
+      this._assertStartupActive(signal);
+      this.host = startupHost;
+      startupClient = this.clientFactory(startupHost);
+      this._assertStartupActive(signal);
+      this.client = startupClient;
+      startupClient.on("notification", (event) => { void this._handleNotification(event); });
+      startupClient.on("serverRequest", (request) => {
         void this._handleServerRequest(request).catch(() => {
-          try { this.client.reject(request.id, "经营分析工具请求处理失败。"); } catch {}
+          try { startupClient.reject(request.id, "经营分析工具请求处理失败。"); } catch {}
         });
       });
-      this.client.on("transportError", () => this._fatal("Codex App Server 传输错误。"));
-      this.client.on("protocolError", () => this._fatal("Codex App Server 协议错误。"));
-      this.client.on("disconnected", () => { if (!this.closing) this._fatal("Codex App Server 连接已断开。"); });
-      this.host.process.once("exit", () => { if (!this.closing) this._fatal("Codex App Server 进程已退出。"); });
-      await this.client.connect();
+      startupClient.on("transportError", () => this._fatal("Codex App Server 传输错误。"));
+      startupClient.on("protocolError", () => this._fatal("Codex App Server 协议错误。"));
+      startupClient.on("disconnected", () => { if (!this.closing) this._fatal("Codex App Server 连接已断开。"); });
+      startupHost.process.once("exit", () => { if (!this.closing) this._fatal("Codex App Server 进程已退出。"); });
+      await startupClient.connect({ signal });
+      this._assertStartupActive(signal);
+      for (const [principalKey, stored] of Object.entries(this.state.threads)) {
+        if (stored.contractHash !== this.contractHash) {
+          delete this.state.threads[principalKey];
+          continue;
+        }
+        const session = createSession(principalKey, stored);
+        this.sessions.set(principalKey, session);
+        // 只登记，不在启动关键路径逐个恢复历史 Thread。对应主体第一次发消息时
+        // 再 excludeTurns 懒恢复，避免授权用户越多机器人上线越慢。
+        this.warmedPrincipals.add(principalKey);
+      }
+      this._assertStartupActive(signal);
+      this.saveState(this.statePath, this.state);
+      this._assertStartupActive(signal);
+      this.started = true;
+      this._emit("ready", { codexVersion, resumedThreads: this.sessions.size });
     } catch (error) {
-      if (this.client) await this.client.close().catch(() => {});
-      if (this.host) await this.host.close().catch(() => {});
+      this.started = false;
+      if (startupClient) await startupClient.close().catch(() => {});
+      if (startupHost) await startupHost.close().catch(() => {});
+      if (this.client === startupClient) this.client = null;
+      if (this.host === startupHost) this.host = null;
+      if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : abortError("Codex Agent 启动已取消。");
+      if (this.fatalError) throw this.fatalError;
+      if (this.closing) throw new Error("Codex Agent 服务正在停止。");
       throw error;
     }
-
-    for (const [principalKey, stored] of Object.entries(this.state.threads)) {
-      if (stored.contractHash !== this.contractHash) {
-        delete this.state.threads[principalKey];
-        continue;
-      }
-      const session = createSession(principalKey, stored);
-      this.sessions.set(principalKey, session);
-      // 只登记，不在启动关键路径逐个恢复历史 Thread。对应主体第一次发消息时
-      // 再 excludeTurns 懒恢复，避免授权用户越多机器人上线越慢。
-      this.warmedPrincipals.add(principalKey);
-    }
-    this.saveState(this.statePath, this.state);
-    this.started = true;
-    this._emit("ready", { codexVersion, resumedThreads: this.sessions.size });
   }
 
   async answer({ question, access, principalKey, messageId, onProgress }) {
@@ -339,18 +487,76 @@ class PersistentCodexAgent extends EventEmitter {
     }
     const waiter = { ...deferred(), onProgress };
     const request = { question: question.trim(), access, messageId, waiter, warmup };
-    if (session.requestQueue.length >= MAX_SESSION_QUEUED_REQUESTS) {
-      const displaced = session.requestQueue.splice(0);
-      for (const stale of displaced) {
-        const priorMode = session.active ? (session.active.businessMode ? "xbb" : "general") : session.lastMode;
-        const route = stale.warmup ? "xbb" : routeSkill(stale.question, priorMode).mode;
-        stale.waiter.resolve(withRouteMode(FOLLOW_UP_HANDOFF_RESULT, route === "xbb"));
-      }
-      this._emit("activity", { status: "turn_queued", reason: "latest_wins_bound" });
-    }
-    session.requestQueue.push(request);
+    if (this._takeOverChangedPrefetch(session, request)) return waiter.promise;
+    this._queueRequest(session, request);
     this._drainSessionQueue(session);
     return waiter.promise;
+  }
+
+  _resolveHandoff(session, request) {
+    const priorMode = session.active ? (session.active.businessMode ? "xbb" : "general") : session.lastMode;
+    const route = request.warmup ? "xbb" : routeSkill(request.question, priorMode).mode;
+    request.waiter.resolve(withRouteMode(FOLLOW_UP_HANDOFF_RESULT, route === "xbb"));
+  }
+
+  _queueRequest(session, request, options = {}) {
+    if (session.requestQueue.length >= MAX_SESSION_QUEUED_REQUESTS) {
+      const displaced = session.requestQueue.splice(0);
+      for (const stale of displaced) this._resolveHandoff(session, stale);
+      this._emit("activity", { status: "turn_queued", reason: "latest_wins_bound" });
+    }
+    if (options.front) session.requestQueue.unshift(request);
+    else session.requestQueue.push(request);
+  }
+
+  _takeOverChangedPrefetch(session, request) {
+    const active = session.active;
+    if (!active?.prefetchInFlight || active.warmup || request.warmup || active.turnId) return false;
+    const activeMode = active.businessMode ? "xbb" : "general";
+    const priorReplacement = active.preStartReplacement;
+    const basePlan = priorReplacement && Object.hasOwn(priorReplacement, "fastPlanOverride")
+      ? priorReplacement.fastPlanOverride
+      : active.queryPlan;
+    const incomingPlan = active.businessMode ? inheritedCorrectionPlan(request.question, basePlan) : null;
+    const scopeChanged = queryFingerprint(incomingPlan) !== queryFingerprint(basePlan);
+    const correctionIntent = active.businessMode && isPrefetchScopeCorrection(request.question);
+    const entityScopeCorrection = correctionIntent && isEntityScopeCorrection(request.question);
+    const incomingRoute = routeSkill(request.question, activeMode);
+    const correctionRouteOverride = active.businessMode && correctionIntent && (scopeChanged || entityScopeCorrection);
+    if (incomingRoute.mode !== activeMode && !correctionRouteOverride) return false;
+    if (!scopeChanged && !entityScopeCorrection) return false;
+
+    const priorContext = priorReplacement
+      ? appendPreStartContext(priorReplacement.preStartContext || initialPreStartContext(active.question), priorReplacement.question)
+      : initialPreStartContext(active.question);
+    if (priorReplacement) this._resolveHandoff(session, priorReplacement);
+    request.routeModeOverride = activeMode;
+    request.fastPlanOverride = incomingPlan;
+    request.preStartContext = priorContext;
+    request.requiresDynamicEntityQuery = entityScopeCorrection || priorReplacement?.requiresDynamicEntityQuery === true;
+    active.preStartReplacement = request;
+    active.prefetchSuperseded = true;
+    this._cancelActiveQuery(active, "用户已在 Turn 启动前更新销帮帮查询范围。");
+    active.prefetchWake?.resolve("superseded");
+    const previousWaiters = active.waiters.splice(0);
+    for (const previous of previousWaiters) {
+      previous.resolve(withRouteMode(FOLLOW_UP_HANDOFF_RESULT, active.businessMode));
+    }
+    this._emit("activity", { status: "turn_queued", reason: "prefetch_scope_replaced" });
+    return true;
+  }
+
+  _handoffSupersededPrefetch(session, active) {
+    if (!active.prefetchSuperseded) return false;
+    const replacement = active.preStartReplacement;
+    active.preStartReplacement = null;
+    if (session.active === active) {
+      this._finishActive(session, active);
+      if (replacement) this._queueRequest(session, replacement, { front: true });
+    } else if (replacement) {
+      replacement.waiter.reject(this.fatalError || new Error("Codex Agent 预取接管已终止。"));
+    }
+    return true;
   }
 
   _drainSessionQueue(session) {
@@ -370,9 +576,25 @@ class PersistentCodexAgent extends EventEmitter {
 
   _rejectQueuedRequests(session, error) {
     for (const request of session.requestQueue.splice(0)) request.waiter.reject(error);
+    if (session.active?.preStartReplacement) {
+      const replacement = session.active.preStartReplacement;
+      session.active.preStartReplacement = null;
+      replacement.waiter.reject(error);
+    }
   }
 
-  async _submit(session, { question, access, messageId, waiter, warmup }) {
+  async _submit(session, request) {
+    const {
+      question,
+      access,
+      messageId,
+      waiter,
+      warmup,
+      routeModeOverride,
+      fastPlanOverride,
+      preStartContext,
+      requiresDynamicEntityQuery = false
+    } = request;
     this._assertOperational();
     await this._ensureThread(session);
     this._assertOperational();
@@ -390,17 +612,21 @@ class PersistentCodexAgent extends EventEmitter {
         this._emit("activity", { status: "turn_queued", reason: "steer_budget" });
         await active.done.promise;
         this._assertOperational();
-        return this._submit(session, { question, access, messageId, waiter, warmup });
+        return this._submit(session, request);
       }
       await this._notifyWaiter(waiter, "已收到新问题。它与当前分析属于不同范围，将在上一条完成后自动继续处理。", false);
       this._emit("activity", { status: "turn_queued" });
       await active.done.promise;
       this._assertOperational();
-      return this._submit(session, { question, access, messageId, waiter, warmup });
+      return this._submit(session, request);
     }
 
     session.access = access;
-    const route = warmup ? Object.freeze({ mode: "xbb", reason: "skill-warmup" }) : routeSkill(question, session.lastMode);
+    const route = warmup
+      ? Object.freeze({ mode: "xbb", reason: "skill-warmup" })
+      : routeModeOverride === "xbb"
+        ? Object.freeze({ mode: "xbb", reason: "prestart-correction" })
+        : routeSkill(question, session.lastMode);
     const businessMode = route.mode === "xbb";
     const timeoutMs = businessMode ? this.businessTurnTimeoutMs : this.generalTurnTimeoutMs;
     const totalTimeoutMs = businessMode ? this.businessTotalTimeoutMs : this.generalTotalTimeoutMs;
@@ -409,37 +635,58 @@ class PersistentCodexAgent extends EventEmitter {
     this._armAbsoluteTimeout(session, active);
     let turnStartFailureCandidate = false;
     try {
-      const fastPlan = businessMode && !warmup ? planFastQuery(question) : null;
+      const hasFastPlanOverride = Object.hasOwn(request, "fastPlanOverride");
+      const semanticPlan = businessMode && !warmup
+        ? (hasFastPlanOverride ? fastPlanOverride : planFastQuery(question))
+        : null;
+      const fastPlan = requiresDynamicEntityQuery ? null : semanticPlan;
       const retrieved = businessMode ? this.knowledgeBase.retrieve(question, {
-        domains: fastPlan?.domains || [],
-        periodCount: fastPlan?.months?.length || 1
+        domains: semanticPlan?.domains || [],
+        periodCount: semanticPlan?.months?.length || 1
       }) : null;
-      active.queryPlan = fastPlan;
-      active.question = question;
+      active.queryPlan = semanticPlan;
+      active.question = preStartContext ? `${question}\n已继承的启动前意图：\n${preStartContext}` : question;
       const turnEffort = warmup ? "none" : businessMode ? chooseTurnEffort(question, this.config.codexReasoningEffort) : this.config.codexReasoningEffort;
       let prefetchedFactPack = null;
       let prefetchedFactView = null;
       if (fastPlan) {
+        const prefetchWake = deferred();
+        active.prefetchInFlight = true;
+        active.prefetchWake = prefetchWake;
+        const subscription = this._beginActiveQuery(active);
         active.toolCalls += 1;
         active.toolStartedAtMs = Date.now();
         this._emit("activity", { status: "tool_started" });
-        await this._notifyQueryProgress(session, fastPlan, access, {
-          stage: "run_started",
-          completed: 0,
-          total: fastPlan.months.length
-        });
         try {
-          const subscription = this._beginActiveQuery(active);
-          try {
-            prefetchedFactPack = await this.queryXbb(fastPlan, access, {
+          await this._notifyQueryProgress(session, fastPlan, access, {
+            stage: "run_started",
+            completed: 0,
+            total: fastPlan.months.length
+          });
+          if (this._handoffSupersededPrefetch(session, active)) return;
+          if (subscription.signal.aborted) throw subscription.signal.reason || active.abortController.signal.reason || abortError();
+          const queryOutcome = Promise.resolve()
+            .then(() => this.queryXbb(fastPlan, access, {
               signal: subscription.signal,
               onProgress: (event) => session.active === active && !active.abortController.signal.aborted
                 ? this._notifyQueryProgress(session, fastPlan, access, event)
                 : undefined
-            });
-          } finally {
-            subscription.cleanup();
-          }
+            }))
+            .then(
+              (value) => ({ kind: "result", value }),
+              (error) => {
+                this._fatalOnRunnerTermination(error);
+                return { kind: "error", error };
+              }
+            );
+          const outcome = await Promise.race([
+            queryOutcome,
+            prefetchWake.promise.then((kind) => ({ kind }))
+          ]);
+          if (this._handoffSupersededPrefetch(session, active)) return;
+          if (outcome.kind === "aborted") throw active.abortController.signal.reason || abortError();
+          if (outcome.kind === "error") throw outcome.error;
+          prefetchedFactPack = outcome.value;
           active.prefetchedQueryFingerprint = queryFingerprint(fastPlan);
           prefetchedFactView = buildModelFactView(prefetchedFactPack);
           prefetchedFactPack = null;
@@ -451,8 +698,13 @@ class PersistentCodexAgent extends EventEmitter {
           active.factBytesSent = Buffer.byteLength(JSON.stringify(prefetchedFactView), "utf8");
           this._emit("activity", { status: "tool_completed", elapsedMs: Date.now() - active.toolStartedAtMs });
         } catch (error) {
+          this._fatalOnRunnerTermination(error);
           this._emit("activity", { status: "tool_failed", elapsedMs: Date.now() - active.toolStartedAtMs });
           throw error;
+        } finally {
+          subscription.cleanup();
+          if (active.prefetchWake === prefetchWake) active.prefetchWake = null;
+          active.prefetchInFlight = false;
         }
         this._assertOperational();
         if (session.active !== active) return;
@@ -480,6 +732,17 @@ class PersistentCodexAgent extends EventEmitter {
               "【本轮 query_xbb 实时预取事实包】",
               JSON.stringify(prefetchedFactView),
               "这是完整事实包经过确定性预算投影后的模型视图，summary、月度趋势、核心排名及覆盖元数据已保留。它已按授权范围实时查询并通过完整性与隐私校验；不要重复查询相同范围。"
+            ] : []),
+            ...(preStartContext ? [
+              "【本轮启动前仍有效的意图链（按出现顺序应用，后续修正优先）】",
+              preStartContext,
+              prefetchedFactView
+                ? "以下最新问题优先；较早问题中已被覆盖的期间或范围仅是语义上下文，不得沿用。经营事实只能使用本轮最新范围的预取事实包。"
+                : "以下最新问题优先；较早问题中已被覆盖的期间、公司或人员范围不得沿用，也不得使用旧范围事实。"
+            ] : []),
+            ...(requiresDynamicEntityQuery ? [
+              "【最新实体范围必须动态查询】",
+              "本轮因公司或销售人员范围修正而未注入宽范围事实。必须合并上述意图链中的仍有效期间和业务域，并在给出经营数字或结论前调用 query_xbb：最新消息明确点名实体时才传入准确 company/person；若只是各公司或销售人员的分组维度，则按当前授权集团范围查询。只有用户明确要求单一实体但名称无法唯一识别时才做最小澄清，不得猜名或沿用旧事实。"
             ] : []),
             ...continuity,
             "【可信运行元数据】",
@@ -813,6 +1076,8 @@ class PersistentCodexAgent extends EventEmitter {
       steerInputBytes: 0,
       steerInFlight: false,
       pendingCompletion: null,
+      modelErrorCode: null,
+      modelRetrying: false,
       done,
       prefetchedQueryFingerprint: null,
       prefetchedFactAvailable: false,
@@ -841,6 +1106,10 @@ class PersistentCodexAgent extends EventEmitter {
       deadlineHandling: null,
       abortController: new AbortController(),
       queryAbortController: null,
+      prefetchInFlight: false,
+      prefetchWake: null,
+      prefetchSuperseded: false,
+      preStartReplacement: null,
       streamedMessageBytes: 0,
       inFlightToolCount: 0
     };
@@ -849,12 +1118,19 @@ class PersistentCodexAgent extends EventEmitter {
   _abortActive(active, message) {
     this._cancelActiveQuery(active, message);
     if (!active.abortController.signal.aborted) active.abortController.abort(abortError(message));
+    active.prefetchWake?.resolve("aborted");
   }
 
   _cancelActiveQuery(active, message = "销帮帮查询范围已更新。") {
     if (active.queryAbortController && !active.queryAbortController.signal.aborted) {
       active.queryAbortController.abort(abortError(message));
     }
+  }
+
+  _fatalOnRunnerTermination(error) {
+    if (![PROCESS_TREE_UNCONFIRMED_CODE, GATEWAY_FAIL_CLOSED_CODE, RUNNER_ISOLATION_ERROR_CODE].includes(error?.code)) return false;
+    this._fatal("销帮帮查询网关已进入隔离保护状态，服务将自动重启。");
+    return true;
   }
 
   _beginActiveQuery(active) {
@@ -1053,6 +1329,7 @@ class PersistentCodexAgent extends EventEmitter {
       this.client.respond(request.id, { success: true, contentItems: [{ type: "inputText", text: viewText }] });
       this._emit("activity", { status: "tool_completed", elapsedMs: Date.now() - active.toolStartedAtMs });
     } catch (error) {
+      if (this._fatalOnRunnerTermination(error)) return;
       if (session.active !== active || active.abortController.signal.aborted) return;
       if (active.factGeneration !== factGeneration) {
         this.client.respond(request.id, {
@@ -1091,6 +1368,24 @@ class PersistentCodexAgent extends EventEmitter {
         session.active.turnId = turnId;
       }
       return;
+    }
+    if (method === "error" && session.active && params.turnId === session.active.turnId) {
+      const active = session.active;
+      active.modelErrorCode = classifyModelError(params.error);
+      if (params.willRetry === true) {
+        active.modelRetrying = true;
+        this._emit("activity", { status: "model_retrying", modelErrorCode: active.modelErrorCode });
+        await this._notifyProgress(session, "模型服务连接暂时异常，正在自动重试……\n恢复后将继续处理当前问题。");
+      }
+      return;
+    }
+    if (session.active?.modelRetrying && params.turnId === session.active.turnId
+        && ((method === "item/started" && ["agentMessage", "reasoning"].includes(params.item?.type))
+          || method === "item/agentMessage/delta")) {
+      session.active.modelRetrying = false;
+      session.active.modelErrorCode = null;
+      this._emit("activity", { status: "model_responding" });
+      void this._notifyProgress(session, "模型连接已恢复，正在生成答复……");
     }
     if (method === "item/started" && params?.item?.type === "agentMessage" && session.active && params.turnId === session.active.turnId) {
       if (session.active.messages.has(params.item.id) || session.active.messages.size < MAX_AGENT_MESSAGE_ITEMS) {
@@ -1177,12 +1472,16 @@ class PersistentCodexAgent extends EventEmitter {
         return;
       }
       const waiters = active.waiters.slice();
-      this._recordTerminalTurn(session);
+      const modelErrorCode = classifyModelError(turn?.error) || active.modelErrorCode;
+      // 已失败的 Thread 不再伪装成可继续使用的上下文；重新登录或连接恢复后
+      // 下一条消息会新建 Thread，避免再次沿用失效状态。
+      this._invalidateThread(session, "model_turn_failed");
       this._finishActive(session, active);
-      this._emit("activity", { status: "turn_failed", elapsedMs: Date.now() - active.startedAtMs, reason: `turn_${turn?.status || "empty"}` });
+      this._emit("activity", { status: "turn_failed", elapsedMs: Date.now() - active.startedAtMs, reason: `turn_${turn?.status || "empty"}`, modelErrorCode });
       const error = new AgentTurnFailureError(
         turn?.status === "interrupted" ? "Codex 任务已中断。" : "Codex Agent 未生成可用最终答复。",
-        active.businessMode ? "xbb" : "general"
+        active.businessMode ? "xbb" : "general",
+        { modelErrorCode }
       );
       for (const waiter of waiters) waiter.reject(error);
     }
@@ -1230,6 +1529,9 @@ class PersistentCodexAgent extends EventEmitter {
     if (this.closing || this.fatalError) return;
     this.fatalError = new Error(message);
     this.started = false;
+    if (this.startupController && !this.startupController.signal.aborted) {
+      this.startupController.abort(this.fatalError);
+    }
     for (const session of this.sessions.values()) {
       this._rejectQueuedRequests(session, this.fatalError);
       if (!session.active) continue;
@@ -1243,20 +1545,26 @@ class PersistentCodexAgent extends EventEmitter {
   }
 
   async close() {
-    if (this.closing) return;
+    if (this.closePromise) return this.closePromise;
     this.closing = true;
     this.started = false;
     const closingError = new Error("Codex Agent 服务正在停止。");
-    for (const session of this.sessions.values()) {
-      this._rejectQueuedRequests(session, closingError);
-      if (!session.active) continue;
-      const active = session.active;
-      this._abortActive(active, closingError.message);
-      for (const waiter of active.waiters) waiter.reject(closingError);
-      this._invalidateThread(session, "agent_closing");
-      this._finishActive(session, active);
+    if (this.startupController && !this.startupController.signal.aborted) {
+      this.startupController.abort(closingError);
     }
-    try { if (this.client) await this.client.close(); } finally { if (this.host) await this.host.close(); }
+    this.closePromise = (async () => {
+      for (const session of this.sessions.values()) {
+        this._rejectQueuedRequests(session, closingError);
+        if (!session.active) continue;
+        const active = session.active;
+        this._abortActive(active, closingError.message);
+        for (const waiter of active.waiters) waiter.reject(closingError);
+        this._invalidateThread(session, "agent_closing");
+        this._finishActive(session, active);
+      }
+      try { if (this.client) await this.client.close(); } finally { if (this.host) await this.host.close(); }
+    })();
+    return this.closePromise;
   }
 }
 

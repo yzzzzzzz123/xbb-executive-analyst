@@ -1,7 +1,13 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const { createLongConnectionHandler, isTransientTransportError, retryTransient, validateFrame } = require("../shared/wecom/long-connection-handler.js");
+const {
+  XBB_FOLLOW_UP_HANDOFF_ANSWER,
+  createLongConnectionHandler,
+  isTransientTransportError,
+  retryTransient,
+  validateFrame
+} = require("../shared/wecom/long-connection-handler.js");
 const { MessageStore, MessageStoreCapacityError } = require("../shared/wecom/message-store.js");
 
 function frame(index, userId = "unknown") {
@@ -79,11 +85,86 @@ function frame(index, userId = "unknown") {
   assert.equal(replies.length, 500);
   assert.equal(replies.every((reply) => reply.finish === true && reply.items?.[0] === emergencyItem), true);
 
+  const handoffStore = new MessageStore({ maxEntries: 256, maxBytes: 2 * 1024 * 1024 });
+  let handoffEmergencyBuilds = 0;
+  let handoffAnswerRenders = 0;
+  let handoffChartRenders = 0;
+  const handoffHandler = createLongConnectionHandler({
+    policy: { schemaVersion: "1.0", users: { boss: { scope: "all" } } },
+    agent: {
+      answer: async () => ({
+        answer: XBB_FOLLOW_UP_HANDOFF_ANSWER,
+        chart: null,
+        routeMode: "xbb"
+      })
+    },
+    messageStore: handoffStore,
+    answerRenderer: async () => {
+      handoffAnswerRenders += 1;
+      throw new Error("handoff must reuse the prebuilt image");
+    },
+    chartRenderer: async () => {
+      handoffChartRenders += 1;
+      throw new Error("handoff must not render a chart");
+    },
+    emergencyImageFactory: () => {
+      handoffEmergencyBuilds += 1;
+      return { buffer: Buffer.from("safe"), item: emergencyItem };
+    }
+  });
+  const handoffReplies = [];
+  const handoffClient = {
+    replyStream: async (_frame, _stream, content, finish, items) => {
+      handoffReplies.push({ content, finish, items });
+    },
+    uploadMedia: async () => { throw new Error("handoff emergency image must be inline without repeated upload"); },
+    sendMediaMessage: async () => { throw new Error("handoff emergency image must be inline without repeated send"); }
+  };
+  const handoffCount = 200;
+  await Promise.all(Array.from({ length: handoffCount }, (_, index) => handoffHandler.handleMessage(frame(`handoff-${index}`, "boss"), handoffClient)));
+  const handoffFinals = handoffReplies.filter((reply) => reply.finish);
+  assert.equal(handoffEmergencyBuilds, 1);
+  assert.equal(handoffAnswerRenders, 0, "authorized handoff flood must not invoke Sharp summary rendering");
+  assert.equal(handoffChartRenders, 0);
+  assert.equal(handoffFinals.length, handoffCount);
+  assert.equal(handoffFinals.every((reply) => reply.items?.[0] === emergencyItem), true);
+
+  const routeReplies = [];
+  const routeMemoryHandler = createLongConnectionHandler({
+    policy: { schemaVersion: "1.0", users: {} },
+    agent: { answer: async () => { throw new Error("denied route memory must not call the agent"); } },
+    routeMemoryMaxEntries: 2,
+    emergencyImageFactory: () => ({ buffer: Buffer.from("safe"), item: emergencyItem })
+  });
+  const routeClient = {
+    replyStream: async (_frame, _stream, _content, finish, items) => { routeReplies.push({ finish, items }); }
+  };
+  await routeMemoryHandler.handleMessage(frame("route-a", "route-a"), routeClient);
+  await routeMemoryHandler.handleMessage(frame("route-b", "route-b"), routeClient);
+  const routeAContinue = frame("route-a-continue", "route-a");
+  routeAContinue.body.text.content = "继续";
+  await routeMemoryHandler.handleMessage(routeAContinue, routeClient);
+  await routeMemoryHandler.handleMessage(frame("route-c", "route-c"), routeClient);
+  const evictedBContinue = frame("route-b-continue", "route-b");
+  evictedBContinue.body.text.content = "继续";
+  await routeMemoryHandler.handleMessage(evictedBContinue, routeClient);
+  const retainedCContinue = frame("route-c-continue", "route-c");
+  retainedCContinue.body.text.content = "继续";
+  await routeMemoryHandler.handleMessage(retainedCContinue, routeClient);
+  assert.equal(routeReplies[2].items?.[0], emergencyItem, "拒绝后的追问应继承最近的 XBB 路由");
+  assert.deepEqual(routeReplies[4].items, [], "路由记忆达到上限后应按 LRU 淘汰");
+  assert.equal(routeReplies[5].items?.[0], emergencyItem, "未被淘汰的拒绝路由仍应附应急图");
+
   assert.throws(() => createLongConnectionHandler({
     policy: { schemaVersion: "1.0", users: {} },
     agent: { answer: async () => "unused" },
     emergencyImageFactory: () => ({ item: { msgtype: "image", image: {} } })
   }), /有效的企业微信图片项/);
+  assert.throws(() => createLongConnectionHandler({
+    policy: { schemaVersion: "1.0", users: {} },
+    agent: { answer: async () => "unused" },
+    routeMemoryMaxEntries: 0
+  }), /路由记忆上限无效/);
   assert.throws(() => validateFrame({ headers: { req_id: "x".repeat(513) }, body: {} }), /安全上限/);
   assert.equal(isTransientTransportError(new Error("HTTP 401 authentication failed")), false);
   let permanentAttempts = 0;
@@ -112,7 +193,7 @@ function frame(index, userId = "unknown") {
   await groupHandler.handleMessage(groupFrame, groupClient);
   assert.deepEqual(groupMedia, [{ target: "group-chat-42", type: "image", mediaId: "group-image" }], "群内@机器人应把经营图片发到群 chatid");
 
-  process.stdout.write(`${JSON.stringify({ success: true, checks: 31, deniedFlood: 500, groupMentionImage: true, maxEntries: deniedStore.maxEntries })}\n`);
+  process.stdout.write(`${JSON.stringify({ success: true, checks: 42, deniedFlood: 500, handoffFlood: handoffCount, groupMentionImage: true, maxEntries: deniedStore.maxEntries })}\n`);
 })().catch((error) => {
   process.stderr.write(`${error.stack}\n`);
   process.exitCode = 1;

@@ -6,8 +6,22 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { AgentTurnFailureError, AgentTurnTimeoutError } = require("../shared/codex/persistent-agent.js");
-const { createLongConnectionHandler, extractQuestion, operationalFailure } = require("../shared/wecom/long-connection-handler.js");
-const { DEFAULT_CONNECTION_STALL_TIMEOUT_MS, createBotService, managedConfigOptions } = require("../shared/wecom/server.js");
+const {
+  XBB_FOLLOW_UP_HANDOFF_ANSWER,
+  createLongConnectionHandler,
+  extractQuestion,
+  isXbbOperationalHandoff,
+  operationalFailure
+} = require("../shared/wecom/long-connection-handler.js");
+const {
+  DEFAULT_CONNECTION_STALL_TIMEOUT_MS,
+  buildRuntime,
+  createBotService,
+  managedConfigOptions,
+  runEntrypoint,
+  runMain,
+  startBotLifecycle
+} = require("../shared/wecom/server.js");
 const { checkAuthentication } = require("../shared/wecom/check-auth.js");
 const { loadConfig, loadWecomConfig, validateWebSocketEndpoint } = require("../shared/config.js");
 const { createPairingCode, discoverUser } = require("../shared/wecom/discover-user.js");
@@ -179,6 +193,27 @@ function frame(messageId, userId, msgtype, body) {
   assert.equal(summaryClient.mediaMessages.length, 1);
   assert.equal(summaryClient.replies.at(-1).content, "事实不足以形成比较，已保留范围说明。");
 
+  const schemaClient = new FakeClient();
+  let schemaSummaryRenders = 0;
+  const schemaHandler = createLongConnectionHandler({
+    policy,
+    agent: {
+      answer: async ({ question }) => {
+        assert.equal(question, "text_63 是什么字段？");
+        return { answer: "字段说明已生成。", chart: null };
+      }
+    },
+    streamIdFactory: () => "stream-schema",
+    answerRenderer: async () => {
+      schemaSummaryRenders += 1;
+      return { buffer: Buffer.from("schema-summary"), item: fakeChartItem };
+    }
+  });
+  await schemaHandler.handleMessage(frame("msg-schema", "boss", "text", { text: { content: "text_63 是什么字段？" } }), schemaClient);
+  assert.equal(schemaSummaryRenders, 1, "纯字段说明也应沿 XBB 路由生成结论图");
+  assert.equal(schemaClient.mediaMessages.length, 1);
+  assert.equal(schemaClient.replies.at(-1).content, "字段说明已生成。");
+
   const generalClient = new FakeClient();
   const generalHandler = createLongConnectionHandler({
     policy,
@@ -232,14 +267,39 @@ function frame(messageId, userId, msgtype, body) {
 
   const denied = frame("msg-2", "unknown", "text", { text: { content: "集团业绩" } });
   await handler.handleMessage(denied, client);
-  assert.equal(client.replies[firstReplyCount + 1].finish, true);
-  assert.match(client.replies[firstReplyCount + 1].content, /尚未获准/);
+  assert.equal(client.replies.at(-1).finish, true);
+  assert.match(client.replies.at(-1).content, /尚未获准/);
+  assert.equal(client.replies.at(-1).msgItem?.[0]?.msgtype, "image", "未授权 XBB 拒绝也必须带应急图");
+  const deniedContinue = frame("msg-2-continue", "unknown", "text", { text: { content: "继续" } });
+  await handler.handleMessage(deniedContinue, client);
+  assert.equal(client.replies.at(-1).finish, true);
+  assert.match(client.replies.at(-1).content, /尚未获准/);
+  assert.equal(client.replies.at(-1).msgItem?.[0]?.msgtype, "image", "拒绝后的省略追问必须继承 XBB 路由并带图");
   assert.equal(agentCalls, 1);
+
+  const openClient = new FakeClient();
+  const openPrincipals = new Map();
+  const openHandler = createLongConnectionHandler({
+    policy: { schemaVersion: "1.0", users: { "*": { scope: "all" } } },
+    agent: {
+      answer: async ({ access, principalKey }) => {
+        openPrincipals.set(access.userId, principalKey);
+        return { answer: "可以使用。", chart: null, routeMode: "general" };
+      }
+    },
+    streamIdFactory: () => `stream-open-${openPrincipals.size + 1}`,
+    emergencyImageFactory: () => ({ buffer: Buffer.from("emergency-png"), item: emergencyItem })
+  });
+  await openHandler.handleMessage(frame("msg-open-a", "employee-a", "text", { text: { content: "你好" } }), openClient);
+  await openHandler.handleMessage(frame("msg-open-b", "employee-b", "text", { text: { content: "你好" } }), openClient);
+  assert.equal(openClient.replies.at(-1).content, "可以使用。");
+  assert.equal(openPrincipals.size, 2, "显式通配策略应允许机器人可触达范围内的其他用户");
+  assert.notEqual(openPrincipals.get("employee-a"), openPrincipals.get("employee-b"), "通配授权用户仍须使用隔离主体");
 
   const image = frame("msg-3", "boss", "image", { image: { url: "https://invalid.example/image" } });
   await handler.handleMessage(image, client);
-  assert.equal(client.replies[firstReplyCount + 2].finish, true);
-  assert.match(client.replies[firstReplyCount + 2].content, /仅支持文字/);
+  assert.equal(client.replies.at(-1).finish, true);
+  assert.match(client.replies.at(-1).content, /仅支持文字/);
 
   assert.equal(extractQuestion({ msgtype: "voice", voice: { content: "语音问题" } }), "语音问题");
   assert.equal(extractQuestion({ msgtype: "mixed", mixed: { msg_item: [{ msgtype: "image" }, { msgtype: "text", text: { content: "图文问题" } }] } }), "图文问题");
@@ -249,6 +309,25 @@ function frame(messageId, userId, msgtype, body) {
   assert.match(operationalFailure(new AgentTurnFailureError("failed", "general")), /自动恢复/);
   assert.match(operationalFailure(new AgentTurnFailureError("failed", "xbb")), /看门狗恢复/);
   assert.doesNotMatch(operationalFailure(new AgentTurnFailureError("failed", "xbb")), /请稍后重试|重新发送|缩小.*主题/);
+  const loginError = new AgentTurnFailureError("private upstream token details", "general", { modelErrorCode: "unauthorized" });
+  assert.match(operationalFailure(loginError), /登录已失效/);
+  assert.doesNotMatch(operationalFailure(loginError), /private|自动恢复|较长推理/);
+  assert.match(operationalFailure(new AgentTurnFailureError("private", "general", { modelErrorCode: "connection_failed" })), /网络和代理/);
+  const loginClient = new FakeClient();
+  const loginHandler = createLongConnectionHandler({ policy, agent: {
+    answer: async ({ onProgress }) => {
+      onProgress("模型服务连接暂时异常，正在自动重试……");
+      throw loginError;
+    }
+  } });
+  await loginHandler.handleMessage(frame("login-error", "boss", "text", { text: { content: "你好" } }), loginClient);
+  assert.equal(loginClient.replies.at(-1).finish, true, "登录失效必须结束流式等待");
+  assert.match(loginClient.replies.at(-1).content, /登录已失效/);
+  assert.doesNotMatch(loginClient.replies.at(-1).content, /private|正在组织|当前阶段仍在继续/);
+  assert.equal(loginClient.uploads.length, 0, "通用问题失败不得查询经营或制作经营图");
+  assert.equal(isXbbOperationalHandoff({ answer: XBB_FOLLOW_UP_HANDOFF_ANSWER, chart: null, routeMode: "xbb" }), true);
+  assert.equal(isXbbOperationalHandoff({ answer: XBB_FOLLOW_UP_HANDOFF_ANSWER, chart: null, routeMode: "general" }), false);
+  assert.equal(isXbbOperationalHandoff({ answer: "正常最终经营答复", chart: null, routeMode: "xbb" }), false);
   await assert.rejects(() => handler.handleMessage({ headers: {}, body: {} }, client), /req_id/);
 
   const config = loadConfig({ env: {
@@ -282,6 +361,7 @@ function frame(messageId, userId, msgtype, body) {
   const transportOnly = loadWecomConfig({ env: { XBB_WECOM_BOT_ID: "aibot_transport", XBB_WECOM_BOT_SECRET: "transport-secret" } });
   assert.equal(transportOnly.wecomBotId, "aibot_transport");
   assert.equal(Object.hasOwn(transportOnly, "modelEndpoint"), false);
+  const noRunnerIsolationRecovery = async () => ({ status: "recovered", markersRecovered: 0, processesTerminated: 0 });
 
   assert.throws(() => loadConfig({ env: {
     XBB_WECOM_BOT_ID: "aibot_external",
@@ -289,6 +369,273 @@ function frame(messageId, userId, msgtype, body) {
     XBB_MODEL_PROVIDER: "chat-completions",
     XBB_ACCESS_POLICY_PATH: "D:\\policy.json"
   } }), /只支持 codex-app-server/);
+
+  const earlyFatalAgent = new EventEmitter();
+  let earlyFatalClosed = 0;
+  earlyFatalAgent.start = async () => {};
+  earlyFatalAgent.warm = async () => {};
+  earlyFatalAgent.close = async () => { earlyFatalClosed += 1; };
+  const earlyFatalRuntime = await buildRuntime(config, {
+    agent: earlyFatalAgent,
+    policy,
+    handlerFactory: () => ({ handleMessage: async () => {} })
+  });
+  earlyFatalAgent.emit("fatal", { message: "runtime 返回后、Bot Service 订阅前 App Server 已退出" });
+  let replayedFatal = null;
+  earlyFatalRuntime.onFatal((event) => { replayedFatal = event; });
+  assert.equal(replayedFatal?.message, "runtime 返回后、Bot Service 订阅前 App Server 已退出", "fatal 早于 Bot Service 订阅时必须立即回放");
+  const earlyFatalClient = new FakeClient();
+  const earlyFatalExitCodes = [];
+  let earlyFatalStopped;
+  const earlyFatalDone = new Promise((resolve) => { earlyFatalStopped = resolve; });
+  createBotService(config, earlyFatalRuntime, {
+    clientFactory: () => earlyFatalClient,
+    statusWriter: () => {},
+    exitOnFatal: true,
+    exitProcess: (code) => earlyFatalExitCodes.push(code),
+    onStopped: earlyFatalStopped
+  });
+  await earlyFatalDone;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(earlyFatalClient.disconnected, true);
+  assert.deepEqual(earlyFatalExitCodes, [1], "晚订阅的 Bot Service 必须在清理后触发重启退出");
+  await earlyFatalRuntime.close();
+  await earlyFatalRuntime.close();
+  assert.equal(earlyFatalClosed, 1, "runtime.close 必须幂等");
+
+  const hangingStartClock = new FakeClock();
+  const hangingStartFatalAgent = new EventEmitter();
+  let hangingStartCloseCalls = 0;
+  hangingStartFatalAgent.start = () => {
+    hangingStartFatalAgent.emit("fatal", { message: "start 挂起期间发生致命故障" });
+    return new Promise(() => {});
+  };
+  hangingStartFatalAgent.close = () => {
+    hangingStartCloseCalls += 1;
+    return new Promise(() => {});
+  };
+  const hangingStartRuntime = buildRuntime(config, {
+    agent: hangingStartFatalAgent,
+    policy,
+    clock: hangingStartClock,
+    cleanupTimeoutMs: 10,
+    handlerFactory: () => ({ handleMessage: async () => {} })
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(hangingStartCloseCalls, 1, "start 未 settle 时 fatal 也必须立刻进入清理");
+  assert.equal([...hangingStartClock.timers.values()].some((timer) => timer.delay === 10), true);
+  hangingStartClock.fireAll();
+  await assert.rejects(hangingStartRuntime, /start 挂起期间发生致命故障/);
+
+  const startFailureAgent = new EventEmitter();
+  let startFailureClosed = 0;
+  startFailureAgent.start = async () => { throw new Error("agent start failed"); };
+  startFailureAgent.close = async () => { startFailureClosed += 1; };
+  await assert.rejects(buildRuntime(config, {
+    agent: startFailureAgent,
+    policy,
+    handlerFactory: () => ({ handleMessage: async () => {} })
+  }), /agent start failed/);
+  assert.equal(startFailureClosed, 1, "agent.start 失败也必须关闭 App Server 资源");
+
+  const warmFailureAgent = new EventEmitter();
+  const warmFailureEvents = [];
+  warmFailureAgent.start = async () => { warmFailureEvents.push("start"); };
+  warmFailureAgent.warm = async () => { warmFailureEvents.push("warm"); throw new Error("agent warm failed"); };
+  warmFailureAgent.close = async () => { warmFailureEvents.push("close"); };
+  await assert.rejects(buildRuntime(config, {
+    agent: warmFailureAgent,
+    policy,
+    statusWriter: (value) => warmFailureEvents.push(value.status),
+    handlerFactory: () => ({ handleMessage: async () => {} })
+  }), /agent warm failed/);
+  assert.deepEqual(warmFailureEvents, ["start", "warm", "agent_warm_failed", "close"]);
+
+  const handlerFailureAgent = new EventEmitter();
+  let handlerFailureClosed = 0;
+  handlerFailureAgent.start = async () => {};
+  handlerFailureAgent.warm = async () => {};
+  handlerFailureAgent.close = async () => { handlerFailureClosed += 1; };
+  await assert.rejects(buildRuntime(config, {
+    agent: handlerFailureAgent,
+    policy,
+    handlerFactory: () => { throw new Error("handler construction failed"); }
+  }), /handler construction failed/);
+  assert.equal(handlerFailureClosed, 1, "消息处理器构建失败必须关闭 Agent/App Server");
+
+  const constructionEvents = [];
+  const constructionLease = {
+    start: (state) => { constructionEvents.push(`lease:${state}`); return true; },
+    stop: () => { constructionEvents.push("lease:stop"); }
+  };
+  const constructionErrorOutput = [];
+  await runEntrypoint({
+    main: () => startBotLifecycle(config, {
+      statusWriter: () => {},
+      lease: constructionLease,
+      acquireLock: async () => { constructionEvents.push("lock:acquire"); return { id: "test-lock" }; },
+      releaseLock: async (lock) => { assert.equal(lock.id, "test-lock"); constructionEvents.push("lock:release"); },
+      runnerIsolationRecovery: async () => { constructionEvents.push("isolation:recover"); return noRunnerIsolationRecovery(); },
+      runtimeFactory: async () => {
+        constructionEvents.push("runtime:create");
+        return { handleMessage: async () => {}, close: async () => { constructionEvents.push("runtime:close"); } };
+      },
+      serviceFactory: () => {
+        constructionEvents.push("service:create");
+        throw new Error("service construction failed");
+      }
+    }),
+    output: { write: (text) => constructionErrorOutput.push(text) },
+    exitProcess: (code) => { constructionEvents.push(`exit:${code}`); }
+  });
+  assert.deepEqual(constructionEvents, [
+    "lock:acquire",
+    "lease:starting",
+    "isolation:recover",
+    "runtime:create",
+    "service:create",
+    "runtime:close",
+    "lease:stop",
+    "lock:release",
+    "exit:1"
+  ], "Service 构造失败时必须完成 runtime/lease/lock 清理后再硬退出");
+  assert.deepEqual(constructionErrorOutput, ["service construction failed\n"]);
+
+  const lateStartupClock = new FakeClock();
+  const lateStartupEvents = [];
+  let releaseLateRuntime;
+  const lateRuntime = {
+    handleMessage: async () => {},
+    close: async () => { lateStartupEvents.push("runtime:close"); }
+  };
+  const lateStartupRun = runEntrypoint({
+    startupTimeoutMs: 25,
+    clock: lateStartupClock,
+    main: ({ signal, clock }) => startBotLifecycle(config, {
+      signal,
+      clock,
+      cleanupTimeoutMs: 10,
+      statusWriter: () => {},
+      lease: {
+        start: (state) => { lateStartupEvents.push(`lease:${state}`); return true; },
+        stop: () => { lateStartupEvents.push("lease:stop"); }
+      },
+      acquireLock: async () => { lateStartupEvents.push("lock:acquire"); return { id: "late-lock" }; },
+      releaseLock: async () => { lateStartupEvents.push("lock:release"); },
+      runnerIsolationRecovery: async () => { lateStartupEvents.push("isolation:recover"); },
+      runtimeFactory: () => {
+        lateStartupEvents.push("runtime:create");
+        return new Promise((resolve) => { releaseLateRuntime = () => resolve(lateRuntime); });
+      },
+      serviceFactory: () => {
+        lateStartupEvents.push("service:create");
+        return { start: () => lateStartupEvents.push("service:start"), stop: async () => {} };
+      }
+    }),
+    output: { write: (text) => lateStartupEvents.push(`error:${text.trim()}`) },
+    exitProcess: (code) => lateStartupEvents.push(`exit:${code}`)
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(typeof releaseLateRuntime, "function");
+  assert.equal([...lateStartupClock.timers.values()].some((timer) => timer.delay === 25), true);
+  lateStartupClock.fireAll();
+  await lateStartupRun;
+  assert.equal(lateStartupEvents.includes("exit:1"), true);
+  releaseLateRuntime();
+  for (let index = 0; index < 5; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(lateStartupEvents.includes("runtime:close"), true, "启动超时后迟到 runtime 必须回收");
+  assert.equal(lateStartupEvents.includes("lease:stop"), true);
+  assert.equal(lateStartupEvents.includes("lock:release"), true);
+  assert.equal(lateStartupEvents.includes("service:create"), false, "启动超时后的迟到 runtime 不得创建 Bot Service");
+  assert.equal(lateStartupEvents.includes("service:start"), false, "启动超时后的迟到 runtime 不得复活 running/ready");
+
+  const entrypointExitCodes = [];
+  await runEntrypoint({
+    main: async ({ exitProcess }) => {
+      exitProcess(1);
+      exitProcess(0);
+      return { service: { stop: async () => {} } };
+    },
+    output: { write: () => {} },
+    exitProcess: (code) => entrypointExitCodes.push(code)
+  });
+  assert.deepEqual(entrypointExitCodes, [1], "runEntrypoint 注入的退出闩锁必须全程幂等");
+
+  const gracefulSignalProcess = new EventEmitter();
+  const gracefulSignalExitCodes = [];
+  let gracefulSignalStops = 0;
+  let gracefulLifecycleExit;
+  await runMain({
+    config,
+    processObject: gracefulSignalProcess,
+    statusWriter: () => {},
+    lease: {},
+    lifecycleFactory: async (_config, lifecycleOptions) => {
+      gracefulLifecycleExit = lifecycleOptions.exitProcess;
+      return { service: { stop: async () => { gracefulSignalStops += 1; } } };
+    },
+    exitProcess: (code) => gracefulSignalExitCodes.push(code)
+  });
+  gracefulSignalProcess.emit("SIGTERM");
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(typeof gracefulLifecycleExit, "function", "退出函数必须传入运行期 service 生命周期");
+  assert.equal(gracefulSignalStops, 1);
+  assert.deepEqual(gracefulSignalExitCodes, [0], "信号清理成功后必须确定性正常退出");
+
+  const failedSignalProcess = new EventEmitter();
+  const failedSignalExitCodes = [];
+  await runMain({
+    config,
+    processObject: failedSignalProcess,
+    statusWriter: () => {},
+    lease: {},
+    lifecycleFactory: async () => ({ service: { stop: async () => { throw new Error("signal cleanup failed"); } } }),
+    exitProcess: (code) => failedSignalExitCodes.push(code)
+  });
+  failedSignalProcess.emit("SIGINT");
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(failedSignalExitCodes, [1], "信号清理失败后必须确定性异常退出且不得产生未处理拒绝");
+
+  const racingSignalProcess = new EventEmitter();
+  const racingSignalExitCodes = [];
+  let runtimeExit;
+  let finishRacingStop;
+  await runMain({
+    config,
+    processObject: racingSignalProcess,
+    statusWriter: () => {},
+    lease: {},
+    lifecycleFactory: async (_config, lifecycleOptions) => {
+      runtimeExit = lifecycleOptions.exitProcess;
+      return { service: { stop: () => new Promise((resolve) => { finishRacingStop = resolve; }) } };
+    },
+    exitProcess: (code) => racingSignalExitCodes.push(code)
+  });
+  racingSignalProcess.emit("SIGTERM");
+  await new Promise((resolve) => setImmediate(resolve));
+  runtimeExit(1);
+  finishRacingStop();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(racingSignalExitCodes, [1], "运行期 fatal 与信号清理竞态只能请求一次退出");
+
+  const isolationStartupEvents = [];
+  await assert.rejects(startBotLifecycle(config, {
+    statusWriter: () => {},
+    lease: {
+      start: (state) => { isolationStartupEvents.push(`lease:${state}`); return true; },
+      stop: () => { isolationStartupEvents.push("lease:stop"); }
+    },
+    acquireLock: async () => { isolationStartupEvents.push("lock:acquire"); return { id: "isolation-lock" }; },
+    releaseLock: async () => { isolationStartupEvents.push("lock:release"); },
+    runnerIsolationRecovery: async () => { isolationStartupEvents.push("isolation:recover"); throw new Error("isolation uncertain"); },
+    runtimeFactory: async () => { isolationStartupEvents.push("runtime:create"); throw new Error("must not run"); }
+  }), /isolation uncertain/);
+  assert.deepEqual(isolationStartupEvents, [
+    "lock:acquire", "lease:starting", "isolation:recover", "lease:stop", "lock:release"
+  ], "跨代 runner 状态不确定时必须在 buildRuntime 前失败关闭并完整释放生命周期资源");
 
   let capturedOptions;
   const serviceClient = new FakeClient();
@@ -362,6 +709,90 @@ function frame(messageId, userId, msgtype, body) {
   assert.equal(connectFailureClient.disconnected, true);
   assert.equal(connectFailureClosed, 1);
   assert.deepEqual(connectFailureExitCodes, [1]);
+
+  const disconnectFailureClient = new FakeClient();
+  disconnectFailureClient.disconnect = () => { throw new Error("disconnect failed"); };
+  let disconnectFailureRuntimeClosed = 0;
+  const disconnectFailureService = createBotService(config, {
+    handleMessage: async () => {},
+    close: async () => { disconnectFailureRuntimeClosed += 1; }
+  }, {
+    clientFactory: () => disconnectFailureClient,
+    statusWriter: () => {}
+  });
+  await disconnectFailureService.stop();
+  assert.equal(disconnectFailureRuntimeClosed, 1, "SDK disconnect 失败不能跳过 Agent/App Server 关闭");
+
+  const stoppedEventClient = new FakeClient();
+  let rejectLateConnect;
+  stoppedEventClient.connect = () => new Promise((_, reject) => { rejectLateConnect = reject; });
+  let emitLateFatal;
+  let stoppedMessageCalls = 0;
+  const stoppedEventStatuses = [];
+  const stoppedEventExitCodes = [];
+  const stoppedEventService = createBotService(config, {
+    handleMessage: async () => { stoppedMessageCalls += 1; },
+    onFatal: (listener) => { emitLateFatal = listener; },
+    close: async () => {}
+  }, {
+    clientFactory: () => stoppedEventClient,
+    statusWriter: (status) => stoppedEventStatuses.push(status.status),
+    exitOnFatal: true,
+    exitProcess: (code) => stoppedEventExitCodes.push(code)
+  });
+  stoppedEventService.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  await stoppedEventService.stop();
+  rejectLateConnect(new Error("connect rejected after normal stop"));
+  emitLateFatal({ message: "fatal emitted after normal stop" });
+  stoppedEventClient.emit("message", frame("late-after-stop", "boss", "text", { text: { content: "集团业绩" } }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stoppedMessageCalls, 0, "stop 后迟到消息不得重新进入已关闭 runtime");
+  assert.deepEqual(stoppedEventExitCodes, [], "stop 后迟到 connect/fatal 不得把正常关闭升级为异常退出");
+  assert.equal(stoppedEventStatuses.includes("agent_failed"), false);
+  assert.equal(stoppedEventStatuses.includes("connection_error"), false);
+
+  const fatalCleanupClock = new FakeClock();
+  const fatalCleanupClient = new FakeClient();
+  const fatalCleanupExitCodes = [];
+  const fatalCleanupLeaseCalls = [];
+  let triggerFatalCleanup;
+  let fatalCleanupRuntimeCloseCalls = 0;
+  let fatalCleanupReleaseCalls = 0;
+  const fatalCleanupService = createBotService(config, {
+    handleMessage: async () => {},
+    onFatal: (listener) => { triggerFatalCleanup = listener; },
+    close: () => {
+      fatalCleanupRuntimeCloseCalls += 1;
+      return new Promise(() => {});
+    }
+  }, {
+    clientFactory: () => fatalCleanupClient,
+    clock: fatalCleanupClock,
+    cleanupTimeoutMs: 10,
+    fatalExitTimeoutMs: 10,
+    exitOnFatal: true,
+    exitProcess: (code) => fatalCleanupExitCodes.push(code),
+    lease: { stop: () => fatalCleanupLeaseCalls.push("stop") },
+    statusWriter: () => {},
+    onStopped: () => {
+      fatalCleanupReleaseCalls += 1;
+      return new Promise(() => {});
+    }
+  });
+  triggerFatalCleanup({ message: "fatal cleanup test" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fatalCleanupRuntimeCloseCalls, 1);
+  assert.equal([...fatalCleanupClock.timers.values()].filter((timer) => timer.delay === 10).length >= 2, true);
+  fatalCleanupClock.fireAll();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(fatalCleanupExitCodes, [1], "runtime 清理挂死仍须在 fatal 10 秒截止触发一次硬退出");
+  assert.deepEqual(fatalCleanupLeaseCalls, ["stop"]);
+  assert.equal(fatalCleanupReleaseCalls, 1);
+  fatalCleanupClock.fireAll();
+  await assert.rejects(fatalCleanupService.stop(), /实例锁释放超过硬截止/);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(fatalCleanupExitCodes, [1], "迟到清理完成路径不得重复退出");
 
   const stalledClient = new FakeClient();
   const stalledClock = new FakeClock();
@@ -440,6 +871,12 @@ function frame(messageId, userId, msgtype, body) {
   assert.equal(safeStatus({ status: "turn_steered", question: "must-not-appear" }).status, "turn_steered");
   assert.equal(safeStatus({ status: "turn_queued", question: "must-not-appear" }).status, "turn_queued");
   assert.equal(safeStatus({ status: "answer_recovered", reason: "must-not-appear", elapsedMs: 12 }).status, "answer_recovered");
+  const safeModelFailure = safeStatus({ status: "turn_failed", modelErrorCode: "unauthorized", error: "private token", message: "private body" });
+  assert.equal(safeModelFailure.modelErrorCode, "unauthorized");
+  assert.doesNotMatch(JSON.stringify(safeModelFailure), /private/);
+  assert.equal(Object.hasOwn(safeStatus({ status: "turn_failed", modelErrorCode: "private token" }), "modelErrorCode"), false);
+  assert.equal(safeStatus({ status: "model_retrying", modelErrorCode: "connection_failed" }).modelErrorCode, "connection_failed");
+  assert.equal(safeStatus({ status: "model_responding" }).status, "model_responding");
   assert.throws(() => safeStatus({ status: "unknown" }), /未知机器人状态/);
 
   const statusRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-ready-status-test-"));
@@ -495,6 +932,10 @@ function frame(messageId, userId, msgtype, body) {
     assert.equal(lease.stop(), true);
     assert.equal(JSON.parse(fs.readFileSync(leasePath, "utf8")).state, "stopped");
     assert.equal(intervalCallback, null);
+    assert.equal(lease.start("running"), false, "租约 stop 后必须保持终止态，迟到启动不得复活");
+    assert.equal(lease.state, "stopped");
+    assert.equal(intervalCallback, null);
+    assert.equal(JSON.parse(fs.readFileSync(leasePath, "utf8")).state, "stopped");
 
     const blockedParent = path.join(leaseRoot, "blocked-parent");
     fs.writeFileSync(blockedParent, "not-a-directory", "utf8");
@@ -544,7 +985,7 @@ function frame(messageId, userId, msgtype, body) {
   assert.match(watchdog, /Stop-ScheduledTask/);
   assert.match(watchdog, /Start-ScheduledTask/);
 
-  process.stdout.write(`${JSON.stringify({ success: true, checks: 109 })}\n`);
+  process.stdout.write(`${JSON.stringify({ success: true, checks: 119 })}\n`);
 })().catch((error) => {
   process.stderr.write(`${error.stack}\n`);
   process.exitCode = 1;

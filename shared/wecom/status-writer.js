@@ -2,10 +2,11 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const { safeModelErrorCode } = require("../codex/model-error.js");
 
 const ALLOWED_STATUSES = new Set([
   "connecting", "ready", "disconnected", "reconnecting", "connection_error", "connection_stalled", "lease_write_failed", "message_failed", "agent_failed",
-  "message_received", "turn_started", "turn_steered", "turn_queued", "tool_started", "tool_completed", "tool_failed",
+  "message_received", "turn_started", "turn_steered", "turn_queued", "model_retrying", "model_responding", "tool_started", "tool_completed", "tool_failed",
   "turn_completed", "turn_failed", "context_resumed", "context_rotated", "context_invalidated", "answer_recovered", "agent_warming", "agent_warmed", "agent_warm_failed",
   "chart_generated", "chart_uploaded", "chart_upload_failed", "chart_media_delivery_failed", "chart_inline_delivered", "chart_delivered", "chart_failed", "reply_completed"
 ]);
@@ -22,6 +23,8 @@ function safeStatus(value) {
   const instanceId = safeInstanceId(value?.instanceId);
   if (status === "ready" && instanceId !== null) result.instanceId = instanceId;
   if (status === "reconnecting" && Number.isInteger(value?.attempt)) result.attempt = value.attempt;
+  const modelErrorCode = safeModelErrorCode(value?.modelErrorCode);
+  if (["model_retrying", "turn_failed"].includes(status) && modelErrorCode !== null) result.modelErrorCode = modelErrorCode;
   if (["connection_stalled", "tool_completed", "tool_failed", "turn_completed", "turn_failed", "answer_recovered", "agent_warmed", "reply_completed"].includes(status)
       && Number.isInteger(value?.elapsedMs) && value.elapsedMs >= 0) result.elapsedMs = value.elapsedMs;
   return result;

@@ -3,6 +3,8 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
+const ANY_USER_ID = "*";
+
 class AccessDeniedError extends Error {
   constructor(message, code = "access_denied") {
     super(message);
@@ -49,6 +51,9 @@ function validatePolicy(policy, schema) {
     if (rule.scope === "all" && rule.companies !== undefined) {
       throw new Error(`USERID ${userId} 使用 all 时不得配置 companies。`);
     }
+    if (userId === ANY_USER_ID && rule.scope !== "all") {
+      throw new Error("通配用户 * 只能配置集团全部公司只读权限。");
+    }
     if (rule.scope === "companies") {
       if (!Array.isArray(rule.companies) || rule.companies.length < 1 || rule.companies.length > maxCompanies) {
         throw new Error(`USERID ${userId} 的 companies 数量无效。`);
@@ -72,7 +77,10 @@ function loadAccessPolicy(policyPath, options = {}) {
 
 function authorize(policy, userId) {
   if (typeof userId !== "string" || !userId.trim()) throw new AccessDeniedError("无法识别企业微信用户。", "missing_userid");
-  const rule = policy.users[userId];
+  // 精确 USERID 规则优先；只有访问策略显式登记保留键 `*` 时，才允许
+  // 机器人可触达范围内的其他用户进入。返回值仍保留实际 USERID，确保
+  // Thread、去重和工具授权继续按真实用户隔离，而不是共享通配主体。
+  const rule = policy.users[userId] || policy.users[ANY_USER_ID];
   if (!rule) throw new AccessDeniedError("当前企业微信账号尚未获准使用经营分析服务。", "user_not_registered");
   return Object.freeze({
     userId,
@@ -93,6 +101,7 @@ function enforceCompany(access, requestedCompany) {
 }
 
 module.exports = {
+  ANY_USER_ID,
   AccessDeniedError,
   authorize,
   enforceCompany,

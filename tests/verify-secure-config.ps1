@@ -76,13 +76,32 @@ try {
     if ([int]$migratedFull.generalTurnTimeoutMs -ne 900000) { throw 'Migrated general turn timeout is invalid.' }
     if ([string]$migratedFull.serviceLeasePath -ne [IO.Path]::GetFullPath((Join-Path $testRoot 'service-lease.json'))) { throw 'Migrated service lease path is invalid.' }
 
+    # Some early App Server deployments already declared schema 4.0 before the
+    # explicit service lease field was introduced. Re-running the migration must
+    # repair that shape without rotating or re-encrypting the existing Secret.
+    $earlySchemaFour = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $schemaFourCipher = [string]$earlySchemaFour.wecomBotSecretDpapi
+    $earlySchemaFour.PSObject.Properties.Remove('serviceLeasePath')
+    [IO.File]::WriteAllText($configPath, (($earlySchemaFour | ConvertTo-Json -Depth 10) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+    & $migrate -Path $configPath | Out-Null
+    $repairedSchemaFour = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([string]$repairedSchemaFour.schemaVersion -ne '4.0' -or
+        [string]$repairedSchemaFour.serviceLeasePath -ne [IO.Path]::GetFullPath((Join-Path $testRoot 'service-lease.json'))) {
+        throw 'Early schema 4.0 config without serviceLeasePath was not repaired.'
+    }
+    if ([string]$repairedSchemaFour.wecomBotSecretDpapi -ne $schemaFourCipher) {
+        throw 'Schema 4.0 repair changed the DPAPI ciphertext.'
+    }
+
     & $configurePolicy -UserId 'first-user' -AllowAll -Path $policyPath | Out-Null
     & $configurePolicy -UserId 'second-user' -AllowAll -Path $policyPath | Out-Null
+    & $configurePolicy -AllowAnyUser -Path $policyPath | Out-Null
     $policy = Get-Content -LiteralPath $policyPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ([string]$policy.users.'first-user'.scope -ne 'all' -or [string]$policy.users.'second-user'.scope -ne 'all') { throw 'Atomic access policy replacement did not preserve and add users.' }
+    if ([string]$policy.users.'*'.scope -ne 'all') { throw 'Any-user access policy was not persisted as an explicit read-only wildcard.' }
     if (@(Get-ChildItem -LiteralPath $testRoot -File | Where-Object { $_.Name -like 'access-policy.json.tmp-*' -or $_.Name -like 'access-policy.json.bak-*' }).Count -ne 0) { throw 'Atomic access policy replacement left temporary files.' }
 
-    Write-Output ([ordered]@{ success = $true; checks = 26; schemaVersion = '4.0'; dpapi = 'CurrentUser'; modelProvider = 'codex-app-server'; codexModel = 'gpt-5.6-sol'; reasoning = 'medium'; atomicReplace = 'passed'; migration = '3.0-to-4.0-passed' } | ConvertTo-Json -Compress)
+    Write-Output ([ordered]@{ success = $true; checks = 29; schemaVersion = '4.0'; dpapi = 'CurrentUser'; modelProvider = 'codex-app-server'; codexModel = 'gpt-5.6-sol'; reasoning = 'medium'; atomicReplace = 'passed'; migration = '3.0-and-early-4.0-passed'; anyUserAccess = 'passed' } | ConvertTo-Json -Compress)
 } finally {
     if ([IO.Directory]::Exists($testRoot)) {
         $verified = [IO.Path]::GetFullPath($testRoot)

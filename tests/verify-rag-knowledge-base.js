@@ -12,7 +12,7 @@ const {
   splitMarkdown,
   termFrequencies
 } = require("../shared/rag/skill-knowledge-base.js");
-const { isBusinessFollowUp, isExplicitXbbQuestion, routeSkill } = require("../shared/rag/skill-router.js");
+const { isBusinessFollowUp, isExplicitXbbQuestion, isKnownXbbFieldQuestion, routeSkill } = require("../shared/rag/skill-router.js");
 const { chooseTurnEffort, isSchemaOnlyQuestion, parseMonths, planFastQuery, routeDomains } = require("../shared/xbb/fast-query-plan.js");
 
 const projectRoot = path.resolve(__dirname, "..");
@@ -30,6 +30,31 @@ assert.equal(isExplicitXbbQuestion("对集团业绩按公司排名，区分课�
 assert.equal(isExplicitXbbQuestion("这个月公司的经营情况怎么样"), true);
 assert.equal(isExplicitXbbQuestion("业绩订单表 5614255 的 text_63 是什么字段"), true);
 assert.equal(isExplicitXbbQuestion("OPP订单的表单ID怎么配置"), true);
+for (const schemaQuestion of [
+  "text_63",
+  "array_4.num_5 是什么字段？",
+  "请问 date_1 对应什么",
+  "text_63 和 array_4.text_10 分别是什么",
+  "date_3 是什么字段",
+  "text_36 对应什么",
+  "num_10 是什么字段",
+  "ownerId 是什么字段",
+  "array_1 是什么字段"
+]) {
+  assert.equal(isKnownXbbFieldQuestion(schemaQuestion), true, `真实字段 ID 应命中销帮帮：${schemaQuestion}`);
+  assert.deepEqual(routeSkill(schemaQuestion), { mode: "xbb", reason: "explicit-business-intent" });
+  assert.equal(isSchemaOnlyQuestion(schemaQuestion), true);
+  assert.equal(planFastQuery(schemaQuestion, new Date("2026-09-01T00:00:00Z")), null, "纯 schema 问题不得预取经营事实");
+}
+for (const codeQuestion of [
+  "JavaScript 变量 text_63 为什么是 undefined",
+  "const date_1 = new Date(); 这段代码怎么改",
+  "SQL 里的 num_1 怎么排序",
+  "text_63 + text_31"
+]) {
+  assert.equal(isKnownXbbFieldQuestion(codeQuestion), false, `普通代码变量不得误判：${codeQuestion}`);
+  assert.deepEqual(routeSkill(codeQuestion), { mode: "general", reason: "general-intent" });
+}
 assert.equal(isExplicitXbbQuestion("帮我写一份销售方案"), false);
 assert.equal(isExplicitXbbQuestion("介绍一下公司法"), false);
 assert.equal(isExplicitXbbQuestion("把下面这段话翻译成英文"), false);
@@ -131,6 +156,38 @@ assert.deepEqual(routeDomains("本月开了多少堂课，每堂课成交率如�
 assert.deepEqual(routeDomains("某某公司本月每堂课的成家率怎么样"), ["courses"]);
 assert.deepEqual(routeDomains("这个月开具交付课程各公司的邀约情况和成交业绩分配"), ["delivery"]);
 assert.deepEqual(routeDomains("销售商机阶段和跟进质量"), ["opportunities"]);
+assert.deepEqual(routeDomains("不要看业绩，只看商机"), ["opportunities"]);
+assert.deepEqual(routeDomains("不要看业绩只看商机"), ["opportunities"]);
+assert.deepEqual(routeDomains("请排除课程仅看交付"), ["delivery"]);
+assert.deepEqual(routeDomains("排除门票和商业操盘，改看业绩排名"), ["performance"]);
+assert.deepEqual(routeDomains("不用看开课和参课，只看交付邀约"), ["delivery"]);
+assert.deepEqual(routeDomains("无需交付邀约，改看产品成交"), ["product-sales"]);
+assert.deepEqual(routeDomains("别看商机跟进，改看课程成交率"), ["courses"]);
+assert.deepEqual(
+  routeDomains("同时看业绩、门票、开课情况、交付邀约和商机跟进"),
+  ["opportunities", "product-sales", "delivery", "courses", "performance"]
+);
+assert.deepEqual(
+  routeDomains("不是不看业绩，只看商机，而是业绩和商机都要分析"),
+  ["opportunities", "performance"]
+);
+assert.deepEqual(
+  routeDomains("事实合同写明：“不看业绩，只看商机”只是错误示例"),
+  ["opportunities", "performance"]
+);
+assert.deepEqual(
+  routeDomains("事实合同写明，不看业绩，只看商机"),
+  ["opportunities", "performance"]
+);
+assert.deepEqual(
+  routeDomains("事实合同写明，不看业绩只看商机只是错误示例"),
+  ["opportunities", "performance"]
+);
+assert.deepEqual(
+  routeDomains("排除业绩异常，只看商机质量"),
+  ["opportunities", "performance"]
+);
+assert.deepEqual(routeDomains("不看商业操盘，只看门票"), ["product-sales"]);
 assert.deepEqual(parseMonths("对2026年9月业绩排名", new Date("2026-09-01T00:00:00Z")), ["2026-09"]);
 assert.deepEqual(parseMonths("看最近3个月趋势", new Date("2026-09-01T00:00:00Z")), ["2026-07", "2026-08", "2026-09"]);
 assert.deepEqual(parseMonths("看2026年全年业绩", new Date("2026-09-01T00:00:00Z")), ["2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06", "2026-07", "2026-08", "2026-09"]);

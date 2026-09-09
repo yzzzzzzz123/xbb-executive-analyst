@@ -8,6 +8,9 @@ const { chartTypeLabel, formatDuration } = require("../xbb/query-progress.js");
 const { createWecomAnswerImage, createWecomChartImage, createWecomEmergencyImage } = require("./chart-image.js");
 const { MessageStore, MessageStoreCapacityError } = require("./message-store.js");
 
+const DEFAULT_ROUTE_MEMORY_MAX_ENTRIES = 4096;
+const XBB_FOLLOW_UP_HANDOFF_ANSWER = "已收到你的补充要求，正在继续分析。完整结果会回复到你最新一条消息。";
+
 function extractQuestion(message) {
   if (message?.msgtype === "text") return message.text?.content;
   if (message?.msgtype === "voice") return message.voice?.content;
@@ -22,6 +25,17 @@ function extractQuestion(message) {
 
 function operationalFailure(error) {
   if (error instanceof AccessDeniedError) return error.message;
+  if (error instanceof AgentTurnFailureError) {
+    const message = {
+      unauthorized: "机器人连接模型服务的登录已失效，暂时无法回答。请管理员在部署机器的 Windows 端重新登录 Codex 后恢复服务。",
+      connection_failed: "机器人暂时无法连接模型服务，自动重试后仍未恢复，本轮未能生成答复。请管理员检查部署机器的网络和代理连接。",
+      usage_limit: "模型服务的使用额度暂时受限，本轮未能生成答复。请管理员检查模型账户的可用额度。",
+      context_limit: "本轮对话超过模型上下文限制，已清理失效上下文；下一条消息将使用新会话。",
+      invalid_request: "模型服务未接受本轮请求。请管理员检查机器人使用的模型和请求配置。",
+      service_error: "模型服务暂时出现故障，本轮未能生成答复；服务恢复后可以继续提问。"
+    }[error.modelErrorCode];
+    if (message) return message;
+  }
   if (error instanceof AgentTurnTimeoutError) {
     return error.routeMode === "xbb"
       ? "本轮实时取数或推理超过时限，自动恢复流程已保护数据完整性并重置会话；没有输出不完整或陈旧数字。服务会从新 Thread 继续接收原问题，无需拆分主题。"
@@ -69,6 +83,13 @@ function isTransientTransportError(error) {
 function appendVisualNotice(answer, notice) {
   const text = String(answer || "").trim();
   return text.includes(notice) ? text : `${text}\n\n${notice}`;
+}
+
+function isXbbOperationalHandoff(result) {
+  return Boolean(result
+    && result.routeMode === "xbb"
+    && !result.chart
+    && String(result.answer || "").trim() === XBB_FOLLOW_UP_HANDOFF_ANSWER);
 }
 
 function normalizeRenderedImage(rendered) {
@@ -145,9 +166,11 @@ function createLongConnectionHandler({
   emergencyImageFactory = createWecomEmergencyImage,
   retryWait = delay,
   renderAttempts = 2,
-  transportAttempts = 3
+  transportAttempts = 3,
+  routeMemoryMaxEntries = DEFAULT_ROUTE_MEMORY_MAX_ENTRIES
 }) {
   if (!policy || !agent?.answer) throw new Error("企业微信长连接处理器初始化参数不完整。");
+  if (!Number.isInteger(routeMemoryMaxEntries) || routeMemoryMaxEntries < 1) throw new Error("企业微信路由记忆上限无效。");
   // 应急图在启动阶段只生成和校验一次。运行时拒绝/渲染故障只复用这个不可变项，
   // 避免未授权消息触发 Sharp CPU 开销，也消除最后一级兜底再次抛错的窗口。
   const emergencyRender = normalizeRenderedImage(emergencyImageFactory());
@@ -155,7 +178,7 @@ function createLongConnectionHandler({
   const rememberRoute = (userId, routeMode) => {
     lastRouteByUser.delete(userId);
     lastRouteByUser.set(userId, routeMode);
-    if (lastRouteByUser.size > 4096) lastRouteByUser.delete(lastRouteByUser.keys().next().value);
+    if (lastRouteByUser.size > routeMemoryMaxEntries) lastRouteByUser.delete(lastRouteByUser.keys().next().value);
   };
   const writeStatus = (value) => {
     try { statusWriter(value); } catch { /* 状态日志故障不能阻断图片和文字答复 */ }
@@ -170,6 +193,9 @@ function createLongConnectionHandler({
       const userId = String(message.from?.userid || "");
       const question = String(extractQuestion(message) || "").trim();
       const inferredRoute = routeSkill(question, lastRouteByUser.get(userId) || null).mode;
+      // 路由意图不含经营事实，可以在鉴权前安全记忆。这样未授权用户收到拒绝后说
+      // “继续”，仍会被识别为上一条销帮帮追问并附应急图；LRU 上限避免常驻泄漏。
+      rememberRoute(userId, inferredRoute);
 
       let access;
       try {
@@ -228,6 +254,7 @@ function createLongConnectionHandler({
       let heartbeat;
       let onProgress;
       let progressPublisher;
+      let usePrebuiltOperationalImage = false;
       try {
         let latestStage = initialContent;
         progressPublisher = createProgressPublisher({
@@ -253,6 +280,7 @@ function createLongConnectionHandler({
         answer = typeof result === "string" ? result : result.answer;
         chart = typeof result === "object" && result ? result.chart : null;
         if (result?.routeMode === "xbb" || result?.routeMode === "general") routeMode = result.routeMode;
+        usePrebuiltOperationalImage = isXbbOperationalHandoff(result);
         clearInterval(heartbeat);
         await progressPublisher.flush();
       } catch (error) {
@@ -260,6 +288,7 @@ function createLongConnectionHandler({
         if (progressPublisher) await progressPublisher.flush();
         answer = operationalFailure(error);
         if (error?.routeMode === "xbb") routeMode = "xbb";
+        usePrebuiltOperationalImage = routeMode === "xbb";
       }
       rememberRoute(userId, routeMode);
       const requiresImage = routeMode === "xbb";
@@ -286,21 +315,29 @@ function createLongConnectionHandler({
         }
       }
       if (requiresImage && !msgItem.length) {
-        try {
-          imageRender = normalizeRenderedImage(await retryTransient(() => answerRenderer(answer), {
-            attempts: renderAttempts,
-            wait: retryWait,
-            shouldRetry: isTransientRenderError
-          }));
-          msgItem = [imageRender.item];
-          imageBuffer = imageRender.buffer;
-          writeStatus({ status: "chart_generated" });
-        } catch {
+        if (usePrebuiltOperationalImage) {
           imageRender = emergencyRender;
           msgItem = [emergencyRender.item];
-          imageBuffer = emergencyRender.buffer;
-          answer = appendVisualNotice(answer, "（可视化引擎暂时异常，已附安全占位图；本条文字结论仍按原口径保留。）");
-          writeStatus({ status: "chart_failed" });
+          // 交接/恢复答复可能在洪泛收敛时批量产生。直接内嵌启动期预构建图片，
+          // 不为每条消息并发调用 Sharp，也不重复上传同一张占位图。
+          imageBuffer = null;
+        } else {
+          try {
+            imageRender = normalizeRenderedImage(await retryTransient(() => answerRenderer(answer), {
+              attempts: renderAttempts,
+              wait: retryWait,
+              shouldRetry: isTransientRenderError
+            }));
+            msgItem = [imageRender.item];
+            imageBuffer = imageRender.buffer;
+            writeStatus({ status: "chart_generated" });
+          } catch {
+            imageRender = emergencyRender;
+            msgItem = [emergencyRender.item];
+            imageBuffer = emergencyRender.buffer;
+            answer = appendVisualNotice(answer, "（可视化引擎暂时异常，已附安全占位图；本条文字结论仍按原口径保留。）");
+            writeStatus({ status: "chart_failed" });
+          }
         }
       }
       let uploadedMediaId = null;
@@ -352,6 +389,8 @@ function createLongConnectionHandler({
 }
 
 module.exports = {
+  DEFAULT_ROUTE_MEMORY_MAX_ENTRIES,
+  XBB_FOLLOW_UP_HANDOFF_ANSWER,
   appendVisualNotice,
   createLongConnectionHandler,
   createProgressPublisher,
@@ -360,6 +399,7 @@ module.exports = {
   operationalFailure,
   isTransientRenderError,
   isTransientTransportError,
+  isXbbOperationalHandoff,
   retryTransient,
   validateFrame
 };

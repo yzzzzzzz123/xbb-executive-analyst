@@ -11,6 +11,7 @@
     },
     "users": {
       "type": "object",
+      "description": "按企业微信 USERID 配置访问范围；保留键 * 显式允许机器人可触达范围内的任意用户，并且只能使用 all。精确 USERID 规则优先。",
       "maxProperties": 5000,
       "additionalProperties": {
         "type": "object",

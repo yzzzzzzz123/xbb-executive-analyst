@@ -7,7 +7,12 @@ param(
     [string[]]$Domains = @('all'),
 
     [Parameter(Mandatory = $true)]
-    [string]$OutputPath
+    [string]$OutputPath,
+
+    # Operational-only process fencing token. It is never persisted in the
+    # exported business payload and has no effect on query semantics.
+    [ValidatePattern('^[a-f0-9]{64}$')]
+    [string]$IsolationToken
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,7 +55,19 @@ try {
     $env:XBB_API_BASE = [string]$credential.baseUrl
     $env:XBB_CORPID = [string]$credential.corpid
     $env:XBB_API_TOKEN = $apiToken
-    & node $extractor --month $Month --domains ($Domains -join ',') --output $resolvedOutput
+    $extractorArguments = @($extractor, '--output', $resolvedOutput, '--request-stdin')
+    if (-not [string]::IsNullOrWhiteSpace($IsolationToken)) {
+        $extractorArguments += @('--isolation-token', $IsolationToken)
+    }
+    $extractRequest = [ordered]@{ month = $Month; domains = @($Domains) } | ConvertTo-Json -Depth 3 -Compress
+    $previousOutputEncoding = $OutputEncoding
+    try {
+        $OutputEncoding = [Text.UTF8Encoding]::new($false)
+        $extractRequest | & node @extractorArguments
+    } finally {
+        $OutputEncoding = $previousOutputEncoding
+        $extractRequest = $null
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "Live XBB data export failed with exit code $LASTEXITCODE."
     }

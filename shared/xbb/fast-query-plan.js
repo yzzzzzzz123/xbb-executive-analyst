@@ -161,6 +161,95 @@ function parseMonths(question, now = new Date()) {
   return validateRequestedMonths(unique, now);
 }
 
+const DOMAIN_SCOPE_ALIASES = new Map([
+  ["业绩", "performance"],
+  ["经营业绩", "performance"],
+  ["收入", "performance"],
+  ["收入结构", "performance"],
+  ["产品", "product-sales"],
+  ["产品销售", "product-sales"],
+  ["产品成交", "product-sales"],
+  ["开源产品", "product-sales"],
+  ["门票", "product-sales"],
+  ["商业操盘", "product-sales"],
+  ["商业操盘复训", "product-sales"],
+  ["课程", "courses"],
+  ["开课", "courses"],
+  ["参课", "courses"],
+  ["参训", "courses"],
+  ["课程成交率", "courses"],
+  ["课程成家率", "courses"],
+  ["交付", "delivery"],
+  ["课程交付", "delivery"],
+  ["交付课程", "delivery"],
+  ["交付邀约", "delivery"],
+  ["邀约", "delivery"],
+  ["业绩分配", "delivery"],
+  ["成交业绩分配", "delivery"],
+  ["商机", "opportunities"],
+  ["销售机会", "opportunities"],
+  ["商机阶段", "opportunities"],
+  ["商机跟进", "opportunities"],
+  ["跟进记录", "opportunities"],
+  ["跟进质量", "opportunities"],
+  ["商机质量", "opportunities"]
+]);
+
+function normalizeDomainScopePart(value) {
+  let text = String(value || "").replace(/\s+/g, "");
+  text = text.replace(/^(?:关于|有关|针对)/, "");
+  text = text.replace(/(?:即可|就行|就好)$/, "");
+  text = text.replace(/(?:相关)?(?:的数据|数据|情况|分析|部分|板块|模块|维度|主题|指标|排名|排行)$/, "");
+  return text;
+}
+
+function parseDomainScope(value) {
+  const parts = String(value || "")
+    .replace(/\s+/g, "")
+    .split(/(?:、|\/|以及|还有|和|与|及)/)
+    .map(normalizeDomainScopePart)
+    .filter(Boolean);
+  if (!parts.length) return [];
+  const domains = parts.map((part) => DOMAIN_SCOPE_ALIASES.get(part));
+  // 限定为可完整识别的短域名，避免把“排除业绩异常”等业务描述误解为
+  // “不要查询业绩域”。
+  if (domains.some((domain) => !domain)) return [];
+  return [...new Set(domains)];
+}
+
+function explicitDomainSwitches(question) {
+  const text = String(question || "").replace(/\s+/g, "");
+  const switches = [];
+  const pattern = /(?:^|[，,；;。！？!?\n])(?:请|麻烦|帮我|本次|这次|此次|本轮|本月|这个月|当月|今年|本年|先|暂时)*(?:不要看|不用看|无需看|不看|别看|排除|不用|无需)([^，,；;。！？!?\n]+?)[，,；;。！？!?\n]+(?:而是)?(?:改为看|转而看|只看|仅看|改看|转看)([^，,；;。！？!?\n]+)/g;
+  for (const match of text.matchAll(pattern)) {
+    const precedingContext = text.slice(Math.max(0, match.index - 32), match.index);
+    if (/(?:事实合同|事实说明|字段说明|文档原文|规则示例|错误示例)(?:中|里|写着|写明|提到|包含|说明)?$/.test(precedingContext)) continue;
+    const excluded = parseDomainScope(match[1]);
+    const included = parseDomainScope(match[2]);
+    if (excluded.length && included.length) switches.push({ excluded, included });
+  }
+  // 手机输入常省略逗号，例如“不要看业绩只看商机”。这里只接受两端都
+  // 是完整、已知的单一域别名；较长业务描述仍交给上面的保守解析，避免把
+  // “排除业绩异常只看商机质量”误当作切换数据域。
+  const aliases = [...DOMAIN_SCOPE_ALIASES.keys()]
+    .sort((left, right) => right.length - left.length)
+    .map((alias) => alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+  const compactPattern = new RegExp(
+    `(?:^|[，,；;。！？!?\\n])(?:请|麻烦|帮我|本次|这次|此次|本轮|本月|这个月|当月|今年|本年|先|暂时)*(?:不要看|不用看|无需看|不看|别看|排除|不用|无需)(${aliases})(?:而是)?(?:改为看|转而看|只看|仅看|改看|转看)(${aliases})(?=$|[，,；;。！？!?\\n])`,
+    "g"
+  );
+  for (const match of text.matchAll(compactPattern)) {
+    const precedingContext = text.slice(Math.max(0, match.index - 32), match.index);
+    if (/(?:事实合同|事实说明|字段说明|文档原文|规则示例|错误示例)(?:中|里|写着|写明|提到|包含|说明)?$/.test(precedingContext)) continue;
+    switches.push({
+      excluded: [DOMAIN_SCOPE_ALIASES.get(match[1])],
+      included: [DOMAIN_SCOPE_ALIASES.get(match[2])]
+    });
+  }
+  return switches;
+}
+
 function routeDomains(question) {
   const text = String(question || "").replace(/\s+/g, "");
   const domains = [];
@@ -171,7 +260,10 @@ function routeDomains(question) {
   if (/开了?多少(?:堂|门)?课|开课|堂课|每堂课|成(?:交|家)率|参课|参训/.test(text)) domains.push("courses");
   if (/业绩|收入|课程.{0,8}咨询|咨询.{0,8}课程|课程占比|咨询占比/.test(text)
       && !(deliveryIntent && /业绩分配|成交业绩/.test(text))) domains.push("performance");
-  return [...new Set(domains)];
+  const switches = explicitDomainSwitches(text);
+  const included = new Set(switches.flatMap((item) => item.included));
+  const excluded = new Set(switches.flatMap((item) => item.excluded).filter((domain) => !included.has(domain)));
+  return [...new Set([...domains, ...included])].filter((domain) => !excluded.has(domain));
 }
 
 function isSchemaOnlyQuestion(question) {

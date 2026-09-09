@@ -11,7 +11,11 @@ function sanitizeCodexEnvironment(source = process.env) {
     "LOCALAPPDATA", "NUMBER_OF_PROCESSORS", "OS", "Path", "PATH", "PATHEXT",
     "PROCESSOR_ARCHITECTURE", "PROGRAMDATA", "ProgramFiles", "PROGRAMFILES",
     "ProgramFiles(x86)", "PROGRAMFILES(X86)", "SystemDrive", "SystemRoot", "TEMP", "TMP",
-    "USERDOMAIN", "USERNAME", "USERPROFILE", "windir", "WINDIR"
+    "USERDOMAIN", "USERNAME", "USERPROFILE", "windir", "WINDIR",
+    // 模型连接必须沿用部署环境的网络路由；丢弃代理会让 CLI 登录正常、
+    // App Server 就绪正常，但每次生成都直连失败并反复重连。
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy"
   ];
   const result = {};
   for (const key of allowed) {

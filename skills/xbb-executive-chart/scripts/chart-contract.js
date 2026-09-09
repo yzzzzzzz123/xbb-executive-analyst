@@ -1,7 +1,7 @@
 "use strict";
 
 const FORMAT_VALUES = Object.freeze(["number", "money", "percent"]);
-const COMMON_FIELDS = Object.freeze(["type", "title", "subtitle", "insight", "note"]);
+const COMMON_FIELDS = Object.freeze(["type", "title", "subtitle", "insight", "note", "focus"]);
 const PERCENT_TOTAL_TOLERANCE = 0.5;
 
 const LIMITS = Object.freeze({
@@ -18,13 +18,18 @@ const LIMITS = Object.freeze({
 
 const formatSchema = { type: "string", enum: FORMAT_VALUES };
 const commonProperties = {
-  title: { type: "string", minLength: 1, maxLength: LIMITS.title },
+  title: {
+    type: "string",
+    minLength: 1,
+    maxLength: LIMITS.title,
+    description: "说明对象和指标，建议不超过 20 个中文字。"
+  },
   subtitle: { type: "string", maxLength: LIMITS.subtitle },
   insight: {
     type: "string",
     minLength: 1,
     maxLength: LIMITS.insight,
-    description: "仅陈述图中事实能够支持的一句关键发现。"
+    description: "仅陈述图中可见事实支持的一句关键发现，建议不超过 36 个中文字；因果、建议与预测留在文字答复。"
   },
   note: { type: "string", maxLength: LIMITS.note }
 };
@@ -124,9 +129,22 @@ function makeSeriesSchema(maxValues, nonnegative) {
 }
 
 function chartVariant(type, specificProperties) {
+  const hasSeries = ["bar", "stacked-bar", "line"].includes(type);
   return strictObject({
     type: { type: "string", enum: [type] },
     ...commonProperties,
+    focus: {
+      description: "选择最能支撑 insight 的已展示数据位置，可为低位、回落或非最大值；没有单一重点时为 null。不得从自由文字猜测。",
+      anyOf: [
+        strictObject({
+          series: hasSeries
+            ? { type: "string", minLength: 1, maxLength: LIMITS.name }
+            : { type: "string", enum: [""] },
+          category: { type: "string", minLength: 1, maxLength: LIMITS.category }
+        }),
+        { type: "null" }
+      ]
+    },
     ...specificProperties
   });
 }
@@ -150,6 +168,8 @@ function validateSpec(spec) {
   if (!validator) fail("type 不受支持");
 
   const normalized = validator(spec);
+  const focus = Object.prototype.hasOwnProperty.call(spec, "focus") ? spec.focus : null;
+  normalized.focus = normalizeFocus(focus, normalized);
   return deepFreeze(normalized);
 }
 
@@ -158,7 +178,7 @@ function validateSeriesChart(spec) {
   ensureExactFields(spec, [
     ...COMMON_FIELDS,
     "valueFormat", "unit", "categories", "series"
-  ], "图表");
+  ], "图表", ["focus"]);
   const common = normalizeCommon(spec);
   const valueFormat = normalizeFormat(spec.valueFormat, "valueFormat");
   const unit = normalizeUnit(spec.unit, valueFormat, "unit");
@@ -177,7 +197,7 @@ function validateDonut(spec) {
   ensureExactFields(spec, [
     ...COMMON_FIELDS,
     "valueFormat", "unit", "items", "centerLabel"
-  ], "图表");
+  ], "图表", ["focus"]);
   const common = normalizeCommon(spec);
   const valueFormat = normalizeFormat(spec.valueFormat, "valueFormat");
   const items = normalizeItems(spec.items, valueFormat, false);
@@ -197,7 +217,7 @@ function validateFunnel(spec) {
   ensureExactFields(spec, [
     ...COMMON_FIELDS,
     "valueFormat", "unit", "items"
-  ], "图表");
+  ], "图表", ["focus"]);
   const common = normalizeCommon(spec);
   const valueFormat = normalizeFormat(spec.valueFormat, "valueFormat");
   const items = normalizeItems(spec.items, valueFormat, true);
@@ -214,7 +234,7 @@ function validateScatter(spec) {
   ensureExactFields(spec, [
     ...COMMON_FIELDS,
     "points", "xLabel", "yLabel", "xFormat", "yFormat", "xUnit", "yUnit"
-  ], "图表");
+  ], "图表", ["focus"]);
   const common = normalizeCommon(spec);
   const xFormat = normalizeFormat(spec.xFormat, "xFormat");
   const yFormat = normalizeFormat(spec.yFormat, "yFormat");
@@ -250,6 +270,25 @@ function normalizeCommon(spec) {
     insight: normalizeString(spec.insight, "insight", LIMITS.insight, false),
     note: normalizeString(spec.note, "note", LIMITS.note, true)
   };
+}
+
+function normalizeFocus(value, spec) {
+  if (value === null) return null;
+  ensureExactFields(value, ["series", "category"], "focus");
+  const hasSeries = ["bar", "stacked-bar", "line"].includes(spec.type);
+  const series = normalizeString(value.series, "focus.series", LIMITS.name, !hasSeries);
+  const category = normalizeString(value.category, "focus.category", LIMITS.category, false);
+  if (hasSeries) {
+    if (!spec.series.some((entry) => entry.name === series)) fail("focus.series 必须匹配已有系列名称");
+    if (!spec.categories.includes(category)) fail("focus.category 必须匹配已有类别");
+  } else {
+    if (series !== "") fail("focus.series 在 donut、funnel、scatter 中必须为空字符串");
+    const labels = spec.type === "scatter"
+      ? spec.points.map((point) => point.label)
+      : spec.items.map((item) => item.name);
+    if (!labels.includes(category)) fail("focus.category 必须匹配已有项目名称或散点标签");
+  }
+  return { series, category };
 }
 
 function normalizeSeries(value, categoryCount, format, nonnegative) {
@@ -362,14 +401,16 @@ function ensureObject(value, path) {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail(`${path} 必须是对象`);
 }
 
-function ensureExactFields(value, fields, path) {
+function ensureExactFields(value, fields, path, optionalFields = []) {
   ensureObject(value, path);
   const allowed = new Set(fields);
   for (const key of Reflect.ownKeys(value)) {
     if (typeof key !== "string" || !allowed.has(key)) fail(`${path} 不支持字段 ${String(key)}`);
   }
   for (const field of fields) {
-    if (!Object.prototype.hasOwnProperty.call(value, field)) fail(`${path} 缺少字段 ${field}`);
+    if (!optionalFields.includes(field) && !Object.prototype.hasOwnProperty.call(value, field)) {
+      fail(`${path} 缺少字段 ${field}`);
+    }
   }
 }
 

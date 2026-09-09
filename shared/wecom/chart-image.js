@@ -5,6 +5,7 @@ const zlib = require("node:zlib");
 const sharp = require("sharp");
 const { render, validateSpec } = require("../xbb/render-chart.js");
 const { sanitizeAgentText } = require("../security/output-sanitizer.js");
+const visual = require("../xbb/chart-primitives.js");
 
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
@@ -18,67 +19,6 @@ function escapeXml(value) {
     .replace(/'/g, "&apos;");
 }
 
-function truncateVisual(value, maxWidth) {
-  const source = String(value ?? "");
-  if (visualWidth(source) <= maxWidth) return source;
-  let result = "";
-  let width = 0;
-  for (const character of source) {
-    const characterWidth = visualWidth(character);
-    if (width + characterWidth > maxWidth - 2) break;
-    result += character;
-    width += characterWidth;
-  }
-  return `${result.trimEnd()}…`;
-}
-
-function visualWidth(value) {
-  let width = 0;
-  for (const character of String(value ?? "")) {
-    width += character.codePointAt(0) > 0xFF ? 2 : 1;
-  }
-  return width;
-}
-
-function wrapVisual(value, maxWidth = 54, maxLines = 14) {
-  const paragraphs = String(value || "").replace(/\r/g, "").split("\n");
-  const lines = [];
-  let truncated = false;
-  for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex += 1) {
-    const paragraph = paragraphs[paragraphIndex];
-    if (!paragraph.trim()) {
-      if (lines.length && lines.at(-1) !== "") lines.push("");
-      continue;
-    }
-    let line = "";
-    let width = 0;
-    for (const character of paragraph.trim()) {
-      const characterWidth = visualWidth(character);
-      if (line && width + characterWidth > maxWidth) {
-        lines.push(line);
-        line = "";
-        width = 0;
-        if (lines.length >= maxLines) {
-          truncated = true;
-          break;
-        }
-      }
-      line += character;
-      width += characterWidth;
-    }
-    if (line && lines.length < maxLines) lines.push(line);
-    if (lines.length >= maxLines && (truncated || paragraphIndex < paragraphs.length - 1)) {
-      truncated = true;
-      break;
-    }
-  }
-  if (truncated && lines.length) {
-    const last = lines.length - 1;
-    while (visualWidth(lines[last]) > maxWidth - 2) lines[last] = [...lines[last]].slice(0, -1).join("");
-    lines[last] = `${lines[last].trimEnd()}…`;
-  }
-  return lines.slice(0, maxLines);
-}
 
 function imageItem(buffer) {
   if (!Buffer.isBuffer(buffer) || !buffer.length || buffer.length > MAX_IMAGE_BYTES) throw new Error("企微图片大小不符合限制。");
@@ -102,32 +42,42 @@ async function createWecomChartImage(spec) {
   return Object.freeze({ buffer, item });
 }
 
-async function createWecomAnswerImage(answer, options = {}) {
+function renderAnswerSvg(answer, options = {}) {
   const safeAnswer = sanitizeAgentText(answer, { maxBytes: 18000 });
   if (!safeAnswer) throw new Error("销帮帮结论速览图缺少可显示文字。");
   const title = sanitizeAgentText(options.title || "销帮帮经营答复", { maxBytes: 240 });
-  const subtitle = sanitizeAgentText(options.subtitle || "结论速览｜完整内容以同条文字答复为准", { maxBytes: 360 });
-  const lines = wrapVisual(safeAnswer);
-  const lineHeight = 43;
-  const content = lines.map((line, index) => line
-    ? `<text x="82" y="${238 + index * lineHeight}" font-size="25" font-weight="${index === 0 ? 650 : 450}" fill="#24324A">${escapeXml(line)}</text>`
-    : "").join("");
-  const svg = `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="900" viewBox="0 0 1200 900" role="img">
-  <rect width="1200" height="900" fill="#F3F1ED"/>
-  <rect x="20" y="20" width="1160" height="860" rx="24" fill="#FFFFFF" stroke="#E4DED5"/>
-  <g font-family="Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif">
-    <rect x="64" y="46" width="144" height="32" rx="16" fill="#FCE8DF"/>
-    <text x="136" y="68" text-anchor="middle" font-size="14" font-weight="700" fill="#B84920">实时只读分析</text>
-    <text x="64" y="126" font-size="34" font-weight="700" fill="#172239">${escapeXml(truncateVisual(title, 56))}</text>
-    <text x="64" y="164" font-size="16" fill="#687386">${escapeXml(truncateVisual(subtitle, 124))}</text>
-    <rect x="64" y="194" width="1072" height="568" rx="18" fill="#F8FAFC" stroke="#E3E9F1"/>
-    <rect x="64" y="194" width="8" height="568" rx="4" fill="#E85D2A"/>
-    ${content}
-    <line x1="64" y1="815" x2="1136" y2="815" stroke="#E5E8ED"/>
-    <text x="64" y="850" font-size="14" font-weight="600" fill="#5E687A">来源：销帮帮实时只读分析｜图片不补造文字答复之外的数字</text>
-  </g>
-</svg>`;
+  const subtitle = sanitizeAgentText(options.subtitle || "结论速览 · 完整内容见文字答复", { maxBytes: 360 });
+  const { LEFT, RIGHT, WIDTH, FONT, ACCENT, MUTED, rect, text, lines, line, wrap } = visual;
+  const titleRows = wrap(title, RIGHT - LEFT, 36);
+  const subtitleRows = wrap(subtitle, RIGHT - LEFT, 20);
+  const subtitleY = 110 + titleRows.length * 48;
+  const bodyY = subtitleY + subtitleRows.length * 30 + 54;
+  // Reflow a bounded excerpt; the previous fixed-height box overflowed on 14 lines.
+  const plainAnswer = safeAnswer.replace(/^\s{0,3}#{1,6}\s+/gm, "").replace(/\*\*(.*?)\*\*/g, "$1");
+  const allRows = plainAnswer.split(/\r?\n/).flatMap((p) => p.trim() ? wrap(p.trim(), RIGHT - LEFT - 48, 30) : [""]);
+  const excerpt = allRows.slice(0, 18);
+  if (allRows.length > 18) excerpt[17] = `${[...excerpt[17]].slice(0, -1).join("")}…`;
+  let y = bodyY;
+  const content = [];
+  let first = true;
+  for (const row of excerpt) {
+    if (!row) { y += 22; continue; }
+    content.push(text(LEFT + 24, y, row, { size: first ? 30 : 27, weight: first ? 650 : 400 }));
+    y += 43; first = false;
+  }
+  const footerY = Math.max(536, y + 44), height = footerY + 91;
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${height}" viewBox="0 0 ${WIDTH} ${height}" role="img" aria-labelledby="answer-title" data-renderer="executive-summary-v3">
+<title id="answer-title">${escapeXml(title)}</title>${rect(0, 0, WIDTH, height, "#FAFCFA")}${rect(LEFT, 0, 62, 7, ACCENT)}
+<g font-family="${FONT}">${text(LEFT, 48, "XBB / 结论速览", { size: 18, fill: ACCENT, weight: 700 })}
+${lines(LEFT, 110, titleRows, { size: 36, weight: 700, leading: 48 })}${lines(LEFT, subtitleY, subtitleRows, { size: 20, fill: MUTED, leading: 30 })}
+${rect(LEFT, bodyY - 34, RIGHT - LEFT, y - bodyY + 54, "#EDF5F2", 12)}${content.join("")}
+${line(LEFT, footerY, RIGHT, footerY)}${text(LEFT, footerY + 36, "销帮帮经营答复", { size: 18, fill: MUTED })}
+${text(LEFT, footerY + 66, "文字摘录 · 完整结论及限制见同条答复", { size: 18, fill: MUTED })}</g></svg>`;
+}
+
+async function createWecomAnswerImage(answer, options = {}) {
+  const svg = renderAnswerSvg(answer, options);
   const buffer = await sharp(Buffer.from(svg, "utf8"), { density: 96 })
     .png({ compressionLevel: 9, adaptiveFiltering: true })
     .toBuffer();
@@ -226,5 +176,6 @@ module.exports = {
   createWecomAnswerImage,
   createWecomChartImage,
   createWecomChartItem,
-  createWecomEmergencyImage
+  createWecomEmergencyImage,
+  renderAnswerSvg
 };

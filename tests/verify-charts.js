@@ -6,7 +6,8 @@ const sharp = require("sharp");
 const { CHART_SCHEMA, validateSpec } = require("../skills/xbb-executive-chart/scripts/chart-contract.js");
 const { GENERAL_RESPONSE_SCHEMA, WECOM_RESPONSE_SCHEMA, parseAgentResponse } = require("../shared/codex/response-contract.js");
 const { render } = require("../shared/xbb/render-chart.js");
-const { createWecomAnswerImage, createWecomChartItem, createWecomEmergencyImage } = require("../shared/wecom/chart-image.js");
+const { createWecomAnswerImage, createWecomChartItem, createWecomEmergencyImage, renderAnswerSvg } = require("../shared/wecom/chart-image.js");
+const { PALETTE, contrastText, formatValue } = require("../shared/xbb/chart-primitives.js");
 
 const common = (type, title, insight) => ({ type, title, subtitle: "2026年9月｜集团｜截至实时刷新时间", insight, note: "" });
 const specs = [
@@ -150,7 +151,7 @@ function assertSupportedOutputSchema(schema, path = "$") {
   assert.equal(summaryImage.kind, "answer-summary");
   assert.equal(summaryMetadata.format, "png");
   assert.ok(summaryMetadata.width >= 1200);
-  assert.equal(summaryMetadata.width / summaryMetadata.height, 4 / 3);
+  assert.ok(summaryMetadata.height >= 600, "结论卡随内容调整高度");
   assert.equal(summaryImage.item.image.md5, crypto.createHash("md5").update(summaryPng).digest("hex"));
 
   const emergencyImage = createWecomEmergencyImage();
@@ -170,7 +171,8 @@ function assertSupportedOutputSchema(schema, path = "$") {
     centerLabel: "收入占比"
   };
   const percentSvg = render(percentDonut);
-  assert.equal((percentSvg.match(/<text\b[^>]*>[^<]*70%/g) || []).length, 2, "可见洞察和图例应各出现一次 70%，图例自身不得重复");
+  assert.equal((percentSvg.match(/<text\b[^>]*>[^<]*70%/g) || []).length, 3, "洞察、重点数值、明细各一份；不得重复拼接百分比");
+  assert.doesNotMatch(percentSvg, /70% · 70%/);
 
   const percentStack = {
     ...specs[1],
@@ -196,17 +198,22 @@ function assertSupportedOutputSchema(schema, path = "$") {
     valueFormat: "percent",
     unit: ""
   });
-  assert.match(contrastStack, /fill="#E85D2A" opacity="0\.95"\/><text[^>]+fill="#0B1220"/);
-  assert.match(contrastStack, /fill="#315D9B" opacity="0\.95"\/><text[^>]+fill="#FFFFFF"/);
-  assert.match(contrastStack, /fill="#168B83" opacity="0\.95"\/><text[^>]+fill="#0B1220"/);
-  assert.match(contrastStack, /fill="#D39518" opacity="0\.95"\/><text[^>]+fill="#0B1220"/);
+  const luminance = (hex) => {
+    const rgb = hex.slice(1).match(/../g).map((v) => parseInt(v, 16) / 255).map((v) => v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
+    return rgb.reduce((s, v, i) => s + v * [0.2126, 0.7152, 0.0722][i], 0);
+  };
+  for (const color of PALETTE.slice(0, 4)) {
+    const ink = contrastText(color), first = luminance(color), second = luminance(ink);
+    assert.ok((Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05) >= 4.5, `段内文字对比度不足 ${color}`);
+    assert.ok(contrastStack.includes(`fill="${ink}"`));
+  }
 
   const roundedPercentDonut = render({
     ...percentDonut,
     insight: "三个构成项各约占三分之一",
     items: [{ name: "课程", value: 33.5 }, { name: "咨询", value: 33.5 }, { name: "其他", value: 33.5 }]
   });
-  assert.match(roundedPercentDonut, />100%<\/text><text x="340"/);
+  assert.match(roundedPercentDonut, />100%<\/text>/);
 
   const unsortedBar = render({
     ...specs[0],
@@ -216,8 +223,10 @@ function assertSupportedOutputSchema(schema, path = "$") {
   const lowCategory = unsortedBar.indexOf(">较低</text>");
   const highCategory = unsortedBar.indexOf(">最高</text>");
   const middleCategory = unsortedBar.indexOf(">居中</text>");
-  assert.match(unsortedBar.slice(lowCategory, highCategory), /fill="#7183A4"/);
-  assert.match(unsortedBar.slice(highCategory, middleCategory), /fill="#E85D2A"/);
+  assert.match(unsortedBar.slice(lowCategory, highCategory), /data-value="10" data-baseline="0"/);
+  assert.match(unsortedBar.slice(highCategory, middleCategory), /data-value="30" data-baseline="0"/);
+  const widths = [...unsortedBar.matchAll(/width="([\d.]+)"[^>]+data-value="([\d.]+)" data-baseline="0"/g)].map((m) => Number(m[1]) / Number(m[2]));
+  assert.ok(widths.every((w) => Math.abs(w - widths[0]) < 0.001), "条长必须从零开始并使用统一比例尺");
 
   const denseLine = render({
     ...specs[2],
@@ -226,7 +235,7 @@ function assertSupportedOutputSchema(schema, path = "$") {
   });
   const labelXs = [...denseLine.matchAll(/<text x="([\d.]+)" y="[\d.]+"[^>]*>M\d{2}<\/text>/g)].map((match) => Number(match[1]));
   assert.ok(labelXs.length >= 2 && labelXs.length <= 9);
-  assert.ok(labelXs.slice(1).every((value, index) => value - labelXs[index] >= 84));
+  assert.ok(labelXs.slice(1).every((value, index) => value - labelXs[index] >= 80));
 
   const boundaryScatter = render({
     ...common("scatter", "边界散点", "边界气泡仍完整位于绘图区内"),
@@ -238,11 +247,57 @@ function assertSupportedOutputSchema(schema, path = "$") {
     xUnit: "",
     yUnit: ""
   });
-  const bubbles = [...boundaryScatter.matchAll(/<circle cx="([\d.]+)" cy="([\d.]+)" r="([\d.]+)" fill="#[0-9A-F]+" opacity="0\.75"/g)]
+  const bubbles = [...boundaryScatter.matchAll(/<circle cx="([\d.]+)" cy="([\d.]+)" r="([\d.]+)" fill="#[0-9A-F]+" opacity="0\.85"/g)]
     .map((match) => ({ x: Number(match[1]), y: Number(match[2]), radius: Number(match[3]) }));
   assert.equal(bubbles.length, 2);
-  assert.ok(bubbles.every((bubble) => bubble.x - bubble.radius >= 145 && bubble.x + bubble.radius <= 1100));
-  assert.ok(bubbles.every((bubble) => bubble.y - bubble.radius >= 250 && bubble.y + bubble.radius <= 746));
+  assert.ok(bubbles.every((bubble) => bubble.x - bubble.radius >= 137 && bubble.x + bubble.radius <= 814));
+  assert.ok(bubbles.every((bubble) => bubble.y - bubble.radius >= 300 && bubble.y + bubble.radius <= 760));
+
+  for (const spec of specs) {
+    assert.equal(validateSpec(spec).focus, null, "旧规格仍可用");
+    const focus = spec.series ? { series: spec.series[0].name, category: spec.categories.at(-1) }
+      : { series: "", category: (spec.items || spec.points).at(-1).name || spec.points.at(-1).label };
+    const normalized = validateSpec({ ...spec, focus });
+    assert.deepEqual(normalized.focus, focus);
+    assert.ok(Object.isFrozen(normalized.focus));
+    assert.doesNotThrow(() => render(normalized));
+    assert.throws(() => validateSpec({ ...spec, focus: { ...focus, category: "不存在的重点" } }), /focus.category/);
+    assert.throws(() => validateSpec({ ...spec, focus: { ...focus, color: "red" } }), /不支持字段/);
+  }
+  const focusedBar = render({ ...specs[0], focus: { series: "回款", category: specs[0].categories[3] } });
+  assert.match(focusedBar, /距最高差 ¥77万/);
+  assert.match(focusedBar, /fill="#087F8C" data-value="510000" data-baseline="0"/);
+  const percentLine = render({ ...specs[2], categories: ["一月", "二月", "三月", "四月"], series: [{ name: "完成率", values: [40, 50, 55, 70] }], valueFormat: "percent", unit: "", focus: { series: "完成率", category: "三月" } });
+  assert.match(percentLine, /\+5 个百分点/);
+  assert.match(percentLine, /峰值 70%/);
+
+  const preciseMoneyLine = render({ ...specs[2], categories: ["一月", "二月", "三月", "四月"], series: [{ name: "回款", values: [100000000, 100000020, 100000050, 100000100] }], valueFormat: "money", unit: "" });
+  const preciseTicks = [...preciseMoneyLine.matchAll(/<text x="121"[^>]*>([^<]+)<\/text>/g)].map((m) => m[1]);
+  assert.ok(preciseTicks.length >= 3);
+  assert.equal(new Set(preciseTicks).size, preciseTicks.length, "相邻轴刻度不能被万/亿舍入成相同文本");
+  const tinyLine = render({ ...specs[2], categories: ["一月", "二月", "三月", "四月"], series: [{ name: "微小值", values: [1e-12, 2e-12, 3e-12, 4e-12] }], unit: "" });
+  const tinyTicks = [...tinyLine.matchAll(/<text x="121"[^>]*>([^<]+)<\/text>/g)].map((m) => m[1]);
+  assert.equal(new Set(tinyTicks).size, tinyTicks.length);
+  assert.ok(tinyTicks.some((v) => v.includes("e-")), "极小数转科学计数法而非舍入成零");
+  const zeroLine = render({ ...specs[2], categories: Array.from({ length: 30 }, (_, i) => `M${i + 1}`), series: [{ name: "零值", values: Array(30).fill(0) }], focus: { series: "零值", category: "M2" } });
+  assert.doesNotMatch(zeroLine, />峰值 /, "全相等序列不添加额外峰值标签");
+
+  const narrowScatter = render({ ...specs[4], points: [{ label: "甲", x: 10000, y: 10000, size: 100 }, { label: "乙", x: 10001, y: 10001, size: 0 }] });
+  const gridXs = [...narrowScatter.matchAll(/<line x1="([\d.]+)" y1="([\d.]+)" x2="([\d.]+)" y2="([\d.]+)"/g)].filter((m) => m[1] === m[3] && m[2] !== m[4]).map((m) => Number(m[1]));
+  assert.ok(gridXs.length >= 3 && Math.max(...gridXs) - Math.min(...gridXs) > 400, "补入零点后刻度必须覆盖完整散点坐标域");
+  assert.match(narrowScatter, /r="3" fill="none" opacity="0.85"/);
+  assert.match(narrowScatter, /空心点：大小指标为 0/);
+  const longCenter = render({ ...specs[3], centerLabel: "全部已验证人数".repeat(5), valueFormat: "number", unit: "人" });
+  assert.doesNotMatch(longCenter, />收入构成<\/text>/);
+  assert.match(longCenter, />合计<\/text>/);
+  assert.ok(formatValue(0.0001, "money").includes("1.0e-4"), "真实小数不能被写成零");
+
+  const longSummary = renderAnswerSvg(Array.from({ length: 30 }, (_, i) => `第${i + 1}项：已核对文字答复中的内容。`).join("\n"));
+  const summaryHeight = Number(longSummary.match(/<svg[^>]*height="(\d+)"/)[1]);
+  assert.ok(summaryHeight > 900);
+  assert.ok([...longSummary.matchAll(/<text[^>]* y="([\d.]+)"/g)].every((m) => Number(m[1]) < summaryHeight - 15));
+  assert.match(longSummary, /…<\/text>/);
+  assert.doesNotMatch(renderAnswerSvg("<script>不执行</script>"), /<script>/);
 
   assert.throws(() => render({ type: "pie", title: "错误类型" }), /type/);
   assert.throws(() => validateSpec({ ...specs[0], color: "red" }), /不支持字段 color/);

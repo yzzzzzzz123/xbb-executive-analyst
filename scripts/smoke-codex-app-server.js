@@ -21,6 +21,7 @@ async function runSmoke() {
   const config = {
     projectRoot,
     agentStatePath: path.join(tempRoot, "agent-state.json"),
+    serviceLeasePath: path.join(tempRoot, "service-lease.json"),
     agentTurnTimeoutMs: 300000,
     generalTurnTimeoutMs: 900000,
     codexModel: "gpt-5.6-sol",

@@ -726,9 +726,19 @@ function parseArguments(argv) {
   const parsed = {};
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index];
-    if (["--input", "--output"].includes(key)) parsed[key.slice(2)] = argv[++index];
+    if (["--input", "--output", "--isolation-token"].includes(key)) {
+      if (index + 1 >= argv.length || String(argv[index + 1]).startsWith("--")) throw new Error(`参数缺少值：${key}`);
+      if (Object.hasOwn(parsed, key.slice(2))) throw new Error(`参数不能重复：${key}`);
+      parsed[key.slice(2)] = argv[index + 1];
+      index += 1;
+    } else {
+      throw new Error(`不支持的参数：${key}`);
+    }
   }
   if (!parsed.input || !parsed.output) throw new Error("必须提供 --input 和 --output。");
+  if (parsed["isolation-token"] !== undefined && !/^[a-f0-9]{64}$/.test(parsed["isolation-token"])) {
+    throw new Error("runner isolation token 格式无效。");
+  }
   return parsed;
 }
 
