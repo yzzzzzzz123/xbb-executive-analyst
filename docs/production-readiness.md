@@ -46,6 +46,8 @@ npm run verify:production
 
 从 PowerShell 7 启动测试时，runner 仅对 Windows PowerShell 5.1 子进程清除继承的 `PSModulePath`，由 5.1 重建原生模块路径；其他环境变量与 Node 测试环境不变。这样避免错误加载 Core 版安全模块，但仍真实执行 DPAPI 往返和计划任务验收。
 
+所有 PowerShell 源码必须是有效 UTF-8；包含中文等非 ASCII 内容的脚本必须带 UTF-8 BOM，保证英文 Windows PowerShell 5.1 不会按本地 ANSI 编码误读。`verify` 在语法解析前执行编码门禁，`.editorconfig` 为 `*.ps1` 固定 `utf-8-bom`。源码顺序断言必须先确认查找位置存在，不能让 `IndexOf` 返回的 `-1` 形成误通过。
+
 ## 真实只读低频探针
 
 离线通过后，使用与后台机器人相同的 Windows 用户验证真实 App Server 登录、模型可用性和受控业务读取。在线探针串行、低频执行，一次选择最小必要范围；不得循环向业务 API 压测，也不得拿离线构造数据替代线上事实。
@@ -135,6 +137,7 @@ npm run bench:production -- --live --repeat=1 --business
 | 月份与活动追问 | 裸 8 月、8 月和 9 月、去年月份均不回落当月；未来/无效/不支持的省略写法拒绝，无效追问不替换原回合答复所有者 |
 | Windows 短路径兼容 | 首次 GitHub CI 暴露隔离标记读写路径规范化不一致；真实 8.3 TEMP 用例修前复现、修后通过，越界/缺失根仍拒绝 |
 | PowerShell 父子环境 | 第二轮 CI 已通过全部 unit/integration，暴露 7→5.1 安全模块路径污染；本机不兼容模块夹具修前同错、修后真实 Windows 两套验收通过，未跳过 DPAPI |
+| 跨区域脚本编码 | 第三轮 CI 通过 16/17 套后暴露最后一份测试缺 UTF-8 BOM；审计 19 份脚本，仅该测试受影响。补编码门禁，并修正正确解码后暴露的两条旧源码顺序断言；运行时未变 |
 
 完整本机报告位于被 Git 忽略的 `test-results/production/`：`benchmark-2026-09-09T03-02-16-245Z.json` 保留通用/上下文成功和原图断言失败；`benchmark-2026-09-09T03-06-39-975Z.json` 保留公司排名图验收通过。上述缓存命中轮次不能用作冷查询提速证据；模型回答耗时和提示文本不同，也不据此宣称“速度提升 X%”。
 

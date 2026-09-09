@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 
 $ErrorActionPreference = 'Stop'
@@ -1715,12 +1715,22 @@ foreach ($taskScript in @($installer, $uninstaller, $watchdog)) {
 if ($installer -match 'RepetitionDuration' -or $installer -match 'New-TimeSpan\s+-Days\s+3650') {
     throw 'Scheduled recovery repetition is still capped instead of having an omitted duration.'
 }
-if ($installer.IndexOf('$productCandidates = Find-ProductProcessCandidates', [StringComparison]::Ordinal) -gt $installer.IndexOf('Remove-ExistingTaskForUpgrade $watchdogTaskName', [StringComparison]::Ordinal) -or
-    $installer.IndexOf("Assert-ProductProcessSlotEmpty '启动新任务前'", [StringComparison]::Ordinal) -gt $installer.IndexOf('Start-ScheduledTask -TaskName $TaskName', [StringComparison]::Ordinal)) {
+$installerDiscoveryIndex = $installer.IndexOf('$productCandidates = Find-ProductProcessCandidates', [StringComparison]::Ordinal)
+$installerMutationIndex = $installer.IndexOf('Remove-ExistingTaskForUpgrade $watchdogTaskName', [StringComparison]::Ordinal)
+$installerLaunchGuardIndex = $installer.IndexOf("Assert-ProductProcessSlotEmpty '启动新任务前'", [StringComparison]::Ordinal)
+$installerLaunchIndex = $installer.IndexOf('Start-VerifiedOwnedTask $TaskName $newMainMetadata', [StringComparison]::Ordinal)
+if (@($installerDiscoveryIndex, $installerMutationIndex, $installerLaunchGuardIndex, $installerLaunchIndex | Where-Object { $_ -lt 0 }).Count -gt 0 -or
+    $installerDiscoveryIndex -ge $installerMutationIndex -or $installerLaunchGuardIndex -ge $installerLaunchIndex) {
     throw 'The installer does not enforce an empty product slot before task mutation and launch.'
 }
-if ($watchdog.IndexOf('$candidates = Find-ProductProcessCandidates', [StringComparison]::Ordinal) -gt $watchdog.IndexOf("action = 'healthy'", [StringComparison]::Ordinal) -or
-    $watchdog.IndexOf("Assert-ProductProcessSlotEmpty '重新启用主任务前'", [StringComparison]::Ordinal) -gt $watchdog.IndexOf('Start-ScheduledTask -TaskName $TaskName', [StringComparison]::Ordinal)) {
+$watchdogDiscoveryIndex = $watchdog.IndexOf('$candidates = Find-ProductProcessCandidates', [StringComparison]::Ordinal)
+$watchdogHealthyIndex = $watchdog.IndexOf("action = 'healthy'", [StringComparison]::Ordinal)
+$watchdogLaunchGuardIndex = $watchdog.IndexOf("Assert-ProductProcessSlotEmpty '重新启用主任务前'", [StringComparison]::Ordinal)
+$watchdogEnableIndex = $watchdog.IndexOf('Enable-VerifiedMainTask $ownedTask', [StringComparison]::Ordinal)
+$watchdogLaunchIndex = $watchdog.IndexOf('Start-VerifiedMainTask $ownedTask', [StringComparison]::Ordinal)
+if (@($watchdogDiscoveryIndex, $watchdogHealthyIndex, $watchdogLaunchGuardIndex, $watchdogEnableIndex, $watchdogLaunchIndex | Where-Object { $_ -lt 0 }).Count -gt 0 -or
+    $watchdogDiscoveryIndex -ge $watchdogHealthyIndex -or $watchdogLaunchGuardIndex -ge $watchdogEnableIndex -or
+    $watchdogEnableIndex -ge $watchdogLaunchIndex) {
     throw 'The watchdog does not enforce the product-level singleton before health acceptance and restart.'
 }
 foreach ($taskScript in @($installer, $uninstaller, $watchdog)) {

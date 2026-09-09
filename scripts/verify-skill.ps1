@@ -85,10 +85,17 @@ $powershellFiles = @(
     Get-ChildItem -LiteralPath (Join-Path $projectRoot 'skills') -Filter '*.ps1' -File -Recurse
     Get-ChildItem -LiteralPath (Join-Path $projectRoot 'tests') -Filter '*.ps1' -File -Recurse
 )
+$strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
 foreach ($file in $powershellFiles) {
     $parseTokens = $null
     $parseErrors = $null
-    $source = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8
+    $bytes = [IO.File]::ReadAllBytes($file.FullName)
+    $hasUtf8Bom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+    try { $source = $strictUtf8.GetString($bytes) } catch { throw "PowerShell source must be valid UTF-8: $($file.FullName)" }
+    if (-not $hasUtf8Bom -and $source -match '[^\x00-\x7F]') {
+        throw "PowerShell 5.1 requires a UTF-8 BOM for non-ASCII source: $($file.FullName)"
+    }
+    if ($hasUtf8Bom) { $source = $source.Substring(1) }
     [void][Management.Automation.Language.Parser]::ParseInput($source, $file.FullName, [ref]$parseTokens, [ref]$parseErrors)
     if (@($parseErrors).Count -gt 0) { throw "PowerShell syntax check failed: $($file.FullName) - $($parseErrors -join '; ')" }
 }
@@ -126,4 +133,5 @@ Write-Output ([ordered]@{
     quickValidate = 'passed'
     javascriptFiles = $javascriptFiles.Count
     powershellFiles = $powershellFiles.Count
+    powershellEncoding = 'valid UTF-8; BOM required for non-ASCII PowerShell 5.1 source'
 } | ConvertTo-Json -Compress)
