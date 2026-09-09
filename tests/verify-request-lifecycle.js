@@ -22,14 +22,14 @@ async function until(predicate, message) {
   assert.fail(message);
 }
 class FakeClient extends EventEmitter {
-  constructor() { super(); this.threads = []; this.turns = []; this.steers = []; this.interrupts = []; }
+  constructor() { super(); this.threads = []; this.turns = []; this.steers = []; this.interrupts = []; this.responses = []; }
   async connect() {}
   async close() {}
   async startThread(params) { const id = `thread-${this.threads.length + 1}`; this.threads.push({ id, params }); return { thread: { id } }; }
   async startTurn(params) { const id = `turn-${this.turns.length + 1}`; this.turns.push({ id, params }); return { turn: { id } }; }
   async steerTurn(params) { this.steers.push(params); return { turnId: params.expectedTurnId }; }
   async interruptTurn(threadId, turnId) { this.interrupts.push({ threadId, turnId }); return {}; }
-  respond() {}
+  respond(id, result) { this.responses.push({ id, result }); }
   reject() {}
   complete(turn = this.turns.at(-1), answer = "已按原始问题完成只读分析。") {
     const item = { type: "agentMessage", id: `item-${turn.id}`, phase: "final_answer", text: JSON.stringify({ answer, chart: null }) };
@@ -59,6 +59,21 @@ function fixture(options = {}) {
   const key = principalKeyFromUserId("synthetic-lifecycle-user", { scope: "all" });
   const ask = (question = "解释二分查找", extra = {}) => observe(agent.answer({ question, access: { scope: "all" }, principalKey: key, ...extra }));
   return { agent, client, key, ask, host, persisted };
+}
+
+function syntheticPerformancePack(month, total) {
+  return {
+    status: "ready", scope: { month, domains: ["performance"] },
+    provenance: { live: true, readOnly: true, dataSource: "xbb-openapi", telephoneFieldsExported: false, credentialFieldsExported: false },
+    facts: { performance: { summary: { total, course: total, consulting: 0, other: 0 }, ranking: [{ company: "合成测试公司", total, course: total, consulting: 0, other: 0 }] } },
+    limitations: [], integrity: { algorithm: "sha256", factPackSha256: "b".repeat(64) }
+  };
+}
+
+function callSyntheticQuery(f, month, id = `synthetic-query-${month}`, turn = f.client.turns.at(-1)) {
+  return f.agent._handleServerRequest({ id, method: "item/tool/call", params: {
+    threadId: turn.params.threadId, turnId: turn.id, tool: "query_xbb", arguments: { months: [month], domains: ["performance"] }
+  } });
 }
 
 (async () => {
@@ -187,6 +202,167 @@ function fixture(options = {}) {
     steers.client.complete(replay, "二分查找原始答复");
     assert.equal((await original).answer, "二分查找原始答复");
   } finally { await steers.agent.close(); }
+
+  // A tool result can arrive after steer delivery but before its ACK. It is
+  // not evidence owned by the previous accepted request, even if verified.
+  for (const confirmedFacts of ["none", "prefetch", "dynamic"]) {
+    for (const ackFailure of ["rejected", "cancelled"]) {
+      const gate = pending();
+      const facts = fixture({ queryXbb: async (args) => syntheticPerformancePack(args.months[0], args.months[0] === "2026-08" ? 111 : 999) });
+      facts.client.steerTurn = (params) => { facts.client.steers.push(params); return gate.promise; };
+      await facts.agent.start();
+      try {
+        const original = facts.ask(confirmedFacts === "prefetch" ? "集团2026年8月业绩排名" : "销帮帮2026年8月整体经营情况怎么样？");
+        await until(() => facts.client.turns.length === 1, "business original owner should start");
+        if (confirmedFacts === "dynamic") await callSyntheticQuery(facts, "2026-08");
+        const active = facts.agent.sessions.get(facts.key).active;
+        const originalPlan = structuredClone(active.queryPlan);
+        const originalDeadline = active.deadlineAtMs;
+        const originalReplay = structuredClone(active.replayTurnParams.input);
+        const controller = new AbortController();
+        const correction = facts.ask("改为集团2026年9月业绩排名", { signal: controller.signal });
+        await until(() => facts.client.steers.length === 1, "new-scope steer should be awaiting ACK");
+        await callSyntheticQuery(facts, "2026-09");
+        assert.deepEqual(active.queryPlan.months, ["2026-09"]);
+        if (confirmedFacts === "none") assert.equal(active.latestFactView.facts.performance.summary.total, 999, "fixture must reproduce unconfirmed facts entering the active slot");
+        const charged = { toolCalls: active.toolCalls, factBytesSent: active.factBytesSent, inputBytes: active.inputBytes };
+        const previousGeneration = active.factGeneration;
+        if (ackFailure === "cancelled") controller.abort();
+        else gate.reject(new Error("synthetic business steer ACK failure"));
+        await assert.rejects(correction, /请求已取消|synthetic business steer ACK failure/u);
+        await until(() => facts.client.turns.length === 2, "previous business owner should recover on fresh thread");
+        assert.equal(active.latestFactView?.facts.performance.summary.total ?? null, confirmedFacts === "none" ? null : 111,
+          "recovered previous owner must never retain unacknowledged new-scope facts");
+        assert.deepEqual(active.queryPlan, originalPlan, "query scope must return to the accepted owner");
+        assert.equal(active.prefetchedFactAvailable, confirmedFacts === "prefetch");
+        assert.equal(active.prefetchedFactView?.facts.performance.summary.total ?? null, confirmedFacts === "prefetch" ? 111 : null);
+        assert.equal(active.deadlineAtMs, originalDeadline);
+        assert.ok(active.factGeneration > previousGeneration, "late uncertain query results must remain ineligible");
+        for (const [name, value] of Object.entries(charged)) assert.equal(active[name], value, `${name} must not reset during recovery`);
+        assert.deepEqual(facts.client.turns[1].params.input, originalReplay, "replay may contain only accepted inputs");
+        await facts.agent._timeoutTurn(facts.agent.sessions.get(facts.key), active);
+        if (confirmedFacts === "none") await assert.rejects(original, /处理超时/u);
+        else {
+          const result = await original;
+          assert.doesNotMatch(result.answer, /999|2026-09/u, "fallback may use only confirmed original-scope facts");
+          assert.match(result.answer, /111/u);
+        }
+      } finally { await facts.agent.close(); }
+    }
+  }
+
+  for (const confirmedFacts of [false, true]) {
+    const gate = pending();
+    const facts = fixture({ queryXbb: async (args) => syntheticPerformancePack(args.months[0], args.months[0] === "2026-08" ? 111 : 999) });
+    facts.client.steerTurn = (params) => { facts.client.steers.push(params); return gate.promise; };
+    await facts.agent.start();
+    try {
+      const original = facts.ask(confirmedFacts ? "集团2026年8月业绩排名" : "销帮帮2026年8月整体经营情况怎么样？");
+      await until(() => facts.client.turns.length === 1, "timeout-boundary original should start");
+      const correction = facts.ask("改为集团2026年9月业绩排名");
+      await until(() => facts.client.steers.length === 1, "timeout-boundary steer should remain unacknowledged");
+      await callSyntheticQuery(facts, "2026-09");
+      const session = facts.agent.sessions.get(facts.key);
+      await facts.agent._timeoutTurn(session, session.active);
+      await assert.rejects(correction, /处理超时/u);
+      if (confirmedFacts) {
+        const result = await original;
+        assert.match(result.answer, /111/u);
+        assert.doesNotMatch(result.answer, /999|2026-09/u);
+      } else await assert.rejects(original, /处理超时/u);
+      assert.equal(session.active, null);
+    } finally { await facts.agent.close(); }
+  }
+
+  for (const queryPhase of ["before-subscribe", "before-prefetch-response", "awaiting-cleanup"]) {
+    const ack = pending();
+    const suspended = pending();
+    const queryCalls = [];
+    const facts = fixture({ queryXbb: async (args, _access, invocation) => {
+      queryCalls.push({ args, signal: invocation.signal });
+      if (args.months[0] === "2026-09") return suspended.promise;
+      return syntheticPerformancePack(args.months[0], 111);
+    } });
+    facts.client.steerTurn = (params) => { facts.client.steers.push(params); return ack.promise; };
+    await facts.agent.start();
+    try {
+      const original = facts.ask(queryPhase === "before-prefetch-response" ? "集团2026年8月业绩排名" : "销帮帮2026年8月整体经营情况怎么样？");
+      await until(() => facts.client.turns.length === 1, "suspended query original should start");
+      const correction = facts.ask("改为集团2026年9月业绩排名");
+      await until(() => facts.client.steers.length === 1, "suspended query steer should await ACK");
+      let pausedProgress = false;
+      const notify = facts.agent._notifyQueryProgress.bind(facts.agent);
+      if (queryPhase !== "awaiting-cleanup") {
+        facts.agent._notifyQueryProgress = async (...args) => {
+          if (!pausedProgress && args[3].stage === (queryPhase === "before-prefetch-response" ? "query_ready" : "run_started")) {
+            pausedProgress = true;
+            await suspended.promise;
+          } else await notify(...args);
+        };
+      }
+      const oldMonth = queryPhase === "before-prefetch-response" ? "2026-08" : "2026-09";
+      const oldQuery = callSyntheticQuery(facts, oldMonth, "old-suspended-query", facts.client.turns[0]);
+      await until(() => queryPhase === "awaiting-cleanup" ? queryCalls.length === 1 : pausedProgress, "old tool should pause at the intended boundary");
+      const session = facts.agent.sessions.get(facts.key);
+      const active = session.active;
+      active.generationRemainingMs = 321;
+      const deadline = active.deadlineAtMs;
+      const chargedCalls = queryCalls.length;
+      ack.reject(new Error("synthetic suspended-query ACK failure"));
+      await assert.rejects(correction, /synthetic suspended-query ACK failure/u);
+      await until(() => facts.client.turns.length === 2, "suspended tool owner should recover");
+      assert.equal(active.inFlightToolCount, 1, "recovery must not release a still-unsettled tool slot");
+      assert.equal(active.generationRemainingMs, 321);
+      if (queryPhase === "awaiting-cleanup") assert.equal(queryCalls[0].signal.aborted, true);
+      await callSyntheticQuery(facts, "2026-08", "blocked-new-query");
+      assert.equal(queryCalls.length, chargedCalls, "new turn cannot launch a replacement while old cleanup is outstanding");
+      suspended.resolve(syntheticPerformancePack("2026-09", 999));
+      await oldQuery;
+      assert.equal(queryCalls.length, chargedCalls, "old progress continuation must not start an old-scope query after recovery");
+      assert.equal(active.inFlightToolCount, 0);
+      assert.ok(active.generationRemainingMs <= 321, "old finally must not renew the new turn generation budget");
+      assert.equal(active.deadlineAtMs, deadline);
+      assert.equal(facts.client.responses.some((entry) => entry.id === "old-suspended-query"), false, "old-thread tool continuation must not emit a stale response");
+      assert.equal(active.latestFactView?.facts.performance.summary.total ?? null, queryPhase === "before-prefetch-response" ? 111 : null);
+      await callSyntheticQuery(facts, "2026-08", "fresh-original-query");
+      assert.equal(active.latestFactView.facts.performance.summary.total, 111);
+      facts.client.complete(); await original;
+    } finally { await facts.agent.close(); }
+  }
+
+  {
+    const ack = pending();
+    const progress = pending();
+    let queryCalls = 0;
+    const facts = fixture({ queryXbb: async (args) => { queryCalls += 1; return syntheticPerformancePack(args.months[0], 999); } });
+    facts.client.steerTurn = (params) => { facts.client.steers.push(params); return ack.promise; };
+    await facts.agent.start();
+    try {
+      const original = facts.ask("销帮帮2026年8月整体经营情况怎么样？");
+      await until(() => facts.client.turns.length === 1, "accepted steer original should start");
+      const correction = facts.ask("改为集团2026年9月业绩排名");
+      await until(() => facts.client.steers.length === 1, "accepted steer should first await ACK");
+      const notify = facts.agent._notifyQueryProgress.bind(facts.agent);
+      let held = false;
+      facts.agent._notifyQueryProgress = async (...args) => {
+        if (!held) { held = true; await progress.promise; }
+        else await notify(...args);
+      };
+      const oldQuery = callSyntheticQuery(facts, "2026-08", "same-turn-old-query");
+      await until(() => held, "same-turn old query should pause before subscription");
+      ack.resolve({ turnId: facts.client.turns[0].id });
+      await original;
+      progress.resolve(); await oldQuery;
+      assert.equal(queryCalls, 0, "confirmed same-turn scope change must prevent old query execution");
+      const response = facts.client.responses.find((entry) => entry.id === "same-turn-old-query");
+      assert.equal(JSON.parse(response.result.contentItems[0].text).status, "superseded");
+      const session = facts.agent.sessions.get(facts.key);
+      assert.equal(session.active.steerFactBoundary, null, "confirmed new owner must no longer use the old-owner snapshot");
+      await callSyntheticQuery(facts, "2026-09", "confirmed-new-query");
+      await facts.agent._timeoutTurn(session, session.active);
+      assert.match((await correction).answer, /999/u, "confirmed new owner may use its own fresh scope facts");
+    } finally { await facts.agent.close(); }
+  }
 
   for (const ackFailure of ["rpc-rejected", "wrong-turn"]) {
     const gate = pending();

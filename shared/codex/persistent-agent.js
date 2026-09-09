@@ -929,6 +929,8 @@ class PersistentCodexAgent extends EventEmitter {
     request.waiter.lifecycle?.limitDeadline(active.deadlineAtMs);
     request.waiter.lifecycle?.throwIfStopped();
     this._markSessionStarted(request.waiter);
+    const confirmedBoundary = this._snapshotConfirmedSteerState(active);
+    active.steerFactBoundary = confirmedBoundary;
     active.steerInFlight = true;
     active.pendingSteerWaiters.add(request.waiter);
     let steerError = null;
@@ -943,6 +945,7 @@ class PersistentCodexAgent extends EventEmitter {
       if (session.active === active) {
         const previousWaiters = active.waiters;
         active.waiters = [request.waiter];
+        active.steerFactBoundary = null;
         active.steerCount += 1;
         active.steerInputBytes += steerBytes;
         active.inputBytes += steerBytes;
@@ -988,10 +991,11 @@ class PersistentCodexAgent extends EventEmitter {
       if (sent && session.active === active && this._hasActiveOwners(active)) {
         // A cancelled or unacknowledged steer might have reached the model.
         // Keep the previous owner, but discard that potentially changed turn.
-        await this._recoverCancelledSteer(session, active);
+        await this._recoverCancelledSteer(session, active, confirmedBoundary);
       }
     } finally {
       active.pendingSteerWaiters.delete(request.waiter);
+      active.steerFactBoundary = null;
       active.steerInFlight = false;
       if (active.pendingCompletion && session.active === active) {
         const pendingCompletion = active.pendingCompletion;
@@ -1007,7 +1011,25 @@ class PersistentCodexAgent extends EventEmitter {
     throw routedTurnError(steerError || new Error("Codex 追问追加失败。"), active.businessMode);
   }
 
-  async _recoverCancelledSteer(session, active) {
+  _snapshotConfirmedSteerState(active) {
+    // Query RPCs can complete before the steer ACK. Only this pre-send state
+    // belongs to the existing owner; cumulative work budgets are NOT copied.
+    return structuredClone({
+      queryPlan: active.queryPlan,
+      prefetchedQueryFingerprint: active.prefetchedQueryFingerprint,
+      prefetchedFactAvailable: active.prefetchedFactAvailable,
+      prefetchedFactView: active.prefetchedFactView,
+      latestFactView: active.latestFactView,
+      fallbackBlockedUntilFreshScope: active.fallbackBlockedUntilFreshScope,
+      requiredFallbackQueryFingerprint: active.requiredFallbackQueryFingerprint,
+      fallbackFactFingerprint: active.fallbackFactFingerprint,
+      successfulFactQueryCount: active.successfulFactQueryCount,
+      supersededFactFingerprints: active.supersededFactFingerprints,
+      replayTurnParams: active.replayTurnParams
+    });
+  }
+
+  async _recoverCancelledSteer(session, active, confirmedBoundary) {
     const owner = active.waiters.find((waiter) => !waiter.lifecycle?.settled);
     if (session.active !== active) return;
     const oldThreadId = session.threadId;
@@ -1021,11 +1043,14 @@ class PersistentCodexAgent extends EventEmitter {
     this._pauseTurnTimeout(active);
     this._cancelActiveQuery(active, "已取消的追问不再参与当前分析。");
     active.factGeneration += 1;
+    Object.assign(active, confirmedBoundary);
     active.turnId = null;
     active.pendingCompletion = null;
     active.messages.clear();
     active.finalText = "";
     active.lastText = "";
+    active.modelErrorCode = null;
+    active.modelRetrying = false;
     active.streamedMessageBytes = 0;
     this._invalidateThread(session, "cancelled_steer");
     this._interruptTurn(oldThreadId, oldTurnId);
@@ -1236,14 +1261,19 @@ class PersistentCodexAgent extends EventEmitter {
     active.prefetchedFactAvailable = false;
     active.prefetchedFactView = null;
     active.latestFactView = null;
+    active.steerFactBoundary = null;
     if (session.active === active) session.active = null;
     active.done.resolve();
   }
 
   _resolveVerifiedFallback(session, active, reason) {
-    if (!hasUsableFacts(active.latestFactView)) return false;
+    // A generation timeout can happen before the steer ACK. An empty accepted
+    // snapshot must stay empty, never fall through to unconfirmed tool facts.
+    const factView = active.steerInFlight && active.steerFactBoundary
+      ? active.steerFactBoundary.latestFactView : active.latestFactView;
+    if (!hasUsableFacts(factView)) return false;
     let answer;
-    try { answer = buildVerifiedFallbackAnswer(active.latestFactView); } catch { return false; }
+    try { answer = buildVerifiedFallbackAnswer(factView); } catch { return false; }
     this._recordSuccessfulTurn(session, active);
     const waiters = active.waiters.slice();
     this._finishActive(session, active);
@@ -1268,6 +1298,7 @@ class PersistentCodexAgent extends EventEmitter {
       steerCount: 0,
       steerInputBytes: 0,
       steerInFlight: false,
+      steerFactBoundary: null,
       pendingCompletion: null,
       pendingSteerWaiters: new Set(),
       modelErrorCode: null,
@@ -1442,6 +1473,16 @@ class PersistentCodexAgent extends EventEmitter {
       active.latestFactView = null;
     }
     const factGeneration = active.factGeneration;
+    const ownsTurn = () => session.active === active && session.threadId === threadId
+      && active.turnId === turnId && !active.abortController.signal.aborted;
+    const canStartQuery = () => {
+      if (!ownsTurn()) return false;
+      if (active.factGeneration === factGeneration) return true;
+      this.client.respond(request.id, { success: true, contentItems: [{ type: "inputText", text: JSON.stringify({
+        status: "superseded", message: "查询开始前用户已更新范围；旧范围未执行，请按最新问题重新调用 query_xbb。"
+      }) }] });
+      return false;
+    };
     active.inFlightToolCount += 1;
     active.toolStartedAtMs = Date.now();
     this._pauseTurnTimeout(active);
@@ -1453,14 +1494,14 @@ class PersistentCodexAgent extends EventEmitter {
         completed: 0,
         total: Array.isArray(args?.months) ? args.months.length : 1
       });
-      if (session.active !== active || active.abortController.signal.aborted) return;
+      if (!canStartQuery()) return;
       if (active.prefetchedFactAvailable && queryFingerprint(args) === active.prefetchedQueryFingerprint) {
         await this._notifyQueryProgress(session, args, session.access, {
           stage: "query_ready",
           completed: Array.isArray(args?.months) ? args.months.length : 1,
           total: Array.isArray(args?.months) ? args.months.length : 1
         });
-        if (session.active !== active || active.abortController.signal.aborted) return;
+        if (!canStartQuery()) return;
         this.client.respond(request.id, {
           success: true,
           contentItems: [{
@@ -1476,6 +1517,7 @@ class PersistentCodexAgent extends EventEmitter {
         this._emit("activity", { status: "tool_completed", elapsedMs: Date.now() - active.toolStartedAtMs });
         return;
       }
+      if (!canStartQuery()) return;
       const subscription = this._beginActiveQuery(active);
       let result;
       try {
@@ -1492,7 +1534,7 @@ class PersistentCodexAgent extends EventEmitter {
       } finally {
         subscription.cleanup();
       }
-      if (session.active !== active || active.abortController.signal.aborted) return;
+      if (!ownsTurn()) return;
       if (active.factGeneration !== factGeneration) {
         this.client.respond(request.id, {
           success: true,
@@ -1536,7 +1578,7 @@ class PersistentCodexAgent extends EventEmitter {
       this._emit("activity", { status: "tool_completed", elapsedMs: Date.now() - active.toolStartedAtMs });
     } catch (error) {
       if (this._fatalOnRunnerTermination(error)) return;
-      if (session.active !== active || active.abortController.signal.aborted) return;
+      if (!ownsTurn()) return;
       if (active.factGeneration !== factGeneration) {
         this.client.respond(request.id, {
           success: true,
