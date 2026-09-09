@@ -5,6 +5,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { performance } = require("node:perf_hooks");
 const util = require("node:util");
 const { enforceCompany } = require("../security/access-control.js");
 const { assertNoSensitiveFactValues } = require("../security/fact-privacy.js");
@@ -230,6 +231,45 @@ async function emitProgress(callback, rawEvent) {
   const event = normalizeRunnerProgressEvent(rawEvent);
   if (!event) return;
   try { await callback(event); } catch { /* 进度发送失败不能中断真实查询 */ }
+}
+
+// Observers are not part of runner execution or process-tree cleanup. A slow
+// consumer gets one in-flight update and the latest pending update, never a
+// growing backlog that can occupy the gateway's only runner slot.
+function createProgressObserver(callback) {
+  let pending = null;
+  let running = false;
+  let stopped = false;
+  function pump() {
+    if (running || stopped || pending === null) return;
+    const event = pending;
+    pending = null;
+    running = true;
+    let result;
+    try { result = callback(event); } catch { result = undefined; }
+    Promise.resolve(result).catch(() => {}).finally(() => {
+      running = false;
+      pump();
+    });
+  }
+  return {
+    publish(event) {
+      if (stopped || typeof callback !== "function") return;
+      pending = event;
+      pump();
+    },
+    stop() {
+      stopped = true;
+      pending = null;
+    }
+  };
+}
+
+function notifyTiming(callback, event) {
+  if (typeof callback !== "function") return;
+  // Defer observers so reentrant calls cannot mutate the scheduler halfway
+  // through a state transition; rejected observer promises remain isolated.
+  Promise.resolve().then(() => callback(Object.freeze(event))).catch(() => {});
 }
 
 async function drainProgressFile(progressPath, state, callback) {
@@ -550,11 +590,35 @@ function createToolGateway(options = {}, testOnlyCapability) {
 
   function settleSubscriber(entry, subscriber, error, value) {
     if (!subscriber || subscriber.settled) return;
+    const stage = !error ? "completed"
+      : error.code === "XBB_QUERY_QUEUE_TIMEOUT" ? "expired"
+        : isAbortError(error, subscriber.signal) ? "cancelled" : "failed";
+    emitSubscriberTiming(subscriber, stage);
     subscriber.settled = true;
+    subscriber.progress.stop();
     entry.subscribers.delete(subscriber.id);
     if (subscriber.signal && subscriber.onAbort) subscriber.signal.removeEventListener("abort", subscriber.onAbort);
     if (error) subscriber.reject(error);
     else subscriber.resolve(value);
+  }
+
+  function emitSubscriberTiming(subscriber, stage) {
+    const atMs = performance.now();
+    const startedAtMs = subscriber.startedAtMs;
+    notifyTiming(subscriber.timingCallback, {
+      stage,
+      elapsedMs: Math.max(0, Math.round(atMs - subscriber.subscribedAtMs)),
+      queueWaitMs: Math.max(0, Math.round((startedAtMs ?? atMs) - subscriber.subscribedAtMs)),
+      runMs: startedAtMs === null ? 0 : Math.max(0, Math.round(atMs - startedAtMs)),
+      shared: subscriber.shared
+    });
+  }
+
+  function emitSchedulingState(subscriber, stage) {
+    emitSubscriberTiming(subscriber, stage);
+    if (subscriber.schedulingProgress) {
+      subscriber.progress.publish(Object.freeze({ stage: stage === "queued" ? "queued" : "query_started" }));
+    }
   }
 
   function abortEntryWithoutSubscribers(entry) {
@@ -584,8 +648,16 @@ function createToolGateway(options = {}, testOnlyCapability) {
         settled: false,
         signal,
         onAbort: null,
-        progressCallback: typeof invocation?.onProgress === "function" ? invocation.onProgress : null
+        progress: createProgressObserver(invocation?.onProgress),
+        timingCallback: invocation?.onTiming,
+        schedulingProgress: invocation?.schedulingProgress === true,
+        subscribedAtMs: performance.now(),
+        startedAtMs: null,
+        shared: entry.subscribers.size > 0
       };
+      if (subscriber.shared) {
+        for (const existing of entry.subscribers.values()) existing.shared = true;
+      }
       if (signal) {
         subscriber.onAbort = () => {
           settleSubscriber(entry, subscriber, signal.reason instanceof Error ? signal.reason : abortError());
@@ -594,11 +666,19 @@ function createToolGateway(options = {}, testOnlyCapability) {
         signal.addEventListener("abort", subscriber.onAbort, { once: true });
       }
       entry.subscribers.set(subscriber.id, subscriber);
+      if (entry.state === "running") {
+        subscriber.startedAtMs = subscriber.subscribedAtMs;
+        emitSchedulingState(subscriber, "started");
+      } else if (entry.state === "queued") {
+        emitSchedulingState(subscriber, "queued");
+      }
     });
   }
 
-  async function broadcastProgress(entry, event) {
-    await Promise.all([...entry.subscribers.values()].map((subscriber) => emitProgress(subscriber.progressCallback, event)));
+  function broadcastProgress(entry, rawEvent) {
+    const event = normalizeRunnerProgressEvent(rawEvent);
+    if (!event) return;
+    for (const subscriber of [...entry.subscribers.values()]) subscriber.progress.publish(event);
   }
 
   function finishEntry(entry, error, value) {
@@ -643,6 +723,11 @@ function createToolGateway(options = {}, testOnlyCapability) {
     entry.queueTimer = null;
     entry.state = "running";
     runningQueries += 1;
+    const startedAtMs = performance.now();
+    for (const subscriber of [...entry.subscribers.values()]) {
+      subscriber.startedAtMs = startedAtMs;
+      emitSchedulingState(subscriber, "started");
+    }
     Promise.resolve(executeQuery(entry.input, entry.company, (event) => broadcastProgress(entry, event), entry.controller.signal)).then(
       (value) => finishEntry(entry, null, value),
       (error) => finishEntry(entry, error)
@@ -680,15 +765,33 @@ function createToolGateway(options = {}, testOnlyCapability) {
     }, queueTtlMs);
     entry.queueTimer.unref?.();
     queue.push(entry);
+    for (const subscriber of [...entry.subscribers.values()]) emitSchedulingState(subscriber, "queued");
   }
 
+  // Optional invocation observers never participate in query completion.
+  // onTiming receives only stage/duration/shared fields. Durations are local
+  // to this subscription: late joiners do not inherit another caller's wait.
+  // runMs includes runner retries, validation and confirmed isolation cleanup;
+  // the slot is released only after all of those have settled. Existing
+  // onProgress sequences stay unchanged unless schedulingProgress is true.
   return async function queryXbb(rawInput, access, invocation = {}) {
+    const rejectTiming = (stage = "rejected") => notifyTiming(invocation?.onTiming, {
+      stage, elapsedMs: 0, queueWaitMs: 0, runMs: 0, shared: false
+    });
     if (invocation?.signal?.aborted) {
+      rejectTiming("cancelled");
       throw invocation.signal.reason instanceof Error ? invocation.signal.reason : abortError();
     }
-    const input = validateRequest(rawInput);
-    const company = enforceCompany(access, input.company);
-    if (failClosedCause) throw gatewayFailClosedError(failClosedCause);
+    let input;
+    let company;
+    try {
+      input = validateRequest(rawInput);
+      company = enforceCompany(access, input.company);
+      if (failClosedCause) throw gatewayFailClosedError(failClosedCause);
+    } catch (error) {
+      rejectTiming();
+      throw error;
+    }
     const key = hashCanonical({
       input: { ...input, company: company || null },
       access: {
@@ -701,11 +804,13 @@ function createToolGateway(options = {}, testOnlyCapability) {
       if (existing.state === "queued" || (existing.state === "running" && !existing.controller.signal.aborted)) {
         return addSubscriber(existing, invocation);
       }
+      rejectTiming();
       throw abortError("相同范围的销帮帮查询正在取消，请等待最新请求接替。");
     }
     if (runningQueries >= maxConcurrentQueries && queue.length >= maxQueuedQueries) {
       const error = new Error(`销帮帮查询排队已达到安全上限（${maxQueuedQueries}）。`);
       error.code = "XBB_QUERY_QUEUE_FULL";
+      rejectTiming();
       throw error;
     }
     const entry = {

@@ -11,8 +11,14 @@
     "start": "node shared/wecom/server.js",
     "smoke:app-server": "node scripts/smoke-codex-app-server.js",
     "smoke:business": "node scripts/smoke-codex-app-server.js --business",
-    "test": "node tests/verify-facts.js && node tests/verify-multi-period-consumers.js && node tests/verify-charts.js && node tests/verify-access-control.js && node tests/verify-rag-knowledge-base.js && node tests/verify-recovery-answer.js && node tests/verify-state-recovery.js && node tests/verify-codex-app-server.js && node tests/verify-message-store.js && node tests/verify-wecom-long-connection.js && node tests/verify-watchdog-launcher.js && powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\tests\\verify-secure-config.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\tests\\verify-hidden-task.ps1",
-    "verify": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\verify-skill.ps1"
+    "test": "node scripts/run-tests.js",
+    "test:unit": "node scripts/run-tests.js --group unit",
+    "test:integration": "node scripts/run-tests.js --group integration",
+    "test:windows": "node scripts/run-tests.js --group windows",
+    "test:list": "node scripts/run-tests.js --list",
+    "verify": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\verify-skill.ps1",
+    "verify:production": "npm run verify && npm test",
+    "bench:production": "node scripts/benchmark-production.js"
   },
   "dependencies": {
     "@wecom/aibot-node-sdk": "1.0.7",

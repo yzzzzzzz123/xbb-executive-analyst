@@ -10,6 +10,7 @@ const { LocalAppServerHost, buildAppServerCommand } = require("../shared/codex/a
 const { PersistentCodexAgent, principalKeyFromUserId } = require("../shared/codex/persistent-agent.js");
 const { sanitizeCodexEnvironment } = require("../shared/codex/runtime.js");
 const { classifyModelError } = require("../shared/codex/model-error.js");
+const { parseMonths, planFastQuery } = require("../shared/xbb/fast-query-plan.js");
 const { emptyState, loadAgentState, saveAgentState } = require("../shared/codex/state-store.js");
 
 function nextImmediate() {
@@ -124,6 +125,22 @@ class FakeAppServerClient extends EventEmitter {
 }
 
 (async () => {
+  const monthTestNow = new Date("2026-09-09T00:00:00Z");
+  assert.deepEqual(planFastQuery("集团8月业绩排名", monthTestNow).months, ["2026-08"]);
+  assert.deepEqual(planFastQuery("集团8月业绩排名并区分课程和咨询", monthTestNow).months, ["2026-08"], "裸月份覆盖集团排名的默认全年范围");
+  assert.deepEqual(parseMonths("今年8月", monthTestNow), ["2026-08"]);
+  assert.deepEqual(parseMonths("去年8月", monthTestNow), ["2025-08"]);
+  assert.deepEqual(planFastQuery("去年8月商机质量", monthTestNow).months, ["2025-08"]);
+  assert.throws(() => planFastQuery("去年8月业绩排名", monthTestNow), /不能混入更早月份/, "旧业绩越界必须拒绝而不是改查今年");
+  assert.deepEqual(parseMonths("8月和9月", monthTestNow), ["2026-08", "2026-09"]);
+  assert.deepEqual(parseMonths("2026年8月和2026年9月", monthTestNow), ["2026-08", "2026-09"]);
+  assert.throws(() => parseMonths("8、9月", monthTestNow), /逐个写明月份/);
+  assert.throws(() => parseMonths("2026年8月和9月", monthTestNow), /每个月写明年份/);
+  assert.deepEqual(parseMonths("最近3月", monthTestNow), ["2026-07", "2026-08", "2026-09"]);
+  for (const invalidPeriod of ["10月", "明年8月"]) assert.throws(() => parseMonths(invalidPeriod, monthTestNow), /晚于当前上海月份/);
+  for (const invalidPeriod of ["0月", "13月"]) assert.throws(() => parseMonths(invalidPeriod, monthTestNow), /月份必须/);
+  assert.deepEqual(parseMonths("9月", new Date("2026-08-31T16:00:00Z")), ["2026-09"], "当前年份和未来边界使用上海月份");
+
   const verifier = "a".repeat(64);
   const command = buildAppServerCommand({ command: "codex.exe", argsPrefix: [] }, "ws://127.0.0.1:43123", verifier);
   assert.deepEqual(command.args, ["app-server", "--listen", "ws://127.0.0.1:43123", "--ws-auth", "capability-token", "--ws-token-sha256", verifier]);
@@ -492,7 +509,7 @@ class FakeAppServerClient extends EventEmitter {
     assert.equal(fakeClient.startTurnCalls[1].params.input[0].type, "text");
     assert.match(fakeClient.startTurnCalls[1].params.input[0].text, /能力路由】通用 Codex/);
     assert.doesNotMatch(fakeClient.startTurnCalls[1].params.input[0].text, /销帮帮 Skill RAG 适用规则/);
-    assert.equal(fakeClient.startTurnCalls[1].params.effort, "medium");
+    assert.equal(fakeClient.startTurnCalls[1].params.effort, "none", "严格匹配的简单问候不消耗复杂推理预算");
     assert.deepEqual(fakeClient.startTurnCalls[1].params.sandboxPolicy, { type: "readOnly", networkAccess: true });
     assert.deepEqual(fakeClient.startTurnCalls[1].params.outputSchema.required, ["answer", "chart"]);
     assert.equal(fakeClient.startTurnCalls[1].params.outputSchema.properties.chart.type, "null");
@@ -740,6 +757,137 @@ class FakeAppServerClient extends EventEmitter {
     await agent.close();
     assert.equal(fakeClient.connected, false);
 
+    const contextClient = new FakeAppServerClient();
+    let contextQueryCalls = 0;
+    const contextAgent = isolatedAgent("task-context", contextClient, {
+      queryXbb: async () => { contextQueryCalls += 1; return readyPerformancePack(); }
+    });
+    await contextAgent.start();
+    const contextPrincipal = principalKeyFromUserId("task-context-user", access);
+    const databaseSource = "优化数据库 notes 的表结构。必须兼容旧接口。\n\n```sql\nCREATE TABLE notes (body TEXT);\n```\n\n不能停机，必须提供回退方案。";
+    const databaseStart = contextAgent.answer({ question: databaseSource, access, principalKey: contextPrincipal });
+    await nextImmediate();
+    const databaseParams = contextClient.startTurnCalls.at(-1).params;
+    assert.equal(databaseParams.effort, "medium", "复杂通用任务必须保留配置推理强度");
+    assert.equal(databaseParams.approvalPolicy, "never");
+    assert.deepEqual(databaseParams.sandboxPolicy, { type: "readOnly", networkAccess: true });
+    assert.equal(databaseParams.input.length, 1, "数据库通用任务不注入经营 Skill");
+    assert.match(databaseParams.input[0].text, /现状[\s\S]*影响[\s\S]*迁移与回退[\s\S]*验证[\s\S]*执行条件/u);
+    const databaseCorrection = contextAgent.answer({ question: "补充：不要删除 notes 表，保持旧字段可读。", access, principalKey: contextPrincipal });
+    await nextImmediate();
+    assert.match((await databaseStart).answer, /最新一条消息/u);
+    contextClient.complete("thread-1", "turn-1", JSON.stringify({ answer: "已完成迁移草案；模型输出标记不应进入续接摘要。", chart: null }));
+    await databaseCorrection;
+    const contextSession = contextAgent.sessions.get(contextPrincipal);
+    assert.match(contextSession.taskContext.goal, /优化数据库 notes/u, "steer 不能覆盖初始目标");
+    assert.match(contextSession.taskContext.corrections.at(-1), /不要删除 notes 表/u);
+    assert.doesNotMatch(JSON.stringify(contextSession.taskContext), /CREATE TABLE|模型输出标记/u);
+    assert.doesNotMatch(fs.readFileSync(contextAgent.statePath, "utf8"), /优化数据库|taskContext|不要删除/u, "任务摘要只保存在内存，不扩大历史持久化");
+    contextSession.turnCount = 24;
+    const continuedDatabase = contextAgent.answer({ question: "继续，按刚才方案补充验证步骤。", access, principalKey: contextPrincipal });
+    await nextImmediate();
+    const continuedParams = contextClient.startTurnCalls.at(-1).params;
+    assert.equal(continuedParams.threadId, "thread-2");
+    assert.match(continuedParams.input[0].text, /用户任务续接摘要/u);
+    assert.match(continuedParams.input[0].text, /优化数据库 notes/u);
+    assert.match(continuedParams.input[0].text, /不能停机/u);
+    assert.match(continuedParams.input[0].text, /不要删除 notes 表/u);
+    assert.doesNotMatch(continuedParams.input[0].text, /CREATE TABLE|模型输出标记/u);
+    contextClient.complete("thread-2", "turn-2", JSON.stringify({ answer: "已按原目标与最新约束补充验证草案，未执行数据库变更。", chart: null }));
+    await continuedDatabase;
+    await assert.rejects(contextAgent.answer({ question: "继续", access: { scope: "companies", companies: ["公司A"] }, principalKey: contextPrincipal }), /授权范围已变化/u);
+    assert.equal(contextClient.startTurnCalls.length, 2, "权限不一致的同 key 请求不得进入模型");
+    const unrelatedGreeting = contextAgent.answer({ question: "你好", access, principalKey: contextPrincipal });
+    await nextImmediate();
+    assert.equal(contextClient.startTurnCalls.at(-1).params.effort, "none");
+    assert.doesNotMatch(contextClient.startTurnCalls.at(-1).params.input[0].text, /复杂数据库|用户任务续接摘要/u, "问候不套复杂任务模板");
+    contextClient.complete("thread-2", "turn-3", JSON.stringify({ answer: "你好。", chart: null }));
+    await unrelatedGreeting;
+    assert.equal(contextQueryCalls, 0);
+    const contextBusiness = contextAgent.answer({ question: "集团9月业绩排名", access, principalKey: contextPrincipal });
+    await nextImmediate();
+    assert.doesNotMatch(contextClient.startTurnCalls.at(-1).params.input[0].text, /优化数据库|不要删除 notes/u);
+    contextClient.complete("thread-2", "turn-4", JSON.stringify({ answer: "经营测试结论。", chart: null }));
+    await contextBusiness;
+    contextSession.turnCount = 24;
+    const businessContinuity = contextAgent.answer({ question: "继续", access, principalKey: contextPrincipal });
+    await nextImmediate();
+    assert.equal(contextClient.startTurnCalls.at(-1).params.threadId, "thread-3");
+    assert.match(contextClient.startTurnCalls.at(-1).params.input[0].text, /集团9月业绩排名/u);
+    assert.doesNotMatch(contextClient.startTurnCalls.at(-1).params.input[0].text, /"total":123|经营测试结论|优化数据库/u, "经营续接仅携意图，不携旧事实或跨路由材料");
+    contextClient.complete("thread-3", "turn-5", JSON.stringify({ answer: "需按当前问题重新核实事实。", chart: null }));
+    await businessContinuity;
+    await contextAgent.close();
+
+    const timingClient = new FakeAppServerClient();
+    const originalTimings = [];
+    const steeredTimings = [];
+    let timingCalls = 0;
+    let delayedTimingInvocation;
+    let releaseTimingQuery;
+    const timingAgent = isolatedAgent("query-timing-forwarding", timingClient, {
+      queryXbb: async (args, _access, invocation) => {
+        timingCalls += 1;
+        invocation.onTiming({ stage: "started", elapsedMs: 2, queueWaitMs: 2, runMs: 0, shared: false });
+        if (timingCalls === 2) {
+          delayedTimingInvocation = invocation;
+          return new Promise((resolve) => { releaseTimingQuery = () => resolve(readyPerformancePack(args.months[0])); });
+        }
+        invocation.onTiming({ stage: "completed", elapsedMs: 11, queueWaitMs: 3, runMs: 8, shared: false });
+        return readyPerformancePack(args.months[0]);
+      }
+    });
+    await timingAgent.start();
+    const timingPrincipal = principalKeyFromUserId("query-timing-user", access);
+    const timingAnswer = timingAgent.answer({ question: "集团8月业绩排名", access, principalKey: timingPrincipal, onTiming: (event) => {
+      originalTimings.push(event);
+      return new Promise(() => {});
+    } });
+    await nextImmediate();
+    assert.deepEqual(timingAgent.sessions.get(timingPrincipal).active.queryPlan.months, ["2026-08"], "首次裸月份必须真正选中8月");
+    assert.deepEqual(originalTimings.map((event) => event.stage), ["completed"], "预取终态时长应转发，阶段事件不重复计时");
+    assert.equal(timingClient.startTurnCalls.length, 1, "未完成的外部 timing Promise 不得阻塞模型启动");
+    timingClient.emit("serverRequest", { id: 991, method: "item/tool/call", params: {
+      threadId: "thread-1", turnId: "turn-1", tool: "query_xbb", arguments: { months: ["2026-09"], domains: ["performance"] }
+    } });
+    await waitUntil(() => Boolean(delayedTimingInvocation), "动态查询应建立独立计时订阅");
+    const timingSteer = timingAgent.answer({ question: "集团9月业绩排名", access, principalKey: timingPrincipal, onTiming: (event) => {
+      steeredTimings.push(event);
+      throw new Error("offline observer failure");
+    } });
+    await nextImmediate();
+    assert.match((await timingAnswer).answer, /最新一条消息/);
+    assert.equal(delayedTimingInvocation.signal.aborted, false, "相同查询范围的 steer 不取消已有查询");
+    delayedTimingInvocation.onTiming({ stage: "completed", elapsedMs: 37, queueWaitMs: 12, runMs: 25, shared: true });
+    delayedTimingInvocation.onTiming({ stage: "failed", elapsedMs: 38, queueWaitMs: 12, runMs: 26, shared: true });
+    releaseTimingQuery();
+    await waitUntil(() => timingClient.responses.some((item) => item.id === 991), "未完成的 observer 不能阻塞动态工具返回");
+    assert.equal(originalTimings.length, 2);
+    assert.equal(originalTimings.at(-1).runMs, 25);
+    assert.equal(steeredTimings.length, 0, "新 waiter 不得继承 steer 前查询的整段耗时");
+    timingClient.emit("serverRequest", { id: 992, method: "item/tool/call", params: {
+      threadId: "thread-1", turnId: "turn-1", tool: "query_xbb", arguments: { months: ["2026-07"], domains: ["performance"] }
+    } });
+    await waitUntil(() => timingClient.responses.some((item) => item.id === 992), "timing observer 同步抛错不能阻塞新动态查询");
+    assert.equal(steeredTimings.length, 1);
+    const waitersBeforeInvalidSteer = timingAgent.sessions.get(timingPrincipal).active.waiters;
+    const steerCountBeforeInvalid = timingClient.steerTurnCalls.length;
+    await assert.rejects(timingAgent.answer({ question: "改成9999年12月业绩排名", access, principalKey: timingPrincipal }), /晚于当前上海月份/);
+    assert.equal(timingClient.steerTurnCalls.length, steerCountBeforeInvalid, "未来月份不能发送到活动模型Turn");
+    assert.equal(timingAgent.sessions.get(timingPrincipal).active.waiters, waitersBeforeInvalidSteer, "无效修正保留原答复所有者");
+    timingClient.complete("thread-1", "turn-1", JSON.stringify({ answer: "计时隔离验证完成。", chart: null }));
+    assert.match((await timingSteer).answer, /计时隔离验证完成/, "无效修正后原请求仍正常完成");
+    const septemberAnswer = timingAgent.answer({ question: "集团9月业绩排名", access, principalKey: timingPrincipal });
+    await nextImmediate();
+    const augustCorrection = timingAgent.answer({ question: "改成集团8月业绩排名", access, principalKey: timingPrincipal });
+    await nextImmediate();
+    assert.match((await septemberAnswer).answer, /最新一条消息/);
+    assert.deepEqual(timingAgent.sessions.get(timingPrincipal).active.queryPlan.months, ["2026-08"], "活动steer中的裸8月不能误当当前9月");
+    assert.equal(timingAgent.sessions.get(timingPrincipal).active.latestFactView, null, "月份修正必须撤销9月旧事实");
+    timingClient.complete("thread-1", "turn-2", JSON.stringify({ answer: "已将分析期间修正为8月，需按8月核实数据。", chart: null }));
+    await augustCorrection;
+    await timingAgent.close();
+
     const schemaClient = new FakeAppServerClient();
     let schemaQueryCalls = 0;
     const schemaAgent = isolatedAgent("schema-only-route", schemaClient, {
@@ -863,6 +1011,9 @@ class FakeAppServerClient extends EventEmitter {
     const prefetchClient = new FakeAppServerClient();
     const prefetchCalls = [];
     let firstPrefetchSignal;
+    let firstPrefetchTiming;
+    const oldPrefetchTimings = [];
+    const newPrefetchTimings = [];
     let releaseFirstPrefetch;
     let markFirstPrefetchStarted;
     const firstPrefetchStarted = new Promise((resolve) => { markFirstPrefetchStarted = resolve; });
@@ -871,9 +1022,11 @@ class FakeAppServerClient extends EventEmitter {
         prefetchCalls.push(args);
         if (prefetchCalls.length === 1) {
           firstPrefetchSignal = invocation.signal;
+          firstPrefetchTiming = invocation.onTiming;
           markFirstPrefetchStarted();
           return new Promise((resolve) => { releaseFirstPrefetch = () => resolve(readyPerformancePack(args.months[0], 901)); });
         }
+        invocation.onTiming({ stage: "completed", elapsedMs: 8, queueWaitMs: 2, runMs: 6, shared: false });
         return readyPerformancePack(args.months[0], 802);
       }
     });
@@ -883,18 +1036,24 @@ class FakeAppServerClient extends EventEmitter {
       question: "分析华东公司2026年1—8月业绩排名",
       access,
       principalKey: prefetchPrincipal,
-      messageId: "prefetch-old"
+      messageId: "prefetch-old",
+      onTiming: (event) => oldPrefetchTimings.push(event)
     });
     await firstPrefetchStarted;
     const latestPrefetch = prefetchAgent.answer({
       question: "改成只看9月",
       access,
       principalKey: prefetchPrincipal,
-      messageId: "prefetch-new"
+      messageId: "prefetch-new",
+      onTiming: (event) => newPrefetchTimings.push(event)
     });
     assert.match((await supersededPrefetch).answer, /最新一条消息/);
     for (let index = 0; index < 4; index += 1) await nextImmediate();
     assert.equal(firstPrefetchSignal.aborted, true, "范围变化必须立即取消旧预取订阅");
+    firstPrefetchTiming({ stage: "completed", elapsedMs: 99, queueWaitMs: 1, runMs: 98, shared: false });
+    assert.equal(oldPrefetchTimings.length, 0, "被取代和取消的旧预取不能补发迟到时长");
+    assert.equal(newPrefetchTimings.length, 1);
+    assert.equal(newPrefetchTimings[0].runMs, 6, "新请求只记录自己订阅的查询时长");
     assert.equal(prefetchCalls.length, 2, "旧预取即便忽略 Abort，新范围也必须立即开始");
     assert.deepEqual(prefetchCalls[0], { months: ["2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06", "2026-07", "2026-08"], domains: ["performance"] });
     assert.deepEqual(prefetchCalls[1], { months: ["2026-09"], domains: ["performance"] });

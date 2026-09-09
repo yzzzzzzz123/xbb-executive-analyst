@@ -202,7 +202,45 @@ function isBusinessFollowUp(question) {
   return Boolean(text) && text.length <= 28 && BUSINESS_FOLLOW_UP_PATTERNS.some((pattern) => pattern.test(text));
 }
 
+function unquotedInstructionText(question) {
+  let fence = null;
+  const prose = String(question || "").split(/\r?\n/).map((line) => {
+    const marker = /^[ \t]*(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence) {
+      if (marker && marker[1][0] === fence.character && marker[1].length >= fence.length && !marker[2].trim()) fence = null;
+      return "";
+    }
+    if (marker) { fence = { character: marker[1][0], length: marker[1].length }; return ""; }
+    if (/^[ \t]*>/.test(line)) return "";
+    return line;
+  }).join("\n");
+  return prose
+    .replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|“[^”]*”|‘[^’]*’|「[^」]*」|『[^』]*』|`+[^`]*`+/g, " ")
+    .replace(/\/\*[\s\S]*?(?:\*\/|$)/g, " ")
+    .replace(/(?:^|[\s;])(?:\/\/|--)[^\n]*/g, " ");
+}
+
+function isExplicitXbbQueryDenied(question) {
+  // Only a complete, short imperative clause changes capabilities. Mentions of
+  // a prohibition inside code, quotes or rule examples remain source material.
+  const text = unquotedInstructionText(question).replace(/[^\S\n]+/g, "");
+  const pattern = /(?:^|[，,、；;。！!：:\n])(?:请|麻烦你|麻烦|帮我|本次|这次|此次|本轮|现在|先|暂时|也|并且|并|你|务必){0,4}(?:不要|不用|无需|不得|禁止|不许|别|不)(?:再|去|直接|实际|真的)?(?:查询|读取|访问|调用|获取|读|查)销帮帮(?:的?(?:实时)?(?:数据|接口|openapi|api))?(?=$|[，,、；;。！!\n])/giu;
+  for (const match of text.matchAll(pattern)) {
+    const preceding = text.slice(Math.max(0, match.index - 96), match.index).split(/[。！？!\n]/).at(-1);
+    if (/(?:文档|规则|合同|原文|错误示例|反例|引用|代码|字符串|注释)[^，,；;：:]{0,24}(?:写明|写着|写道|提到|说明|说|包含|如下|内容|是|为|例如|示例|要求)[，,；;：:]*$/.test(preceding)) continue;
+    if (/^(?:以下(?:是|为)?)?(?:例如|比如|示例|反例|原文|引用|代码|注释)(?:如下)?[：:]*$/.test(preceding)) continue;
+    if (/(?:不是|并非|不意味着|不代表)(?:说|要求)?[，,；;：:]*$/.test(preceding)) continue;
+    const following = text.slice(match.index + match[0].length);
+    if (/^[，,；;](?:这句话|这句|上述表述)(?:只是|是)(?:一个)?(?:错误)?(?:示例|反例|引用)/.test(following)) continue;
+    return true;
+  }
+  return false;
+}
+
 function routeSkill(question, previousMode = null) {
+  if (isExplicitXbbQueryDenied(question)) {
+    return Object.freeze({ mode: "general", reason: "explicit-xbb-query-denial" });
+  }
   if (isExplicitXbbQuestion(question)) {
     return Object.freeze({ mode: "xbb", reason: "explicit-business-intent" });
   }
@@ -220,6 +258,7 @@ module.exports = {
   XBB_FIELD_IDS,
   isBusinessFollowUp,
   isExplicitXbbQuestion,
+  isExplicitXbbQueryDenied,
   isKnownXbbFieldQuestion,
   routeSkill
 };

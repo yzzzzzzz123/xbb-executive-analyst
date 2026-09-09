@@ -8,10 +8,19 @@ $projectRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Pa
 $mainSkillRoot = Join-Path $projectRoot 'skills\xbb-executive-analyst'
 $chartSkillRoot = Join-Path $projectRoot 'skills\xbb-executive-chart'
 $skillRoots = @($mainSkillRoot, $chartSkillRoot)
-$codexRoot = if ([string]::IsNullOrWhiteSpace([string]$env:CODEX_HOME)) { Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex' } else { [IO.Path]::GetFullPath($env:CODEX_HOME) }
-$validator = Join-Path $codexRoot 'skills\.system\skill-creator\scripts\quick_validate.py'
+$validator = Join-Path $projectRoot 'scripts\validate-skill.py'
 $nodePath = (Get-Command node -ErrorAction Stop).Source
-$pyPath = (Get-Command py -ErrorAction Stop).Source
+$pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+$pythonArguments = @()
+if ($null -ne $pythonCommand -and $pythonCommand.Source -match '\\Microsoft\\WindowsApps\\') {
+    # A Microsoft Store alias is not a usable Python interpreter.
+    $pythonCommand = $null
+}
+if ($null -eq $pythonCommand) {
+    $pythonCommand = Get-Command py -ErrorAction Stop
+    $pythonArguments = @('-3')
+}
+$pythonPath = $pythonCommand.Source
 
 function Find-ProjectTextMatch(
     [string]$Pattern,
@@ -74,6 +83,7 @@ $powershellFiles = @(
     Get-ChildItem -LiteralPath (Join-Path $projectRoot 'scripts') -Filter '*.ps1' -File -Recurse
     Get-ChildItem -LiteralPath (Join-Path $projectRoot 'shared') -Filter '*.ps1' -File -Recurse
     Get-ChildItem -LiteralPath (Join-Path $projectRoot 'skills') -Filter '*.ps1' -File -Recurse
+    Get-ChildItem -LiteralPath (Join-Path $projectRoot 'tests') -Filter '*.ps1' -File -Recurse
 )
 foreach ($file in $powershellFiles) {
     $parseTokens = $null
@@ -83,19 +93,11 @@ foreach ($file in $powershellFiles) {
     if (@($parseErrors).Count -gt 0) { throw "PowerShell syntax check failed: $($file.FullName) - $($parseErrors -join '; ')" }
 }
 
-Push-Location $projectRoot
-try {
-    & npm.cmd test
-    if ($LASTEXITCODE -ne 0) { throw 'Project tests failed.' }
-} finally {
-    Pop-Location
-}
-
 $previousPythonUtf8 = $env:PYTHONUTF8
 try {
     $env:PYTHONUTF8 = '1'
     foreach ($skillRoot in $skillRoots) {
-        & $pyPath -3 $validator $skillRoot
+        & $pythonPath @pythonArguments $validator $skillRoot
         if ($LASTEXITCODE -ne 0) { throw "Skill quick validation failed: $skillRoot" }
     }
 } finally {
@@ -120,7 +122,7 @@ Write-Output ([ordered]@{
     success = $true
     skills = @('xbb-executive-analyst', 'xbb-executive-chart')
     htmlFiles = 0
-    projectTests = 'passed'
+    projectTests = 'separate: npm test (or npm run verify:production for the complete gate)'
     quickValidate = 'passed'
     javascriptFiles = $javascriptFiles.Count
     powershellFiles = $powershellFiles.Count

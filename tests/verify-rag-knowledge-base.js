@@ -12,7 +12,7 @@ const {
   splitMarkdown,
   termFrequencies
 } = require("../shared/rag/skill-knowledge-base.js");
-const { isBusinessFollowUp, isExplicitXbbQuestion, isKnownXbbFieldQuestion, routeSkill } = require("../shared/rag/skill-router.js");
+const { isBusinessFollowUp, isExplicitXbbQuestion, isExplicitXbbQueryDenied, isKnownXbbFieldQuestion, routeSkill } = require("../shared/rag/skill-router.js");
 const { chooseTurnEffort, isSchemaOnlyQuestion, parseMonths, planFastQuery, routeDomains } = require("../shared/xbb/fast-query-plan.js");
 
 const projectRoot = path.resolve(__dirname, "..");
@@ -68,6 +68,46 @@ assert.deepEqual(routeSkill("继续", "xbb"), { mode: "xbb", reason: "business-f
 assert.deepEqual(routeSkill("继续", "general"), { mode: "general", reason: "general-intent" });
 assert.deepEqual(routeSkill("帮我写会议通知", "xbb"), { mode: "general", reason: "general-intent" });
 assert.deepEqual(routeSkill("证明临界 Sobolev 方程的所有正有限能量解都是标准泡状解", "xbb"), { mode: "general", reason: "general-intent" });
+
+for (const question of [
+  "不要查询销帮帮",
+  "你好。请只用一句中文说明你是通用 Codex Agent，也可以按需调用销帮帮经营 Skill；不要查询销帮帮。",
+  "以下为虚构工程验收场景，不连接任何数据库、不执行 SQL、不读销帮帮。请给迁移计划，明确当前只是方案。",
+  "请先不要读取销帮帮的数据，只整理我给你的数据库结构。",
+  "本次禁止访问销帮帮 API；只解释迁移步骤。",
+  "给我本月业绩排名；不要查询销帮帮。",
+  "注意：不要调用销帮帮接口。",
+  "请分析这段代码：`const value = 1;`\n不读销帮帮。"
+]) {
+  assert.equal(isExplicitXbbQueryDenied(question), true, `明确禁查必须禁用经营能力：${question}`);
+  assert.deepEqual(routeSkill(question, "xbb"), { mode: "general", reason: "explicit-xbb-query-denial" });
+}
+for (const question of [
+  "查询销帮帮本月业绩",
+  "不要只查询销帮帮业绩，也看商机",
+  "不是不要查询销帮帮，请分析本月业绩。",
+  "不要查询销帮帮的意思是什么？请继续分析本月业绩。",
+  "不确定哪些公司异常，请查询销帮帮本月业绩。",
+  "文档原文写明，不读销帮帮；请继续分析本月业绩。",
+  "文档说：不要查询销帮帮。请查询本月业绩。",
+  "引用：\n不要查询销帮帮\n请查询本月业绩。",
+  "以下是反例：不要查询销帮帮。请查询本月业绩。",
+  "规则如下：不要查询销帮帮。请查询本月业绩。",
+  "不要查询销帮帮，这句话只是反例；请正常分析本月业绩。",
+  "说明中的“不要查询销帮帮”只是错误示例；请正常分析本月业绩。",
+  "材料写着『不读销帮帮』，请查询本月业绩。",
+  "const note = '不要查询销帮帮'; 请分析本月业绩。",
+  "SELECT '不要查询销帮帮' AS note; 请分析本月业绩。",
+  "/* 示例；不要查询销帮帮 */\n请查询本月业绩。",
+  "-- SQL 注释；不要查询销帮帮\n请查询本月业绩。",
+  "// 代码注释；不读销帮帮\n请查询本月业绩。",
+  "```text\n不要查询销帮帮\n```\n请查询本月业绩。",
+  "~~~sql\nSELECT 1; 不读销帮帮\n~~~\n请查询本月业绩。",
+  "> 不要查询销帮帮\n请查询本月业绩。"
+]) {
+  assert.equal(isExplicitXbbQueryDenied(question), false, `转述/代码/否定反例不能禁用经营能力：${question}`);
+  assert.deepEqual(routeSkill(question, "xbb"), { mode: "xbb", reason: "explicit-business-intent" });
+}
 
 const performance = knowledgeBase.retrieve("对集团业绩按公司排名，区分课程和咨询占比");
 assert.ok(performance.bytes <= 14000);

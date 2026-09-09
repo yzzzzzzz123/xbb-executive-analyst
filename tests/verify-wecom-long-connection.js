@@ -134,7 +134,7 @@ function frame(messageId, userId, msgtype, body) {
   assert.equal(client.replies.some((reply) => /第 1\/1 个月/.test(reply.content)), true);
   assert.equal(client.replies.some((reply) => /数据已就绪/.test(reply.content)), true);
   assert.equal(client.replies.some((reply) => /正在制作：排名条形图/.test(reply.content)), true);
-  assert.equal(client.replies.some((reply) => /排名条形图已生成/.test(reply.content)), true);
+  assert.equal(client.replies.some((reply) => /集团9月业绩排名已生成（MTD）。/.test(reply.content) && reply.finish === false), true, "完整结论必须在图表交付前可读");
   assert.equal(client.replies.at(-1).finish, true);
   assert.equal(client.replies.at(-1).content, "集团9月业绩排名已生成（MTD）。");
   assert.deepEqual(client.replies.at(-1).msgItem, []);
@@ -170,7 +170,7 @@ function frame(messageId, userId, msgtype, body) {
   });
   await fallbackHandler.handleMessage(frame("msg-fallback", "boss", "text", { text: { content: "集团业绩" } }), fallbackClient);
   assert.deepEqual(fallbackClient.replies.at(-1).msgItem, [fakeChartItem]);
-  assert.equal(failedMediaSends, 2);
+  assert.equal(failedMediaSends, 1, "默认不叠加 SDK 内部重试；失败后走内嵌图片");
   assert.equal(fallbackStatuses.some((value) => value.status === "chart_media_delivery_failed"), true);
   assert.equal(fallbackStatuses.some((value) => value.status === "chart_inline_delivered"), true);
   assert.equal(fallbackStatuses.some((value) => value.status === "chart_delivered"), true);

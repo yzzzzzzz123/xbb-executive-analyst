@@ -7,6 +7,8 @@ const { routeSkill } = require("../rag/skill-router.js");
 const { chartTypeLabel, formatDuration } = require("../xbb/query-progress.js");
 const { createWecomAnswerImage, createWecomChartImage, createWecomEmergencyImage } = require("./chart-image.js");
 const { MessageStore, MessageStoreCapacityError } = require("./message-store.js");
+const { createRequestMetrics } = require("../observability/request-metrics.js");
+const { DeliveryTimeoutError, validateBudget, withinBudget } = require("./delivery-budget.js");
 
 const DEFAULT_ROUTE_MEMORY_MAX_ENTRIES = 4096;
 const XBB_FOLLOW_UP_HANDOFF_ANSWER = "已收到你的补充要求，正在继续分析。完整结果会回复到你最新一条消息。";
@@ -61,6 +63,7 @@ async function retryTransient(operation, options = {}) {
   const shouldRetry = typeof options.shouldRetry === "function" ? options.shouldRetry : () => true;
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    if (typeof options.canAttempt === "function" && !options.canAttempt()) throw new DeliveryTimeoutError();
     try { return await operation(attempt); } catch (error) {
       lastError = error;
       if (attempt < attempts && shouldRetry(error)) await wait(Math.min(400, 75 * (2 ** (attempt - 1))));
@@ -75,6 +78,7 @@ function isTransientRenderError(error) {
 }
 
 function isTransientTransportError(error) {
+  if (error instanceof DeliveryTimeoutError) return false;
   const message = String(error?.message || "");
   const code = String(error?.code || error?.errcode || "");
   return !/(?:^|\D)(?:400|401|403|410)(?:\D|$)|鉴权|认证失败|无权限|非法|invalid|格式|超过.*(?:限制|大小)|10\s*mb/i.test(`${code} ${message}`);
@@ -115,29 +119,32 @@ function validateFrame(frame) {
   return message;
 }
 
-function createProgressPublisher({ deliver, updateState }) {
+function createProgressPublisher({ deliver, updateState, drainBudgetMs = 6000 }) {
+  validateBudget(drainBudgetMs);
   let pending = null;
   let running = false;
+  let closed = false;
   let current = Promise.resolve();
 
   const pump = () => {
-    if (running) return current;
+    if (running || closed) return current;
     running = true;
     current = (async () => {
-      while (pending !== null) {
+      while (!closed && pending !== null) {
         const content = pending;
         pending = null;
         await deliver(content);
       }
     })().catch(() => { /* 中间进度失败不能阻断最终答复 */ }).finally(() => {
       running = false;
-      if (pending !== null) void pump();
+      if (!closed && pending !== null) void pump();
     });
     return current;
   };
 
   return Object.freeze({
     publish(content) {
+      if (closed) return;
       const value = String(content || "").trim();
       if (!value) return;
       pending = value;
@@ -149,6 +156,14 @@ function createProgressPublisher({ deliver, updateState }) {
         if (!running && pending !== null) void pump();
         await current;
       } while (running || pending !== null);
+    },
+    async close() {
+      closed = true;
+      pending = null;
+      // SDK serializes already submitted replies by req_id. Only that one
+      // in-flight update may finish; no queued/late stage can follow the answer.
+      try { await withinBudget(() => current, drainBudgetMs); return true; }
+      catch { return false; }
     }
   });
 }
@@ -166,11 +181,18 @@ function createLongConnectionHandler({
   emergencyImageFactory = createWecomEmergencyImage,
   retryWait = delay,
   renderAttempts = 2,
-  transportAttempts = 3,
+  // SDK upload chunks already retry three times. Do not multiply whole uploads.
+  transportAttempts = 1,
+  progressDrainBudgetMs = 6000,
+  replyBudgetMs = 7000,
+  renderBudgetMs = 10000,
+  uploadBudgetMs = 15000,
+  mediaDeliveryBudgetMs = 6000,
   routeMemoryMaxEntries = DEFAULT_ROUTE_MEMORY_MAX_ENTRIES
 }) {
   if (!policy || !agent?.answer) throw new Error("企业微信长连接处理器初始化参数不完整。");
   if (!Number.isInteger(routeMemoryMaxEntries) || routeMemoryMaxEntries < 1) throw new Error("企业微信路由记忆上限无效。");
+  [progressDrainBudgetMs, replyBudgetMs, renderBudgetMs, uploadBudgetMs, mediaDeliveryBudgetMs].forEach(validateBudget);
   // 应急图在启动阶段只生成和校验一次。运行时拒绝/渲染故障只复用这个不可变项，
   // 避免未授权消息触发 Sharp CPU 开销，也消除最后一级兜底再次抛错的窗口。
   const emergencyRender = normalizeRenderedImage(emergencyImageFactory());
@@ -233,18 +255,33 @@ function createLongConnectionHandler({
       const { state, isNew } = begun;
 
       if (!isNew) return client.replyStream(frame, state.streamId, state.content, state.finish, state.finish ? state.msgItem : undefined);
+      const metrics = createRequestMetrics();
+      let outcome = "success";
+      const finishMetrics = (routeMode, imageDelivery, result = outcome) => {
+        const value = metrics.finish({ routeMode, imageDelivery, outcome: result });
+        if (value) writeStatus(value);
+      };
+      const replyStream = (content, finish, items) => withinBudget(
+        () => client.replyStream(frame, state.streamId, content, finish, items), replyBudgetMs
+      );
       writeStatus({ status: "message_received" });
       if (!question) {
         messageStore.complete(messageId, initialContent);
-        const reply = await client.replyStream(frame, state.streamId, initialContent, true);
+        let reply;
+        try { reply = await replyStream(initialContent, true); }
+        catch (error) { finishMetrics(inferredRoute, "none", "failed"); throw error; }
+        metrics.mark("firstReplyMs");
+        finishMetrics(inferredRoute, "none", "unsupported");
         writeStatus({ status: "reply_completed", elapsedMs: Date.now() - receivedAtMs });
         return reply;
       }
 
       try {
-        await client.replyStream(frame, state.streamId, initialContent, false);
+        await replyStream(initialContent, false);
+        metrics.mark("firstReplyMs");
       } catch (error) {
         messageStore.delete(messageId);
+        finishMetrics(inferredRoute, "none", "failed");
         throw error;
       }
 
@@ -259,7 +296,8 @@ function createLongConnectionHandler({
         let latestStage = initialContent;
         progressPublisher = createProgressPublisher({
           deliver: (content) => client.replyStream(frame, state.streamId, content, false),
-          updateState: (content) => messageStore.update(messageId, content)
+          updateState: (content) => messageStore.update(messageId, content),
+          drainBudgetMs: progressDrainBudgetMs
         });
         onProgress = (content) => {
           latestStage = String(content || "").trim() || latestStage;
@@ -270,46 +308,59 @@ function createLongConnectionHandler({
           progressPublisher.publish(`${latestStage}\n已用时：${formatDuration(seconds)}；当前阶段仍在继续。`);
         }, heartbeatMs);
         heartbeat.unref?.();
-        const result = await agent.answer({
+        const result = await metrics.measure("analysisMs", () => agent.answer({
           question,
           access,
           principalKey: principalKeyFactory(userId, access),
           messageId,
-          onProgress
-        });
+          onProgress,
+          onTiming: (event) => metrics.addQueryTiming(event)
+        }));
         answer = typeof result === "string" ? result : result.answer;
         chart = typeof result === "object" && result ? result.chart : null;
         if (result?.routeMode === "xbb" || result?.routeMode === "general") routeMode = result.routeMode;
         usePrebuiltOperationalImage = isXbbOperationalHandoff(result);
-        clearInterval(heartbeat);
-        await progressPublisher.flush();
       } catch (error) {
-        if (heartbeat) clearInterval(heartbeat);
-        if (progressPublisher) await progressPublisher.flush();
+        outcome = "failed";
         answer = operationalFailure(error);
         if (error?.routeMode === "xbb") routeMode = "xbb";
         usePrebuiltOperationalImage = routeMode === "xbb";
+      } finally {
+        if (heartbeat) clearInterval(heartbeat);
+        metrics.mark("answerReadyMs");
+        if (progressPublisher) await metrics.measure("progressDrainMs", () => progressPublisher.close());
       }
       rememberRoute(userId, routeMode);
       const requiresImage = routeMode === "xbb";
+      let answerVisible = false;
+      if (requiresImage || chart) {
+        // Send a complete readable answer before rasterization or upload. This
+        // remains the same stream; the final packet still includes an image or
+        // follows successful standalone delivery. No generic progress replaces it.
+        const visible = `${answer}\n\n${chart ? `正在制作：${chartTypeLabel(chart.type)}` : "正在准备结论辅助图"}，图片随后补齐。`;
+        messageStore.update(messageId, visible);
+        try {
+          await replyStream(visible, false);
+          answerVisible = true;
+          metrics.mark("answerVisibleMs");
+        } catch { /* Final reply retains the complete answer and image for replay. */ }
+      }
       let msgItem = [];
       let imageBuffer = null;
       let imageRender = null;
       if (chart) {
         try {
-          onProgress?.(`经营结论已生成。\n正在制作：${chartTypeLabel(chart.type)}\n下一步：上传图片并发送最终文字结论。`);
-          if (progressPublisher) await progressPublisher.flush();
-          const rendered = normalizeRenderedImage(await retryTransient(() => chartRenderer(chart), {
+          const rendered = normalizeRenderedImage(await metrics.measure("renderMs", () => withinBudget((isOpen) => retryTransient(() => chartRenderer(chart), {
+            canAttempt: isOpen,
             attempts: renderAttempts,
             wait: retryWait,
-            shouldRetry: isTransientRenderError
-          }));
+            shouldRetry: (error) => isOpen() && isTransientRenderError(error)
+          }), renderBudgetMs)));
           msgItem = [rendered.item];
           imageBuffer = rendered.buffer;
           writeStatus({ status: "chart_generated" });
-          onProgress?.(`${chartTypeLabel(chart.type)}已生成。\n正在上传企业微信图片并准备最终答复……`);
-          if (progressPublisher) await progressPublisher.flush();
         } catch {
+          if (outcome === "success") outcome = "degraded";
           writeStatus({ status: "chart_failed" });
           answer = appendVisualNotice(answer, "（数据图生成暂时异常，已自动改用结论速览图；文字口径不变。）");
         }
@@ -323,15 +374,17 @@ function createLongConnectionHandler({
           imageBuffer = null;
         } else {
           try {
-            imageRender = normalizeRenderedImage(await retryTransient(() => answerRenderer(answer), {
+            imageRender = normalizeRenderedImage(await metrics.measure("renderMs", () => withinBudget((isOpen) => retryTransient(() => answerRenderer(answer), {
+              canAttempt: isOpen,
               attempts: renderAttempts,
               wait: retryWait,
-              shouldRetry: isTransientRenderError
-            }));
+              shouldRetry: (error) => isOpen() && isTransientRenderError(error)
+            }), renderBudgetMs)));
             msgItem = [imageRender.item];
             imageBuffer = imageRender.buffer;
             writeStatus({ status: "chart_generated" });
           } catch {
+            if (outcome === "success") outcome = "degraded";
             imageRender = emergencyRender;
             msgItem = [emergencyRender.item];
             imageBuffer = emergencyRender.buffer;
@@ -344,17 +397,18 @@ function createLongConnectionHandler({
       const target = message.chattype === "group" ? String(message.chatid || "") : userId;
       if (imageBuffer && target && typeof client.uploadMedia === "function" && typeof client.sendMediaMessage === "function") {
         try {
-          const uploaded = await retryTransient(
+          const uploaded = await metrics.measure("uploadMs", () => withinBudget((isOpen) => retryTransient(
             async () => {
               const result = await client.uploadMedia(imageBuffer, { type: "image", filename: "经营分析图表.png" });
               if (!result?.media_id) throw new Error("企业微信未返回图片 media_id。");
               return result;
             },
-            { attempts: transportAttempts, wait: retryWait, shouldRetry: isTransientTransportError }
-          );
+            { attempts: transportAttempts, canAttempt: isOpen, wait: retryWait, shouldRetry: (error) => isOpen() && isTransientTransportError(error) }
+          ), uploadBudgetMs));
           uploadedMediaId = uploaded.media_id;
           writeStatus({ status: "chart_uploaded" });
         } catch {
+          if (outcome === "success") outcome = "degraded";
           uploadedMediaId = null;
           writeStatus({ status: "chart_upload_failed" });
         }
@@ -362,13 +416,14 @@ function createLongConnectionHandler({
       let standaloneDelivered = false;
       if (uploadedMediaId) {
         try {
-          await retryTransient(
+          await metrics.measure("mediaDeliveryMs", () => withinBudget((isOpen) => retryTransient(
             () => client.sendMediaMessage(target, "image", uploadedMediaId),
-            { attempts: Math.min(2, transportAttempts), wait: retryWait, shouldRetry: isTransientTransportError }
-          );
+            { attempts: Math.min(2, transportAttempts), canAttempt: isOpen, wait: retryWait, shouldRetry: (error) => isOpen() && isTransientTransportError(error) }
+          ), mediaDeliveryBudgetMs));
           standaloneDelivered = true;
           writeStatus({ status: "chart_delivered" });
         } catch {
+          if (outcome === "success") outcome = "degraded";
           standaloneDelivered = false;
           writeStatus({ status: "chart_media_delivery_failed" });
         }
@@ -377,12 +432,20 @@ function createLongConnectionHandler({
       // 首次若已用独立 media 消息送图，正文不重复内嵌；缓存仍保存完整图片项，
       // 让企业微信重放同一 msgid 时也不会只收到文字。
       messageStore.complete(messageId, answer, msgItem);
-      const reply = await client.replyStream(frame, state.streamId, answer, true, inlineItems);
+      let reply;
+      try {
+        reply = await replyStream(answer, true, inlineItems);
+        if (!answerVisible) metrics.mark("answerVisibleMs");
+      } catch (error) {
+        finishMetrics(routeMode, standaloneDelivered ? "standalone" : msgItem.length ? "failed" : "none", "failed");
+        throw error;
+      }
       if (inlineItems.length) {
         writeStatus({ status: "chart_inline_delivered" });
         writeStatus({ status: "chart_delivered" });
       }
       writeStatus({ status: "reply_completed", elapsedMs: Date.now() - receivedAtMs });
+      finishMetrics(routeMode, standaloneDelivered ? "standalone" : inlineItems.length ? "inline" : "none");
       return reply;
     }
   });

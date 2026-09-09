@@ -66,7 +66,8 @@ function monthsBetween(startMonth, endMonth) {
 
 function hasExplicitPeriod(question) {
   const text = String(question || "");
-  return /(?<!\d)\d{4}\s*(?:年|[-/.])\s*\d{1,2}\s*月?|(?<!\d)\d{4}\s*年(?:度|全年)?|(?:近|最近|过去)\s*\d+\s*个?(?:自然)?月|(?<!\d)\d{1,2}\s*月?\s*(?:-|—|~|～|至|到)\s*\d{1,2}\s*月|本月|这个月|当月|当前月|上(?:个)?月|今年|本年|全年|整年|一整年|年度/.test(text);
+  if (/(?<!\d)\d{1,2}\s*月\s*(?:和|与|及|、|,|，)\s*\d{1,2}\s*月/u.test(text)) return true;
+  return /(?<!\d)\d{4}\s*(?:年|[-/.])\s*\d{1,2}\s*月?|(?<!\d)\d{4}\s*年(?:度|全年)?|(?:近|最近|过去)\s*\d+\s*个?(?:自然)?月|(?<!\d)\d{1,2}\s*月?\s*(?:-|—|~|～|至|到)\s*\d{1,2}\s*月|(?:去年|明年)\s*\d{1,2}\s*月|本月|这个月|当月|当前月|上(?:个)?月|今年|本年|全年|整年|一整年|年度/.test(text);
 }
 
 function isDefaultGroupPerformanceRanking(question, domains) {
@@ -77,7 +78,11 @@ function isDefaultGroupPerformanceRanking(question, domains) {
     && /排名|排行/.test(text)
     && /课程/.test(text)
     && /咨询/.test(text)
-    && !hasExplicitPeriod(text);
+    && !hasExplicitPeriod(text)
+    // A bare calendar month overrides the default full performance window. It
+    // remains distinct from a year-qualified period so prestart corrections can
+    // still inherit their existing year rather than silently changing it.
+    && !/(?<!\d)\d+\s*月/u.test(text);
 }
 
 function restrictPerformanceMonths(months, domains) {
@@ -89,10 +94,16 @@ function restrictPerformanceMonths(months, domains) {
 }
 
 function parseMonths(question, now = new Date()) {
-  const text = String(question || "");
   const current = shanghaiMonth(now);
+  // Normalize only a relative year immediately qualifying a numeric month/range;
+  // reuse the existing explicit-date parser and its future / coverage checks.
+  const text = String(question || "").replace(/(去年|今年|本年|明年)\s*(?=\d{1,2}\s*(?:月|[-—~～至到]))/gu, (_match, label) =>
+    `${current.getUTCFullYear() + (label === "去年" ? -1 : label === "明年" ? 1 : 0)}年`);
   const currentMonth = monthLabel(current);
   const months = [];
+  if (/(?<!\d)\d+\s*(?:、|,|，|和|与|及)\s*\d+\s*月/u.test(text)) {
+    throw new Error("并列月份请逐个写明月份，例如 8月和9月；不能省略月份单位后猜测查询范围。");
+  }
 
   // 先识别宽松的显式日期外形，避免“13 月”等错误被当成未写期间并静默回落到本月。
   for (const match of text.matchAll(/(?<!\d)(\d{4})\s*(?:年|[-/.])\s*(\d{1,2})\s*月?/g)) {
@@ -122,9 +133,15 @@ function parseMonths(question, now = new Date()) {
     return validateRequestedMonths(monthsBetween(startMonth, currentMonth), now);
   }
 
+  const explicitMonthSpans = [];
   for (const match of text.matchAll(/(?<!\d)(\d{4})\s*(?:年|[-/.])\s*(\d{1,2})\s*月?/g)) {
     const parsed = parseCanonicalMonth(`${match[1]}-${String(Number(match[2])).padStart(2, "0")}`);
     months.push(parsed.value);
+    explicitMonthSpans.push({ start: match.index, end: match.index + match[0].length });
+  }
+  if (months.length && [...text.matchAll(/(?<!\d)\d+\s*月/gu)].some((match) =>
+    !explicitMonthSpans.some((span) => match.index >= span.start && match.index + match[0].length <= span.end))) {
+    throw new Error("混合年份的并列月份请为每个月写明年份，例如 2026年8月和2026年9月；本次未猜测查询范围。");
   }
 
   const range = /(?<!\d)(\d{1,2})\s*月?\s*(?:-|—|~|～|至|到)\s*(\d{1,2})\s*月/.exec(text);
@@ -144,6 +161,14 @@ function parseMonths(question, now = new Date()) {
   }
 
   const explicitYear = /(?<!\d)(\d{4})\s*年(?:度|全年)?/.exec(text);
+  if (!months.length && !recent) {
+    // "8月" means August of the current Shanghai year, never the current month
+    // or an inferred previous year. Reject invalid/future values normally.
+    const year = explicitYear ? Number(explicitYear[1]) : current.getUTCFullYear();
+    for (const match of text.matchAll(/(?<!\d)(\d+)\s*月/gu)) {
+      months.push(parseCanonicalMonth(`${year}-${String(Number(match[1])).padStart(2, "0")}`).value);
+    }
+  }
   if (!months.length && explicitYear) {
     const year = Number(explicitYear[1]);
     if (year < MIN_QUERY_YEAR || year > 9999) throw new Error(`月份年份必须在 ${MIN_QUERY_YEAR} 至 9999 之间。`);

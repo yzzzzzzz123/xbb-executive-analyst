@@ -1,6 +1,8 @@
 "use strict";
 
 const RUNNER_STAGES = new Set([
+  "queued",
+  "query_started",
   "run_started",
   "month_started",
   "source_ready",
@@ -86,6 +88,10 @@ function formatQueryProgress(input, rawEvent, access) {
   const total = event.total || (Array.isArray(input?.months) ? input.months.length : 1);
   const focus = analysisFocus(input?.domains);
   switch (event.stage) {
+    case "queued":
+      return `${header}\n数据进度：正在等待只读取数通道，尚未开始本次读取\n通道按序执行，期间可继续补充范围或约束。`;
+    case "query_started":
+      return `${header}\n数据进度：已进入只读取数通道，正在准备本次读取\n分析重点：${focus}`;
     case "run_started":
       return `${header}\n数据进度：准备读取 ${total} 个月的真实只读数据\n分析重点：${focus}`;
     case "month_started":

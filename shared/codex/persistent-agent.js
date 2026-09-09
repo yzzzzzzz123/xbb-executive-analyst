@@ -24,14 +24,21 @@ const { buildVerifiedFallbackAnswer, falseTechnicalRefusalReason, hasUsableFacts
 const { GENERAL_RESPONSE_SCHEMA, WECOM_RESPONSE_SCHEMA, parseAgentResponse, responseContractHash } = require("./response-contract.js");
 const { loadAgentState, saveAgentState } = require("./state-store.js");
 const { buildThreadInstructions } = require("./thread-instructions.js");
+const {
+  MAX_USER_QUESTION_BYTES,
+  buildComplexTaskGuidance,
+  chooseGeneralTurnEffort,
+  formatTaskContext,
+  formatUserMessage,
+  isTaskContinuation,
+  updateTaskContext
+} = require("./context-policy.js");
 const { readCodexVersion, verifyCodexChatGptLogin } = require("./runtime.js");
 
 const MAX_SESSION_ESTIMATED_INPUT_BYTES = 256 * 1024;
 const MAX_SESSION_TURNS = 24;
 const CONTEXT_ROTATION_RATIO = 0.7;
 const MAX_TURN_FACT_BYTES = 128 * 1024;
-const MAX_INTENT_MEMORY = 8;
-const MAX_USER_QUESTION_BYTES = 32 * 1024;
 const MAX_STEER_COUNT = 8;
 const MAX_STEER_INPUT_BYTES = 64 * 1024;
 const MAX_AGENT_MESSAGE_ITEMS = 32;
@@ -39,9 +46,9 @@ const MAX_AGENT_MESSAGE_BYTES = 64 * 1024;
 const MAX_AGENT_STREAM_BYTES = 128 * 1024;
 const MAX_CONSECUTIVE_TURN_START_FAILURES = 2;
 const MAX_SESSION_QUEUED_REQUESTS = 8;
-const MAX_PRESTART_CONTEXT_BYTES = 2400;
 const DEFAULT_BUSINESS_TOTAL_TIMEOUT_MS = 20 * 60 * 1000;
 const DEFAULT_GENERAL_TOTAL_TIMEOUT_MS = 15 * 60 * 1000;
+const QUERY_TIMING_TERMINAL_STAGES = new Set(["completed", "failed", "cancelled", "expired", "rejected"]);
 const DOMAIN_QUERY_HINTS = Object.freeze({
   performance: "业绩",
   "product-sales": "产品成交",
@@ -147,21 +154,17 @@ function utf8Prefix(value, maxBytes) {
   return result;
 }
 
-function steerInput(question) {
+function steerInput(question, context = null) {
   return [{
     type: "text",
     text: [
       "【用户追问/修正】",
-      question,
+      formatUserMessage(question),
+      ...(buildComplexTaskGuidance(question, context) ? [buildComplexTaskGuidance(question, context)] : []),
       "请把这条消息作为当前用户的最新要求：与原问题冲突时以本条为准；最终回答同时回应仍然有效的原问题和本条追问。"
     ].join("\n"),
     text_elements: []
   }];
-}
-
-function boundedIntentQuestion(question) {
-  const sanitized = sanitizeAgentText(String(question || ""), { maxBytes: 800 });
-  return sanitized || "";
 }
 
 function normalizedCorrectionText(question) {
@@ -186,29 +189,12 @@ function isEntityScopeCorrection(question) {
   return isPrefetchScopeCorrection(text) && ENTITY_SCOPE_PATTERN.test(text) && !isGenericEntityDimension(text);
 }
 
-function utf8Suffix(value, maxBytes) {
-  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
-  const characters = [...String(value || "")];
-  let result = "";
-  let bytes = 0;
-  for (let index = characters.length - 1; index >= 0; index -= 1) {
-    const character = characters[index];
-    const characterBytes = Buffer.byteLength(character, "utf8");
-    if (bytes + characterBytes > maxBytes) break;
-    result = `${character}${result}`;
-    bytes += characterBytes;
-  }
-  return result;
-}
-
 function initialPreStartContext(question) {
-  return `【初始问题】\n${boundedIntentQuestion(question)}`;
+  return updateTaskContext(null, question, { mode: "xbb" });
 }
 
 function appendPreStartContext(context, question) {
-  const latest = `\n【后续修正】\n${boundedIntentQuestion(question)}`;
-  const remainingBytes = Math.max(0, MAX_PRESTART_CONTEXT_BYTES - Buffer.byteLength(latest, "utf8"));
-  return `${utf8Suffix(context, remainingBytes)}${latest}`;
+  return updateTaskContext(context, question, { mode: "xbb", continuation: true });
 }
 
 function inheritedCorrectionPlan(question, activePlan) {
@@ -253,7 +239,8 @@ function createSession(principalKey, stored = {}) {
     turnCount: Number.isInteger(stored.turnCount) ? stored.turnCount : 0,
     estimatedInputBytes: Number.isInteger(stored.estimatedInputBytes) ? stored.estimatedInputBytes : 0,
     tokenUsage: null,
-    intentMemory: [],
+    taskContext: null,
+    accessFingerprint: null,
     resumed: Boolean(stored.threadId),
     needsResume: Boolean(stored.threadId),
     turnInProgress: stored.turnInProgress === true
@@ -319,7 +306,7 @@ class PersistentCodexAgent extends EventEmitter {
       response: responseContractHash(),
       model: config.codexModel,
       effort: config.codexReasoningEffort,
-      interaction: "bounded-context-recoverable-xbb-skill-v4",
+      interaction: "bounded-task-context-recoverable-xbb-skill-v5",
       knowledge: this.knowledgeBase.digest,
       sandbox: "read-only",
       approvalPolicy: "never"
@@ -437,8 +424,8 @@ class PersistentCodexAgent extends EventEmitter {
     }
   }
 
-  async answer({ question, access, principalKey, messageId, onProgress }) {
-    return this._enqueue({ question, access, principalKey, messageId, onProgress });
+  async answer({ question, access, principalKey, messageId, onProgress, onTiming }) {
+    return this._enqueue({ question, access, principalKey, messageId, onProgress, onTiming });
   }
 
   _assertOperational() {
@@ -473,7 +460,7 @@ class PersistentCodexAgent extends EventEmitter {
     return Object.freeze({ ...stats, principals: principals.length });
   }
 
-  async _enqueue({ question, access, principalKey, messageId, onProgress, warmup = false }) {
+  async _enqueue({ question, access, principalKey, messageId, onProgress, onTiming, warmup = false }) {
     this._assertOperational();
     if (typeof question !== "string" || !question.trim()) throw new Error("问题不能为空。");
     if (Buffer.byteLength(question.trim(), "utf8") > MAX_USER_QUESTION_BYTES) {
@@ -485,7 +472,12 @@ class PersistentCodexAgent extends EventEmitter {
       session = createSession(principalKey);
       this.sessions.set(principalKey, session);
     }
-    const waiter = { ...deferred(), onProgress };
+    const accessFingerprint = sha256(JSON.stringify(canonicalAccess(access)));
+    if (session.accessFingerprint && session.accessFingerprint !== accessFingerprint) {
+      throw new AccessDeniedError("授权范围已变化，必须使用对应权限的独立会话。", "session_scope_mismatch");
+    }
+    session.accessFingerprint = accessFingerprint;
+    const waiter = { ...deferred(), onProgress, onTiming };
     const request = { question: question.trim(), access, messageId, waiter, warmup };
     if (this._takeOverChangedPrefetch(session, request)) return waiter.promise;
     this._queueRequest(session, request);
@@ -527,8 +519,8 @@ class PersistentCodexAgent extends EventEmitter {
     if (!scopeChanged && !entityScopeCorrection) return false;
 
     const priorContext = priorReplacement
-      ? appendPreStartContext(priorReplacement.preStartContext || initialPreStartContext(active.question), priorReplacement.question)
-      : initialPreStartContext(active.question);
+      ? appendPreStartContext(priorReplacement.preStartContext || active.taskContext || initialPreStartContext(active.question), priorReplacement.question)
+      : active.taskContext || initialPreStartContext(active.question);
     if (priorReplacement) this._resolveHandoff(session, priorReplacement);
     request.routeModeOverride = activeMode;
     request.fastPlanOverride = incomingPlan;
@@ -603,10 +595,11 @@ class PersistentCodexAgent extends EventEmitter {
       const activeMode = active.businessMode ? "xbb" : "general";
       const incomingRoute = warmup ? Object.freeze({ mode: "xbb", reason: "skill-warmup" }) : routeSkill(question, activeMode);
       if (!warmup && !active.warmup && incomingRoute.mode === activeMode) {
-        const nextSteerInput = steerInput(question);
+        const nextTaskContext = updateTaskContext(active.taskContext, question, { mode: activeMode, continuation: true });
+        const nextSteerInput = steerInput(question, nextTaskContext);
         const nextSteerBytes = inputBytes(nextSteerInput);
         if (active.steerCount < MAX_STEER_COUNT && active.steerInputBytes + nextSteerBytes <= MAX_STEER_INPUT_BYTES) {
-          return this._steerActiveTurn(session, active, { question, access, messageId, waiter, warmup }, nextSteerInput, nextSteerBytes);
+          return this._steerActiveTurn(session, active, { question, access, messageId, waiter, warmup, taskContext: nextTaskContext }, nextSteerInput, nextSteerBytes);
         }
         await this._notifyWaiter(waiter, "当前分析已接收较多补充要求；这条消息将在当前结果完成后使用新 Turn 继续处理。", false);
         this._emit("activity", { status: "turn_queued", reason: "steer_budget" });
@@ -645,8 +638,11 @@ class PersistentCodexAgent extends EventEmitter {
         periodCount: semanticPlan?.months?.length || 1
       }) : null;
       active.queryPlan = semanticPlan;
-      active.question = preStartContext ? `${question}\n已继承的启动前意图：\n${preStartContext}` : question;
-      const turnEffort = warmup ? "none" : businessMode ? chooseTurnEffort(question, this.config.codexReasoningEffort) : this.config.codexReasoningEffort;
+      active.question = question;
+      const continuation = !warmup && (Boolean(preStartContext) || isTaskContinuation(question, session.taskContext, route.mode, route.reason));
+      const priorTaskContext = preStartContext || (continuation ? session.taskContext : null);
+      active.taskContext = warmup ? null : updateTaskContext(priorTaskContext, question, { mode: route.mode, continuation });
+      const turnEffort = warmup ? "none" : businessMode ? chooseTurnEffort(question, this.config.codexReasoningEffort) : chooseGeneralTurnEffort(question, this.config.codexReasoningEffort);
       let prefetchedFactPack = null;
       let prefetchedFactView = null;
       if (fastPlan) {
@@ -668,6 +664,8 @@ class PersistentCodexAgent extends EventEmitter {
           const queryOutcome = Promise.resolve()
             .then(() => this.queryXbb(fastPlan, access, {
               signal: subscription.signal,
+              schedulingProgress: true,
+              onTiming: this._queryTimingCallback(session, active, subscription.signal),
               onProgress: (event) => session.active === active && !active.abortController.signal.aborted
                 ? this._notifyQueryProgress(session, fastPlan, access, event)
                 : undefined
@@ -714,12 +712,8 @@ class PersistentCodexAgent extends EventEmitter {
         this._assertOperational();
         if (session.active !== active) return;
       }
-      const continuity = !warmup && session.intentMemory.length && (question.length <= 16 || route.reason === "follow-up")
-        ? [
-            "【最近意图（仅用于理解省略的指代，经营数字必须重新查询）】",
-            ...session.intentMemory.slice(-2).map((item) => `- ${item.question}`)
-          ]
-        : [];
+      const continuity = continuation && priorTaskContext && !preStartContext ? [formatTaskContext(priorTaskContext)] : [];
+      const taskGuidance = buildComplexTaskGuidance(question, active.taskContext);
       const text = businessMode
         ? [
             "$xbb-executive-analyst",
@@ -735,7 +729,7 @@ class PersistentCodexAgent extends EventEmitter {
             ] : []),
             ...(preStartContext ? [
               "【本轮启动前仍有效的意图链（按出现顺序应用，后续修正优先）】",
-              preStartContext,
+              formatTaskContext(preStartContext),
               prefetchedFactView
                 ? "以下最新问题优先；较早问题中已被覆盖的期间或范围仅是语义上下文，不得沿用。经营事实只能使用本轮最新范围的预取事实包。"
                 : "以下最新问题优先；较早问题中已被覆盖的期间、公司或人员范围不得沿用，也不得使用旧范围事实。"
@@ -749,13 +743,15 @@ class PersistentCodexAgent extends EventEmitter {
             `上海日期：${shanghaiDateLabel()}`,
             `授权范围：${accessLabel(access)}`,
             "【用户问题】",
-            question
+            formatUserMessage(question)
           ].join("\n")
         : [
             "【能力路由】通用 Codex",
             "本轮不是销帮帮经营查询，不注入经营或辅助图 Skill，不得调用 query_xbb，chart 固定为 null。请直接使用通用能力回答用户。",
+            ...continuity,
+            ...(taskGuidance ? [taskGuidance] : []),
             "【用户问题】",
-            question
+            formatUserMessage(question)
           ].join("\n");
       const input = [{ type: "text", text, text_elements: [] }];
       if (businessMode) {
@@ -828,6 +824,9 @@ class PersistentCodexAgent extends EventEmitter {
 
   async _steerActiveTurn(session, active, request, input = steerInput(request.question), steerBytes = inputBytes(input)) {
     if (!active.turnId) throw new AgentTurnFailureError("Codex 活动 Turn 尚未就绪，无法追加追问。", active.businessMode ? "xbb" : "general");
+    // Reject an invalid/future scope before sending a steer or transferring the
+    // answer owner. A rejected correction must leave the original turn intact.
+    const incomingPlan = active.businessMode ? planFastQuery(request.question) : null;
     active.steerInFlight = true;
     let steerError = null;
     let accepted = false;
@@ -844,7 +843,6 @@ class PersistentCodexAgent extends EventEmitter {
         active.steerCount += 1;
         active.steerInputBytes += steerBytes;
         active.inputBytes += steerBytes;
-        const incomingPlan = active.businessMode ? planFastQuery(request.question) : null;
         const priorFingerprint = queryFingerprint(active.queryPlan);
         const incomingFingerprint = queryFingerprint(incomingPlan);
         if (!priorFingerprint || priorFingerprint !== incomingFingerprint) {
@@ -863,6 +861,9 @@ class PersistentCodexAgent extends EventEmitter {
         }
         active.queryPlan = incomingPlan;
         active.question = request.question;
+        active.taskContext = request.taskContext || updateTaskContext(active.taskContext, request.question, {
+          mode: active.businessMode ? "xbb" : "general", continuation: true
+        });
         session.access = request.access;
         this._armTurnTimeout(session, active);
         this._emit("activity", { status: "turn_steered" });
@@ -1011,11 +1012,8 @@ class PersistentCodexAgent extends EventEmitter {
   }
 
   _rememberIntent(session, active) {
-    if (active.warmup || !active.question) return;
-    const question = boundedIntentQuestion(active.question);
-    if (!question) return;
-    session.intentMemory.push({ question, queryPlan: active.queryPlan || null });
-    if (session.intentMemory.length > MAX_INTENT_MEMORY) session.intentMemory.splice(0, session.intentMemory.length - MAX_INTENT_MEMORY);
+    if (active.warmup || !active.taskContext) return;
+    session.taskContext = active.taskContext;
   }
 
   _recordSuccessfulTurn(session, active) {
@@ -1092,6 +1090,7 @@ class PersistentCodexAgent extends EventEmitter {
       factBytesSent: 0,
       queryPlan: null,
       question: "",
+      taskContext: null,
       inputBytes: 0,
       replayTurnParams: null,
       startedAtMs: Date.now(),
@@ -1277,6 +1276,8 @@ class PersistentCodexAgent extends EventEmitter {
       try {
         result = await this.queryXbb(args, session.access, {
           signal: subscription.signal,
+          schedulingProgress: true,
+          onTiming: this._queryTimingCallback(session, active, subscription.signal, factGeneration),
           onProgress: (event) => session.active === active
             && !active.abortController.signal.aborted
             && active.factGeneration === factGeneration
@@ -1513,6 +1514,23 @@ class PersistentCodexAgent extends EventEmitter {
     const content = sanitize ? sanitizeAgentText(text, { maxBytes: 4000 }) : text;
     if (!content) return;
     try { await waiter.onProgress(content); } catch {}
+  }
+
+  _queryTimingCallback(session, active, signal, factGeneration = active.factGeneration) {
+    // Bind timing to the subscribers that created this query, not the active
+    // waiters after a same-turn steer. Otherwise a new request inherits old work.
+    const waiters = active.waiters.slice();
+    let terminalForwarded = false;
+    return (event) => {
+      if (terminalForwarded || !QUERY_TIMING_TERMINAL_STAGES.has(event?.stage)
+          || session.active !== active || active.factGeneration !== factGeneration
+          || active.abortController.signal.aborted || signal.aborted) return;
+      terminalForwarded = true;
+      for (const waiter of waiters) {
+        if (typeof waiter.onTiming !== "function") continue;
+        try { Promise.resolve(waiter.onTiming(event)).catch(() => {}); } catch {}
+      }
+    };
   }
 
   async _notifyProgress(session, text) {
