@@ -44,6 +44,8 @@ npm run verify:production
 
 完整验收中，JavaScript/PowerShell 语法错误、Skill 合同不合法、非法运行时、未登记测试、任一 suite 失败都会以非零状态退出。每个 suite 输出耗时，便于定位测试自身变慢；该耗时不等同于机器人响应耗时。
 
+从 PowerShell 7 启动测试时，runner 仅对 Windows PowerShell 5.1 子进程清除继承的 `PSModulePath`，由 5.1 重建原生模块路径；其他环境变量与 Node 测试环境不变。这样避免错误加载 Core 版安全模块，但仍真实执行 DPAPI 往返和计划任务验收。
+
 ## 真实只读低频探针
 
 离线通过后，使用与后台机器人相同的 Windows 用户验证真实 App Server 登录、模型可用性和受控业务读取。在线探针串行、低频执行，一次选择最小必要范围；不得循环向业务 API 压测，也不得拿离线构造数据替代线上事实。
@@ -132,6 +134,7 @@ npm run bench:production -- --live --repeat=1 --business
 | 取数调度故障注入 | 队列满/过期/取消、共享订阅取消、永久未决 observer、隔离清理前不释放唯一槽等通过 |
 | 月份与活动追问 | 裸 8 月、8 月和 9 月、去年月份均不回落当月；未来/无效/不支持的省略写法拒绝，无效追问不替换原回合答复所有者 |
 | Windows 短路径兼容 | 首次 GitHub CI 暴露隔离标记读写路径规范化不一致；真实 8.3 TEMP 用例修前复现、修后通过，越界/缺失根仍拒绝 |
+| PowerShell 父子环境 | 第二轮 CI 已通过全部 unit/integration，暴露 7→5.1 安全模块路径污染；本机不兼容模块夹具修前同错、修后真实 Windows 两套验收通过，未跳过 DPAPI |
 
 完整本机报告位于被 Git 忽略的 `test-results/production/`：`benchmark-2026-09-09T03-02-16-245Z.json` 保留通用/上下文成功和原图断言失败；`benchmark-2026-09-09T03-06-39-975Z.json` 保留公司排名图验收通过。上述缓存命中轮次不能用作冷查询提速证据；模型回答耗时和提示文本不同，也不据此宣称“速度提升 X%”。
 

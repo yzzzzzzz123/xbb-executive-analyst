@@ -55,6 +55,12 @@ function parseArgs(args) {
   throw new Error("Usage: node scripts/run-tests.js [--list | --group unit|integration|windows]");
 }
 
+function windowsPowerShellEnvironment(environment = process.env) {
+  // PowerShell 7 includes its Core modules in PSModulePath. Windows PowerShell
+  // 5.1 must rebuild its own module search path or DPAPI cmdlet autoload fails.
+  return Object.fromEntries(Object.entries(environment).filter(([key]) => key.toLowerCase() !== "psmodulepath"));
+}
+
 function main(args = process.argv.slice(2)) {
   const options = parseArgs(args);
   const totalRegistered = validateSuiteManifest();
@@ -83,6 +89,7 @@ function main(args = process.argv.slice(2)) {
         stdio: "inherit",
         windowsHide: true,
         shell: false,
+        ...(powershell ? { env: windowsPowerShellEnvironment() } : {}),
       });
       const elapsedMs = Math.round(performance.now() - suiteStarted);
       const passed = !child.error && child.status === 0;
@@ -105,4 +112,4 @@ if (require.main === module) {
   catch (error) { process.stderr.write(`${error.message}\n`); process.exitCode = 1; }
 }
 
-module.exports = { SUITES, validateSuiteManifest, parseArgs, main };
+module.exports = { SUITES, validateSuiteManifest, parseArgs, windowsPowerShellEnvironment, main };

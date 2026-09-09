@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { builtinModules } = require("node:module");
-const { validateSuiteManifest } = require("../scripts/run-tests.js");
+const { validateSuiteManifest, windowsPowerShellEnvironment } = require("../scripts/run-tests.js");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const BUILTINS = new Set(builtinModules.flatMap((name) => [name, `node:${name}`]));
@@ -113,4 +113,24 @@ function assertAcyclic(file, stack = []) {
 for (const file of files) assertAcyclic(file);
 
 const suites = validateSuiteManifest();
+const inheritedEnvironment = Object.freeze({
+  PSModulePath: "synthetic-core-modules",
+  PSMODULEPATH: "synthetic-uppercase-core-modules",
+  psmodulepath: "synthetic-lowercase-core-modules",
+  PsMoDuLePaTh: "synthetic-mixed-case-core-modules",
+  PATH: "synthetic-executable-search-path",
+  TEMP: "synthetic-temp",
+  TMP: "synthetic-tmp",
+  SystemRoot: "synthetic-system-root",
+  TEST_FLAG: "preserved",
+});
+assert.deepEqual(windowsPowerShellEnvironment(inheritedEnvironment), {
+  PATH: inheritedEnvironment.PATH,
+  TEMP: inheritedEnvironment.TEMP,
+  TMP: inheritedEnvironment.TMP,
+  SystemRoot: inheritedEnvironment.SystemRoot,
+  TEST_FLAG: inheritedEnvironment.TEST_FLAG,
+}, "PowerShell 5.1 子进程只移除继承的 PSModulePath，其他环境值保持不变");
+assert.equal(inheritedEnvironment.PSModulePath, "synthetic-core-modules", "不得修改 Node 测试父进程环境");
+assert.deepEqual(windowsPowerShellEnvironment({ PATH: "unchanged" }), { PATH: "unchanged" });
 process.stdout.write(`${JSON.stringify({ success: true, runtimeModules: files.length, dependencies, registeredSuites: suites, cycles: 0 })}\n`);
