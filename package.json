@@ -18,7 +18,9 @@
     "test:list": "node scripts/run-tests.js --list",
     "verify": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\verify-skill.ps1",
     "verify:production": "npm run verify && npm test",
-    "bench:production": "node scripts/benchmark-production.js"
+    "bench:production": "node scripts/benchmark-production.js",
+    "bench:reliability": "node scripts/benchmark-reliability.js",
+    "observe:runtime": "node scripts/observe-runtime-health.js"
   },
   "dependencies": {
     "@wecom/aibot-node-sdk": "1.0.7",

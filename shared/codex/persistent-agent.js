@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const { EventEmitter } = require("node:events");
 const path = require("node:path");
+const { performance } = require("node:perf_hooks");
 const { AccessDeniedError } = require("../security/access-control.js");
 const { sanitizeAgentText } = require("../security/output-sanitizer.js");
 const { SOURCE_FILES, SkillKnowledgeBase } = require("../rag/skill-knowledge-base.js");
@@ -34,6 +35,8 @@ const {
   updateTaskContext
 } = require("./context-policy.js");
 const { readCodexVersion, verifyCodexChatGptLogin } = require("./runtime.js");
+const { REQUEST_CANCELLED, REQUEST_DEADLINE_EXCEEDED, createRequestLifecycle, isRequestLifecycleError } = require("./request-lifecycle.js");
+const { applyPlanUpdate, bindCheckpointTurn, createTaskCheckpoint, formatTaskCheckpoint, reviseTaskCheckpoint } = require("./task-checkpoint.js");
 
 const MAX_SESSION_ESTIMATED_INPUT_BYTES = 256 * 1024;
 const MAX_SESSION_TURNS = 24;
@@ -240,6 +243,7 @@ function createSession(principalKey, stored = {}) {
     estimatedInputBytes: Number.isInteger(stored.estimatedInputBytes) ? stored.estimatedInputBytes : 0,
     tokenUsage: null,
     taskContext: null,
+    taskCheckpoint: null,
     accessFingerprint: null,
     resumed: Boolean(stored.threadId),
     needsResume: Boolean(stored.threadId),
@@ -265,7 +269,7 @@ class AgentTurnTimeoutError extends AgentTurnFailureError {
 }
 
 function routedTurnError(error, businessMode) {
-  if (error instanceof AccessDeniedError || error instanceof AgentTurnFailureError) return error;
+  if (isRequestLifecycleError(error) || error instanceof AccessDeniedError || error instanceof AgentTurnFailureError) return error;
   return new AgentTurnFailureError(error?.message || "Codex Agent 未能完成本轮处理。", businessMode ? "xbb" : "general", { cause: error });
 }
 
@@ -424,8 +428,8 @@ class PersistentCodexAgent extends EventEmitter {
     }
   }
 
-  async answer({ question, access, principalKey, messageId, onProgress, onTiming }) {
-    return this._enqueue({ question, access, principalKey, messageId, onProgress, onTiming });
+  async answer({ question, access, principalKey, messageId, onProgress, onTiming, signal, remainingMs }) {
+    return this._enqueue({ question, access, principalKey, messageId, onProgress, onTiming, signal, remainingMs });
   }
 
   _assertOperational() {
@@ -460,29 +464,95 @@ class PersistentCodexAgent extends EventEmitter {
     return Object.freeze({ ...stats, principals: principals.length });
   }
 
-  async _enqueue({ question, access, principalKey, messageId, onProgress, onTiming, warmup = false }) {
-    this._assertOperational();
+  async _enqueue({ question, access, principalKey, messageId, onProgress, onTiming, signal, remainingMs, warmup = false }) {
     if (typeof question !== "string" || !question.trim()) throw new Error("问题不能为空。");
     if (Buffer.byteLength(question.trim(), "utf8") > MAX_USER_QUESTION_BYTES) {
       throw new Error(`问题长度不能超过 ${MAX_USER_QUESTION_BYTES} 字节。`);
     }
     if (!/^[a-f0-9]{64}$/.test(principalKey)) throw new Error("Codex Agent principal key 无效。");
     let session = this.sessions.get(principalKey);
-    if (!session) {
-      session = createSession(principalKey);
-      this.sessions.set(principalKey, session);
-    }
-    const accessFingerprint = sha256(JSON.stringify(canonicalAccess(access)));
-    if (session.accessFingerprint && session.accessFingerprint !== accessFingerprint) {
-      throw new AccessDeniedError("授权范围已变化，必须使用对应权限的独立会话。", "session_scope_mismatch");
-    }
-    session.accessFingerprint = accessFingerprint;
-    const waiter = { ...deferred(), onProgress, onTiming };
-    const request = { question: question.trim(), access, messageId, waiter, warmup };
-    if (this._takeOverChangedPrefetch(session, request)) return waiter.promise;
-    this._queueRequest(session, request);
-    this._drainSessionQueue(session);
+    const priorMode = session?.active ? (session.active.businessMode ? "xbb" : "general") : session?.lastMode;
+    const routeMode = warmup ? "xbb" : routeSkill(question, priorMode).mode;
+    const timeoutMs = routeMode === "xbb" ? this.businessTotalTimeoutMs : this.generalTotalTimeoutMs;
+    let request;
+    const enqueuedAtMs = performance.now();
+    const lifecycle = createRequestLifecycle({ signal, remainingMs, timeoutMs, routeMode,
+      makeError: (kind) => {
+        const error = kind === "deadline" ? new AgentTurnTimeoutError(routeMode, timeoutMs)
+          : new AgentTurnFailureError("Codex Agent 请求已取消。", routeMode);
+        error.code = kind === "deadline" ? REQUEST_DEADLINE_EXCEEDED : REQUEST_CANCELLED;
+        return error;
+      },
+      onCancel: (error) => {
+        if (request && !request.waiter.executionStarted && error.code === REQUEST_DEADLINE_EXCEEDED) {
+          this._notifyTiming(request.waiter, { stage: "session_expired", queueWaitMs: Math.max(0, performance.now() - enqueuedAtMs) });
+        }
+        if (session && request) this._cancelRequest(session, request, error);
+      }
+    });
+    const waiter = { promise: lifecycle.promise, resolve: lifecycle.resolve, reject: lifecycle.reject, lifecycle, onProgress, onTiming,
+      enqueuedAtMs, executionStarted: false };
+    request = { question: question.trim(), access, messageId, waiter, warmup };
+    if (lifecycle.settled) return waiter.promise;
+    try {
+      if (!this.started && this.startPromise) await lifecycle.wait(this.startPromise);
+      lifecycle.throwIfStopped();
+      this._assertOperational();
+      session = this.sessions.get(principalKey);
+      if (!session) {
+        session = createSession(principalKey);
+        this.sessions.set(principalKey, session);
+      }
+      const accessFingerprint = sha256(JSON.stringify(canonicalAccess(access)));
+      if (session.accessFingerprint && session.accessFingerprint !== accessFingerprint) {
+        throw new AccessDeniedError("授权范围已变化，必须使用对应权限的独立会话。", "session_scope_mismatch");
+      }
+      session.accessFingerprint = accessFingerprint;
+      if (!this._takeOverChangedPrefetch(session, request)) {
+        this._queueRequest(session, request);
+        this._drainSessionQueue(session);
+      }
+    } catch (error) { waiter.reject(error); }
     return waiter.promise;
+  }
+
+  _hasActiveOwners(active) {
+    const alive = (waiter) => waiter && !waiter.lifecycle?.settled;
+    return active.waiters.some(alive) || [...active.pendingSteerWaiters].some(alive)
+      || alive(active.preStartReplacement?.waiter);
+  }
+
+  _notifyTiming(waiter, event) {
+    if (typeof waiter.onTiming !== "function") return;
+    try { Promise.resolve(waiter.onTiming(event)).catch(() => {}); } catch {}
+  }
+
+  _markSessionStarted(waiter) {
+    waiter.lifecycle?.throwIfStopped();
+    if (waiter.executionStarted) return;
+    waiter.executionStarted = true;
+    this._notifyTiming(waiter, { stage: "session_started", queueWaitMs: Math.max(0, performance.now() - waiter.enqueuedAtMs) });
+  }
+
+  _interruptTurn(threadId, turnId) {
+    if (!threadId || !turnId) return;
+    try { Promise.resolve(this.client.interruptTurn(threadId, turnId)).catch(() => {}); } catch {}
+  }
+
+  _cancelRequest(session, request, error) {
+    session.requestQueue = session.requestQueue.filter((queued) => queued !== request);
+    const active = session.active;
+    if (!active) return;
+    active.waiters = active.waiters.filter((waiter) => waiter !== request.waiter);
+    active.pendingSteerWaiters.delete(request.waiter);
+    if (active.preStartReplacement === request) active.preStartReplacement = null;
+    if (this._hasActiveOwners(active)) return;
+    const threadId = session.threadId;
+    const turnId = active.turnId;
+    this._finishActive(session, active);
+    this._invalidateThread(session, error.code === REQUEST_DEADLINE_EXCEEDED ? "request_deadline" : "request_cancelled");
+    this._interruptTurn(threadId, turnId);
+    this._emit("activity", { status: "turn_cancelled", reason: error.code });
   }
 
   _resolveHandoff(session, request) {
@@ -492,6 +562,7 @@ class PersistentCodexAgent extends EventEmitter {
   }
 
   _queueRequest(session, request, options = {}) {
+    if (request.waiter.lifecycle?.settled) return;
     if (session.requestQueue.length >= MAX_SESSION_QUEUED_REQUESTS) {
       const displaced = session.requestQueue.splice(0);
       for (const stale of displaced) this._resolveHandoff(session, stale);
@@ -517,6 +588,8 @@ class PersistentCodexAgent extends EventEmitter {
     const correctionRouteOverride = active.businessMode && correctionIntent && (scopeChanged || entityScopeCorrection);
     if (incomingRoute.mode !== activeMode && !correctionRouteOverride) return false;
     if (!scopeChanged && !entityScopeCorrection) return false;
+    request.waiter.lifecycle?.limitDeadline(active.deadlineAtMs);
+    request.waiter.lifecycle?.throwIfStopped();
 
     const priorContext = priorReplacement
       ? appendPreStartContext(priorReplacement.preStartContext || active.taskContext || initialPreStartContext(active.question), priorReplacement.question)
@@ -557,6 +630,7 @@ class PersistentCodexAgent extends EventEmitter {
     session.operation = (async () => {
       while (session.requestQueue.length) {
         const request = session.requestQueue.shift();
+        if (request.waiter.lifecycle?.settled) continue;
         try { await this._submit(session, request); } catch (error) { request.waiter.reject(error); }
       }
     })().finally(() => {
@@ -573,6 +647,7 @@ class PersistentCodexAgent extends EventEmitter {
       session.active.preStartReplacement = null;
       replacement.waiter.reject(error);
     }
+    for (const waiter of session.active?.pendingSteerWaiters || []) waiter.reject(error);
   }
 
   async _submit(session, request) {
@@ -587,32 +662,42 @@ class PersistentCodexAgent extends EventEmitter {
       preStartContext,
       requiresDynamicEntityQuery = false
     } = request;
-    this._assertOperational();
-    await this._ensureThread(session);
+    waiter.lifecycle?.throwIfStopped();
     this._assertOperational();
     if (session.active) {
       const active = session.active;
       const activeMode = active.businessMode ? "xbb" : "general";
       const incomingRoute = warmup ? Object.freeze({ mode: "xbb", reason: "skill-warmup" }) : routeSkill(question, activeMode);
       if (!warmup && !active.warmup && incomingRoute.mode === activeMode) {
-        const nextTaskContext = updateTaskContext(active.taskContext, question, { mode: activeMode, continuation: true });
+        const nextContinuation = isTaskContinuation(question, active.taskContext, activeMode, incomingRoute.reason);
+        const nextTaskContext = updateTaskContext(active.taskContext, question, { mode: activeMode, continuation: nextContinuation });
         const nextSteerInput = steerInput(question, nextTaskContext);
+        const nextCheckpoint = this._checkpointForContext(session, active.businessMode, nextTaskContext, question, nextContinuation);
+        if (nextCheckpoint) nextSteerInput.push({ type: "text", text: formatTaskCheckpoint(nextCheckpoint), text_elements: [] });
         const nextSteerBytes = inputBytes(nextSteerInput);
         if (active.steerCount < MAX_STEER_COUNT && active.steerInputBytes + nextSteerBytes <= MAX_STEER_INPUT_BYTES) {
-          return this._steerActiveTurn(session, active, { question, access, messageId, waiter, warmup, taskContext: nextTaskContext }, nextSteerInput, nextSteerBytes);
+          return this._steerActiveTurn(session, active, { question, access, messageId, waiter, warmup, taskContext: nextTaskContext, taskCheckpoint: nextCheckpoint }, nextSteerInput, nextSteerBytes);
         }
         await this._notifyWaiter(waiter, "当前分析已接收较多补充要求；这条消息将在当前结果完成后使用新 Turn 继续处理。", false);
         this._emit("activity", { status: "turn_queued", reason: "steer_budget" });
-        await active.done.promise;
+        await waiter.lifecycle.wait(active.done.promise);
+        waiter.lifecycle.throwIfStopped();
         this._assertOperational();
         return this._submit(session, request);
       }
       await this._notifyWaiter(waiter, "已收到新问题。它与当前分析属于不同范围，将在上一条完成后自动继续处理。", false);
       this._emit("activity", { status: "turn_queued" });
-      await active.done.promise;
+      await waiter.lifecycle.wait(active.done.promise);
+      waiter.lifecycle.throwIfStopped();
       this._assertOperational();
       return this._submit(session, request);
     }
+
+    // Queueing ends before thread preparation, not before a wait on another turn.
+    this._markSessionStarted(waiter);
+    await this._ensureThread(session, waiter.lifecycle);
+    waiter.lifecycle?.throwIfStopped();
+    this._assertOperational();
 
     session.access = access;
     const route = warmup
@@ -623,7 +708,8 @@ class PersistentCodexAgent extends EventEmitter {
     const businessMode = route.mode === "xbb";
     const timeoutMs = businessMode ? this.businessTurnTimeoutMs : this.generalTurnTimeoutMs;
     const totalTimeoutMs = businessMode ? this.businessTotalTimeoutMs : this.generalTotalTimeoutMs;
-    const active = this._newActive(null, waiter, { allowTools: businessMode && !warmup, businessMode, routeReason: route.reason, warmup, timeoutMs, totalTimeoutMs });
+    const active = this._newActive(null, waiter, { allowTools: businessMode && !warmup, businessMode, routeReason: route.reason, warmup, timeoutMs, totalTimeoutMs,
+      deadlineAtMs: waiter.lifecycle?.deadline });
     session.active = active;
     this._armAbsoluteTimeout(session, active);
     let turnStartFailureCandidate = false;
@@ -642,6 +728,8 @@ class PersistentCodexAgent extends EventEmitter {
       const continuation = !warmup && (Boolean(preStartContext) || isTaskContinuation(question, session.taskContext, route.mode, route.reason));
       const priorTaskContext = preStartContext || (continuation ? session.taskContext : null);
       active.taskContext = warmup ? null : updateTaskContext(priorTaskContext, question, { mode: route.mode, continuation });
+      active.taskCheckpoint = this._checkpointForContext(session, businessMode, active.taskContext, question, continuation);
+      session.taskCheckpoint = active.taskCheckpoint;
       const turnEffort = warmup ? "none" : businessMode ? chooseTurnEffort(question, this.config.codexReasoningEffort) : chooseGeneralTurnEffort(question, this.config.codexReasoningEffort);
       let prefetchedFactPack = null;
       let prefetchedFactView = null;
@@ -750,6 +838,7 @@ class PersistentCodexAgent extends EventEmitter {
             "本轮不是销帮帮经营查询，不注入经营或辅助图 Skill，不得调用 query_xbb，chart 固定为 null。请直接使用通用能力回答用户。",
             ...continuity,
             ...(taskGuidance ? [taskGuidance] : []),
+            ...(active.taskCheckpoint ? [formatTaskCheckpoint(active.taskCheckpoint)] : []),
             "【用户问题】",
             formatUserMessage(question)
           ].join("\n");
@@ -768,7 +857,7 @@ class PersistentCodexAgent extends EventEmitter {
       }
       const upcomingBytes = inputBytes(input);
       if (this._shouldRotateThread(session, upcomingBytes, { businessMode, hasFacts: Boolean(prefetchedFactView), warmup })) {
-        await this._replaceThread(session, "context_budget");
+        await this._replaceThread(session, "context_budget", waiter.lifecycle);
         this._assertOperational();
         if (session.active !== active) return;
       }
@@ -789,18 +878,28 @@ class PersistentCodexAgent extends EventEmitter {
       session.turnInProgress = true;
       this._persistSession(session);
       turnStartFailureCandidate = true;
-      const result = await this.client.startTurn(turnParams);
+      waiter.lifecycle?.throwIfStopped();
+      const turnStart = this.client.startTurn(turnParams);
+      void Promise.resolve(turnStart).then((lateResult) => {
+        if (session.active !== active || active.abortController.signal.aborted) {
+          const lateId = extractTurnId(lateResult);
+          this._interruptTurn(turnParams.threadId, lateId);
+        }
+      }).catch(() => {});
+      const result = await waiter.lifecycle.wait(turnStart);
       const startedTurnId = extractTurnId(result);
       if (session.active !== active || active.abortController.signal.aborted) {
-        try { await this.client.interruptTurn(turnParams.threadId, startedTurnId); } catch {}
+        this._interruptTurn(turnParams.threadId, startedTurnId);
         return;
       }
       active.turnId = startedTurnId;
+      this._bindActiveCheckpoint(session, active);
       turnStartFailureCandidate = false;
       this.consecutiveAppServerFailures = 0;
       this._emit("activity", { status: "turn_started" });
       this._armTurnTimeout(session, active);
     } catch (error) {
+      if (isRequestLifecycleError(error)) throw error;
       if (active.deadlineExceeded) {
         if (active.deadlineHandling) await active.deadlineHandling;
         return;
@@ -827,14 +926,18 @@ class PersistentCodexAgent extends EventEmitter {
     // Reject an invalid/future scope before sending a steer or transferring the
     // answer owner. A rejected correction must leave the original turn intact.
     const incomingPlan = active.businessMode ? planFastQuery(request.question) : null;
+    request.waiter.lifecycle?.limitDeadline(active.deadlineAtMs);
+    request.waiter.lifecycle?.throwIfStopped();
+    this._markSessionStarted(request.waiter);
     active.steerInFlight = true;
+    active.pendingSteerWaiters.add(request.waiter);
     let steerError = null;
     let accepted = false;
+    let sent = false;
     try {
-      const result = await this.client.steerTurn({
-        threadId: session.threadId,
-        expectedTurnId: active.turnId,
-        input
+      const result = await request.waiter.lifecycle.wait(() => {
+        sent = true;
+        return this.client.steerTurn({ threadId: session.threadId, expectedTurnId: active.turnId, input });
       });
       if (result?.turnId !== active.turnId) throw new Error("Codex App Server 未确认目标活动 Turn。");
       if (session.active === active) {
@@ -843,6 +946,7 @@ class PersistentCodexAgent extends EventEmitter {
         active.steerCount += 1;
         active.steerInputBytes += steerBytes;
         active.inputBytes += steerBytes;
+        active.replayTurnParams = { ...active.replayTurnParams, input: [...active.replayTurnParams.input, ...input] };
         const priorFingerprint = queryFingerprint(active.queryPlan);
         const incomingFingerprint = queryFingerprint(incomingPlan);
         if (!priorFingerprint || priorFingerprint !== incomingFingerprint) {
@@ -864,6 +968,9 @@ class PersistentCodexAgent extends EventEmitter {
         active.taskContext = request.taskContext || updateTaskContext(active.taskContext, request.question, {
           mode: active.businessMode ? "xbb" : "general", continuation: true
         });
+        active.taskCheckpoint = request.taskCheckpoint || null;
+        session.taskCheckpoint = active.taskCheckpoint;
+        this._bindActiveCheckpoint(session, active);
         session.access = request.access;
         this._armTurnTimeout(session, active);
         this._emit("activity", { status: "turn_steered" });
@@ -878,7 +985,13 @@ class PersistentCodexAgent extends EventEmitter {
       }
     } catch (error) {
       steerError = error;
+      if (sent && session.active === active && this._hasActiveOwners(active)) {
+        // A cancelled or unacknowledged steer might have reached the model.
+        // Keep the previous owner, but discard that potentially changed turn.
+        await this._recoverCancelledSteer(session, active);
+      }
     } finally {
+      active.pendingSteerWaiters.delete(request.waiter);
       active.steerInFlight = false;
       if (active.pendingCompletion && session.active === active) {
         const pendingCompletion = active.pendingCompletion;
@@ -887,14 +1000,65 @@ class PersistentCodexAgent extends EventEmitter {
       }
     }
     if (accepted) return;
+    if (steerError) throw routedTurnError(steerError, active.businessMode);
     if (session.active !== active) {
       return this._submit(session, request);
     }
     throw routedTurnError(steerError || new Error("Codex 追问追加失败。"), active.businessMode);
   }
 
-  async _startThread(session) {
-    const result = await this.client.startThread({
+  async _recoverCancelledSteer(session, active) {
+    const owner = active.waiters.find((waiter) => !waiter.lifecycle?.settled);
+    if (session.active !== active) return;
+    const oldThreadId = session.threadId;
+    const oldTurnId = active.turnId;
+    if (!owner) {
+      this._finishActive(session, active);
+      this._invalidateThread(session, "unconfirmed_steer_without_owner");
+      this._interruptTurn(oldThreadId, oldTurnId);
+      return;
+    }
+    this._pauseTurnTimeout(active);
+    this._cancelActiveQuery(active, "已取消的追问不再参与当前分析。");
+    active.factGeneration += 1;
+    active.turnId = null;
+    active.pendingCompletion = null;
+    active.messages.clear();
+    active.finalText = "";
+    active.lastText = "";
+    active.streamedMessageBytes = 0;
+    this._invalidateThread(session, "cancelled_steer");
+    this._interruptTurn(oldThreadId, oldTurnId);
+    try {
+      await this._ensureThread(session, owner.lifecycle);
+      owner.lifecycle.throwIfStopped();
+      if (session.active !== active) return;
+      const params = { ...active.replayTurnParams, threadId: session.threadId };
+      active.replayTurnParams = params;
+      session.turnInProgress = true;
+      this._persistSession(session);
+      const starting = this.client.startTurn(params);
+      void Promise.resolve(starting).then((result) => {
+        if (session.active !== active || active.abortController.signal.aborted) this._interruptTurn(params.threadId, extractTurnId(result));
+      }).catch(() => {});
+      const result = await owner.lifecycle.wait(starting);
+      if (session.active !== active) return;
+      active.turnId = extractTurnId(result);
+      this._bindActiveCheckpoint(session, active);
+      this._armTurnTimeout(session, active);
+    } catch (error) {
+      if (session.active === active) {
+        const waiters = active.waiters.slice();
+        this._finishActive(session, active);
+        this._invalidateThread(session, "cancelled_steer_recovery_failed");
+        for (const waiter of waiters) waiter.reject(routedTurnError(error, active.businessMode));
+      }
+    }
+  }
+
+  async _startThread(session, lifecycle = null) {
+    lifecycle?.throwIfStopped();
+    const starting = this.client.startThread({
       model: this.config.codexModel,
       allowProviderModelFallback: false,
       cwd: this.projectRoot,
@@ -904,6 +1068,8 @@ class PersistentCodexAgent extends EventEmitter {
       ephemeral: false,
       dynamicTools: [QUERY_XBB_DYNAMIC_TOOL]
     });
+    const result = lifecycle ? await lifecycle.wait(starting) : await starting;
+    lifecycle?.throwIfStopped();
     session.threadId = extractThreadId(result);
     session.turnCount = 0;
     session.estimatedInputBytes = 0;
@@ -915,11 +1081,13 @@ class PersistentCodexAgent extends EventEmitter {
     this._emit("threadReady", { principalKey: session.principalKey });
   }
 
-  async _ensureThread(session) {
+  async _ensureThread(session, lifecycle = null) {
+    lifecycle?.throwIfStopped();
     if (!session.threadId) {
       try {
-        await this._startThread(session);
+        await this._startThread(session, lifecycle);
       } catch (error) {
+        if (isRequestLifecycleError(error)) throw error;
         this._fatal("Codex App Server 无法创建 Thread。");
         throw error;
       }
@@ -928,12 +1096,13 @@ class PersistentCodexAgent extends EventEmitter {
     if (!session.needsResume) return;
     if (session.turnInProgress) {
       this._invalidateThread(session, "unfinished_turn_after_restart");
-      await this._startThread(session);
+      await this._startThread(session, lifecycle);
       this._emit("activity", { status: "context_rotated", reason: "unfinished_turn_after_restart" });
       return;
     }
     try {
-      const resumed = await this.client.resumeThread(session.threadId, {
+      const resumedThreadId = session.threadId;
+      const resuming = this.client.resumeThread(resumedThreadId, {
         cwd: this.projectRoot,
         model: this.config.codexModel,
         approvalPolicy: "never",
@@ -941,30 +1110,40 @@ class PersistentCodexAgent extends EventEmitter {
         developerInstructions: this.instructions,
         excludeTurns: true
       });
+      void Promise.resolve(resuming).then((result) => {
+        if (lifecycle?.signal.aborted) this._interruptTurn(resumedThreadId, extractActiveTurnId(result));
+      }).catch(() => {});
+      const resumed = lifecycle ? await lifecycle.wait(resuming) : await resuming;
       const activeTurnId = extractActiveTurnId(resumed);
-      if (activeTurnId) await this.client.interruptTurn(session.threadId, activeTurnId).catch(() => {});
+      if (activeTurnId) {
+        const interruption = this.client.interruptTurn(session.threadId, activeTurnId);
+        if (lifecycle) await lifecycle.wait(interruption);
+        else await interruption;
+      }
       session.needsResume = false;
       session.resumed = true;
       this._emit("activity", { status: "context_resumed" });
-    } catch {
+    } catch (error) {
+      if (isRequestLifecycleError(error)) throw error;
       this._invalidateThread(session, "resume_failed");
       try {
-        await this._startThread(session);
+        await this._startThread(session, lifecycle);
       } catch (error) {
+        if (isRequestLifecycleError(error)) throw error;
         this._fatal("Codex App Server 无法恢复或重建 Thread。");
         throw error;
       }
     }
   }
 
-  async _replaceThread(session, reason) {
+  async _replaceThread(session, reason, lifecycle = null) {
     session.threadId = null;
     session.turnCount = 0;
     session.estimatedInputBytes = 0;
     session.tokenUsage = null;
     session.turnInProgress = false;
     delete this.state.threads[session.principalKey];
-    await this._startThread(session);
+    await this._startThread(session, lifecycle);
     this._emit("activity", { status: "context_rotated", reason });
   }
 
@@ -1014,6 +1193,22 @@ class PersistentCodexAgent extends EventEmitter {
   _rememberIntent(session, active) {
     if (active.warmup || !active.taskContext) return;
     session.taskContext = active.taskContext;
+  }
+
+  _checkpointForContext(session, businessMode, context, question, continuation = false) {
+    if (businessMode || !context?.databaseTask) return null;
+    const binding = { principalKey: session.principalKey, routeMode: "general", revision: session.taskCheckpoint?.revision };
+    return continuation && session.taskCheckpoint
+      ? reviseTaskCheckpoint(session.taskCheckpoint, { context, question, binding })
+      : createTaskCheckpoint({ ...binding, context, question });
+  }
+
+  _bindActiveCheckpoint(session, active) {
+    if (!active.taskCheckpoint || !active.turnId) return;
+    active.taskCheckpoint = bindCheckpointTurn(active.taskCheckpoint, {
+      principalKey: session.principalKey, routeMode: "general", revision: active.taskCheckpoint.revision, turnId: active.turnId
+    });
+    session.taskCheckpoint = active.taskCheckpoint;
   }
 
   _recordSuccessfulTurn(session, active) {
@@ -1074,6 +1269,7 @@ class PersistentCodexAgent extends EventEmitter {
       steerInputBytes: 0,
       steerInFlight: false,
       pendingCompletion: null,
+      pendingSteerWaiters: new Set(),
       modelErrorCode: null,
       modelRetrying: false,
       done,
@@ -1091,14 +1287,17 @@ class PersistentCodexAgent extends EventEmitter {
       queryPlan: null,
       question: "",
       taskContext: null,
+      taskCheckpoint: null,
       inputBytes: 0,
       replayTurnParams: null,
       startedAtMs: Date.now(),
       toolStartedAtMs: null,
       timeoutMs: Number(options.timeoutMs || 0),
+      generationRemainingMs: Number(options.timeoutMs || 0),
+      generationRunningAt: null,
       timeout: null,
       totalTimeoutMs: Number(options.totalTimeoutMs || options.timeoutMs || 0),
-      deadlineAtMs: Date.now() + Number(options.totalTimeoutMs || options.timeoutMs || 0),
+      deadlineAtMs: Math.min(options.deadlineAtMs ?? Infinity, performance.now() + Number(options.totalTimeoutMs || options.timeoutMs || 0)),
       absoluteTimeout: null,
       deadlineExceeded: false,
       deadlineTimeoutMs: null,
@@ -1153,11 +1352,17 @@ class PersistentCodexAgent extends EventEmitter {
   _pauseTurnTimeout(active) {
     if (active.timeout) clearTimeout(active.timeout);
     active.timeout = null;
+    if (active.generationRunningAt !== null) {
+      active.generationRemainingMs = Math.max(0, active.generationRemainingMs - (performance.now() - active.generationRunningAt));
+      active.generationRunningAt = null;
+    }
   }
 
-  _armTurnTimeout(session, active) {
+  _armTurnTimeout(session, active, { resetAfterTool = false } = {}) {
     this._pauseTurnTimeout(active);
-    if (session.active !== active || active.deadlineExceeded || active.inFlightToolCount > 0) return;
+    if (session.active !== active || active.deadlineExceeded || !active.turnId || active.inFlightToolCount > 0) return;
+    if (resetAfterTool) active.generationRemainingMs = active.timeoutMs;
+    active.generationRunningAt = performance.now();
     active.timeout = setTimeout(() => {
       active.timeout = null;
       if (session.active !== active || active.deadlineExceeded) return;
@@ -1165,14 +1370,14 @@ class PersistentCodexAgent extends EventEmitter {
       active.deadlineTimeoutMs = active.timeoutMs;
       this._abortActive(active, "Codex Agent 本轮生成阶段超过时限。");
       active.deadlineHandling = this._timeoutTurn(session, active).catch(() => {});
-    }, active.timeoutMs);
+    }, Math.max(0, active.generationRemainingMs));
     active.timeout.unref?.();
   }
 
   _armAbsoluteTimeout(session, active) {
     if (active.absoluteTimeout) clearTimeout(active.absoluteTimeout);
     if (session.active !== active || active.deadlineExceeded) return;
-    const remainingMs = Math.max(0, active.deadlineAtMs - Date.now());
+    const remainingMs = Math.max(0, active.deadlineAtMs - performance.now());
     active.absoluteTimeout = setTimeout(() => {
       active.absoluteTimeout = null;
       if (session.active !== active || active.deadlineExceeded) return;
@@ -1350,7 +1555,7 @@ class PersistentCodexAgent extends EventEmitter {
       this._emit("activity", { status: "tool_failed", elapsedMs: Date.now() - active.toolStartedAtMs });
     } finally {
       active.inFlightToolCount = Math.max(0, active.inFlightToolCount - 1);
-      this._armTurnTimeout(session, active);
+      this._armTurnTimeout(session, active, { resetAfterTool: active.factGeneration === factGeneration });
     }
   }
 
@@ -1367,7 +1572,19 @@ class PersistentCodexAgent extends EventEmitter {
       const turnId = params?.turn?.id;
       if (session.active && typeof turnId === "string" && (!session.active.turnId || session.active.turnId === turnId)) {
         session.active.turnId = turnId;
+        this._bindActiveCheckpoint(session, session.active);
       }
+      return;
+    }
+    if (method === "turn/plan/updated") {
+      const active = session.active;
+      if (!active?.taskCheckpoint || active.businessMode || params?.turnId !== active.turnId || active.steerInFlight) return;
+      try {
+        active.taskCheckpoint = applyPlanUpdate(active.taskCheckpoint, params, {
+          principalKey: session.principalKey, routeMode: "general", revision: active.taskCheckpoint.revision, turnId: active.turnId
+        });
+        session.taskCheckpoint = active.taskCheckpoint;
+      } catch { /* A malformed/stale report cannot change the bound checkpoint. */ }
       return;
     }
     if (method === "error" && session.active && params.turnId === session.active.turnId) {
@@ -1492,28 +1709,30 @@ class PersistentCodexAgent extends EventEmitter {
     if (session.active !== active) return;
     active.deadlineExceeded = true;
     this._abortActive(active, "Codex Agent 本轮绝对截止时间已到。");
-    try { if (active.turnId) await this.client.interruptTurn(session.threadId, active.turnId); } catch {}
+    this._interruptTurn(session.threadId, active.turnId);
     if (session.active !== active) return;
-    if (this._resolveVerifiedFallback(session, active, "turn_timeout")) {
-      this._invalidateThread(session, "turn_timeout");
-      return;
-    }
-    const waiters = active.waiters.slice();
-    this._finishActive(session, active);
-    this._invalidateThread(session, "turn_timeout");
-    this._emit("activity", { status: "turn_failed", elapsedMs: Date.now() - active.startedAtMs, reason: "turn_timeout" });
     const error = new AgentTurnTimeoutError(
       active.businessMode ? "xbb" : "general",
       active.deadlineTimeoutMs || active.timeoutMs
     );
+    if (active.deadlineTimeoutMs === active.totalTimeoutMs) error.code = REQUEST_DEADLINE_EXCEEDED;
+    for (const waiter of active.pendingSteerWaiters) waiter.reject(error);
+    if (this._resolveVerifiedFallback(session, active, "turn_timeout")) {
+      this._invalidateThread(session, "turn_timeout");
+      return;
+    }
+    const waiters = [...active.waiters, ...active.pendingSteerWaiters];
+    this._finishActive(session, active);
+    this._invalidateThread(session, "turn_timeout");
+    this._emit("activity", { status: "turn_failed", elapsedMs: Date.now() - active.startedAtMs, reason: "turn_timeout" });
     for (const waiter of waiters) waiter.reject(error);
   }
 
   async _notifyWaiter(waiter, text, sanitize = true) {
-    if (typeof waiter.onProgress !== "function") return;
+    if (waiter.lifecycle?.settled || typeof waiter.onProgress !== "function") return;
     const content = sanitize ? sanitizeAgentText(text, { maxBytes: 4000 }) : text;
     if (!content) return;
-    try { await waiter.onProgress(content); } catch {}
+    try { Promise.resolve(waiter.onProgress(content)).catch(() => {}); } catch {}
   }
 
   _queryTimingCallback(session, active, signal, factGeneration = active.factGeneration) {
@@ -1527,7 +1746,7 @@ class PersistentCodexAgent extends EventEmitter {
           || active.abortController.signal.aborted || signal.aborted) return;
       terminalForwarded = true;
       for (const waiter of waiters) {
-        if (typeof waiter.onTiming !== "function") continue;
+        if (waiter.lifecycle?.settled || typeof waiter.onTiming !== "function") continue;
         try { Promise.resolve(waiter.onTiming(event)).catch(() => {}); } catch {}
       }
     };

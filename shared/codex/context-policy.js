@@ -10,7 +10,7 @@ const SOFT_SEGMENT_BYTES = 4 * 1024;
 const MAX_INTENT_BYTES = 960;
 const MAX_CONSTRAINT_BYTES = 480;
 const TASK_RESET_PATTERN = /^(?:换个话题|新问题|另一个问题|不谈这个|忘掉(?:前面|之前|上面))/u;
-const CONTINUATION_PATTERN = /^(?:(?:请|麻烦)(?:帮我)?)?(?:继续|接着|沿用|按(?:照)?(?:上面|上述|刚才|这个|之前)|在此基础|另外|补充|还有|改成|改为|换成|只看|只要|不要|不能|必须|保留|保持|重新|再(?:看|查|改|细|加|解释)|然后呢|详细点|展开|[1-9一二三四五六七八九十][.。?？]?$)/u;
+const CONTINUATION_PATTERN = /^(?:(?:请|麻烦)(?:帮我)?)?(?:继续|接着|沿用|按(?:照)?(?:上面|上述|刚才|这个|之前)|在此基础|另外|补充|还有|改成|改为|改用|修正|替换|换成|只看|只要|不要|不能|必须|保留|保持|重新|再(?:看|查|改|细|加|解释)|然后呢|详细点|展开|[1-9一二三四五六七八九十][.。?？]?$)/u;
 const CONSTRAINT_PATTERN = /不得|不能|不要|禁止|必须|务必|保留|兼容|约束|限制|只读|仅限|只看|只要|排除|回退|回滚|不停机|零停机|不丢数据|\b(?:must|never|preserve|without|constraint|read.only|rollback)\b/iu;
 const EXPLICIT_GOAL_PATTERN = /^(?:(?:本次|当前|实际|核心|最终|主要|我的|用户)的?)?(?:任务)?(?:目标|目的|需求|任务)\s*(?:[：:]|是|为|改为|改成)|^(?:goal|objective|task)\s*:/iu;
 const WHY_QUESTION_PATTERN = /^(?:为什么|为啥)/u;
@@ -188,6 +188,20 @@ function formatTaskContext(context) {
   ].join("\n");
 }
 
+function taskIntentDescriptor(context) {
+  if (context?.mode !== "general" || context.databaseTask !== true) return null;
+  const count = (value) => Number.isInteger(value) && value >= 0 ? Math.min(999, value) : 0;
+  return Object.freeze({
+    goal: sanitizeIntent(String(context.goal || ""), "general"),
+    constraints: Object.freeze((Array.isArray(context.constraints) ? context.constraints : [])
+      .slice(0, 8).map((value) => sanitizeIntent(String(value), "general", MAX_CONSTRAINT_BYTES))),
+    omittedConstraints: count(context.omittedConstraints),
+    omittedSourceBlocks: count(context.omittedSourceBlocks),
+    omittedTextUnits: count(context.omittedTextUnits),
+    sourceComplete: false
+  });
+}
+
 function buildComplexTaskGuidance(question, context) {
   if (context?.mode !== "general") return "";
   if (context.databaseTask) {
@@ -221,5 +235,6 @@ module.exports = {
   formatUserMessage,
   isTaskContinuation,
   segmentUserMessage,
+  taskIntentDescriptor,
   updateTaskContext
 };

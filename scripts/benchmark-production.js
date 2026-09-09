@@ -9,14 +9,29 @@ const { summarizeTimings, percentile } = require("../shared/observability/reques
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const GREETING = "你好。请只用一句中文说明你是通用编程助手，不调用任何工具。";
+const FIXED_WORKLOADS = Object.freeze([
+  { id: "exact-format", question: "不要调用任何工具。严格只回复四个大写字母 READY，不加标点。", matches: (answer) => answer.trim() === "READY" },
+  { id: "small-reasoning", question: "不调用工具。一个函数把数组 [3,1,3,2] 去重后升序排列。严格只回复结果数组的 JSON，不解释。", matches: (answer) => /^\[\s*1\s*,\s*2\s*,\s*3\s*\]$/.test(answer.trim()) },
+  { id: "constraint-following", question: "不调用工具。把英文 apple 翻译成中文。只输出译文，不加解释、标点、拼音或英文。", matches: (answer) => answer.trim() === "苹果" }
+]);
+
+function summarizeLiveSamples(samples) {
+  const summary = (values) => ({ count: values.length, passed: values.filter((sample) => sample.passed).length,
+    failed: values.filter((sample) => !sample.passed).length,
+    timeouts: values.filter((sample) => sample.failure === "AgentTurnTimeoutError" || sample.failure === "REQUEST_DEADLINE_EXCEEDED").length,
+    p50Ms: percentile(values.map((sample) => sample.answerMs), 0.5),
+    p95Ms: percentile(values.map((sample) => sample.answerMs), 0.95),
+    p99Ms: percentile(values.map((sample) => sample.answerMs), 0.99) });
+  return { ...summary(samples), byScenario: Object.fromEntries([...new Set(samples.map((sample) => sample.scenario))].map((scenario) => [scenario, summary(samples.filter((sample) => sample.scenario === scenario))])) };
+}
 
 function parseOptions(args) {
-  const allowed = /^(?:--live|--business|--context|--repeat=[1-5])$/;
-  if (args.some((arg) => !allowed.test(arg))) throw new Error("参数仅支持 --live [--repeat=1..5] [--context] [--business]。");
+  const allowed = /^(?:--live|--business|--context|--workload|--repeat=[1-5])$/;
+  if (args.some((arg) => !allowed.test(arg))) throw new Error("参数仅支持 --live [--repeat=1..5] [--context] [--business] [--workload]。");
   if (!args.includes("--live") && args.some((arg) => arg !== "--repeat=1")) {
     if (args.length) throw new Error("在线场景必须显式指定 --live；默认只运行离线交付故障基准。");
   }
-  return { live: args.includes("--live"), business: args.includes("--business"), context: args.includes("--context"), repeat: Number(args.find((arg) => arg.startsWith("--repeat="))?.split("=")[1] || 3) };
+  return { live: args.includes("--live"), business: args.includes("--business"), context: args.includes("--context"), workload: args.includes("--workload"), repeat: Number(args.find((arg) => arg.startsWith("--repeat="))?.split("=")[1] || 3) };
 }
 
 function runtimeRoot() {
@@ -29,7 +44,7 @@ function readProbeConfig() {
   // Do not decrypt or copy the bot secret, credentials, policy, or production state.
   const codexModel = configured.codexModel || "gpt-5.6-sol";
   const codexReasoningEffort = configured.codexReasoningEffort || "medium";
-  if (!/^[a-zA-Z0-9._-]{1,128}$/.test(codexModel) || !["none", "minimal", "low", "medium", "high", "xhigh"].includes(codexReasoningEffort)) throw new Error("本机模型配置不合法。");
+  if (!/^[a-zA-Z0-9._-]{1,128}$/.test(codexModel) || !["none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(codexReasoningEffort)) throw new Error("本机模型配置不合法。");
   const productionStatePath = process.env.XBB_AGENT_STATE_PATH || configured.agentStatePath || path.join(runtimeRoot(), "agent-state.json");
   if (!path.isAbsolute(productionStatePath)) throw new Error("生产状态文件必须是绝对路径。");
   return { codexModel, codexReasoningEffort, productionStatePath };
@@ -84,7 +99,7 @@ async function liveProbe(options) {
     try { response = await agent.answer({ question, access, principalKey, messageId: `local-probe-${samples.length + 1}` }); }
     catch (error) {
       const failure = { scenario, passed: false, answerMs: Math.round(performance.now() - before),
-        failure: ["AgentTurnTimeoutError", "AgentTurnFailureError", "AccessDeniedError"].includes(error?.name) ? error.name : "probe_failed",
+        failure: error?.code === "REQUEST_DEADLINE_EXCEEDED" ? error.code : ["AgentTurnTimeoutError", "AgentTurnFailureError", "AccessDeniedError"].includes(error?.name) ? error.name : "probe_failed",
         modelErrorCode: ["unauthorized", "connection_failed", "usage_limit", "context_limit", "invalid_request", "service_error"].includes(error?.modelErrorCode) ? error.modelErrorCode : null,
         stages: events.slice(eventIndex).map((event) => event.status), scheduling: [...scheduling]
       };
@@ -113,11 +128,20 @@ async function liveProbe(options) {
     await agent.start();
     const startupMs = Math.round(performance.now() - start);
     const warmStart = performance.now();
-    await agent.warm({ access, principalKey });
+    // Fixed workloads start with a genuinely cold general Thread; no business
+    // skill warmup is charged to or hidden ahead of the first measured sample.
+    if (!options.workload) await agent.warm({ access, principalKey });
     const warmMs = Math.round(performance.now() - warmStart);
     const generalChecks = (response, currentEvents) => ({ nonempty: Boolean(response.answer?.trim()), generalRoute: response.routeMode === "general", noBusinessQuery: !currentEvents.some((event) => event.status === "tool_started"), noChart: response.chart === null });
-    for (let index = 0; index < options.repeat; index += 1) await probe("baseline-greeting", GREETING, generalChecks);
-    await probe("strict-greeting", "你好", generalChecks);
+    if (options.workload) {
+      for (let index = 0; index < options.repeat; index += 1) {
+        for (const workload of FIXED_WORKLOADS) await probe(workload.id, workload.question,
+          (response, currentEvents) => ({ ...generalChecks(response, currentEvents), expectedAnswer: workload.matches(response.answer) }));
+      }
+    } else {
+      for (let index = 0; index < options.repeat; index += 1) await probe("baseline-greeting", GREETING, generalChecks);
+      await probe("strict-greeting", "你好", generalChecks);
+    }
     if (options.context) {
       const question = [
         "以下为虚构工程验收场景，不连接任何数据库、不执行 SQL。请给迁移计划，明确当前只是方案。",
@@ -127,12 +151,18 @@ async function liveProbe(options) {
         "关键约束：资金不能丢失精度；分批回填必须幂等，失败可回滚；必须说明校验与停止条件。",
         "按现状与目标、影响、迁移及回滚、验证、执行条件五段简洁回答。"
       ].join("\n\n");
-      await probe("database-plan", question, (response, currentEvents) => ({ ...generalChecks(response, currentEvents), rollback: /回滚|回退/.test(response.answer), validation: /校验|验证/.test(response.answer), planOnly: /方案|未执行|不执行|只读/.test(response.answer) }));
+      await probe("database-plan", question, (response, currentEvents) => {
+        const checkpoint = agent.sessions.get(principalKey)?.taskCheckpoint;
+        return { ...generalChecks(response, currentEvents), rollback: /回滚|回退/.test(response.answer), validation: /校验|验证/.test(response.answer), planOnly: /方案|未执行|不执行|只读/.test(response.answer),
+          checkpointBound: Boolean(checkpoint?.revision && checkpoint.materials?.count > 0),
+          executionUnverified: checkpoint?.executionStatus === "not-executed" && checkpoint.stages.every((stage) => stage.verified === false) };
+      });
       // Isolated fault injection: exercise a real replacement Thread without
       // touching the production agent or waiting 24 real turns.
       agent.sessions.get(principalKey).turnCount = 24;
       await probe("context-rotation-correction", "继续刚才的数据库迁移目标。修正：维护窗口改为30秒，旧接口兼容保留90天，其他限制不变。请先复述保留的目标与约束，再给下一步，仍不执行任何变更。", (response, currentEvents) => ({
         ...generalChecks(response, currentEvents), rotated: currentEvents.some((event) => event.status === "context_rotated"),
+        checkpointRevised: agent.sessions.get(principalKey)?.taskCheckpoint?.revision > 1,
         preservesGoal: /整数分|金额.*分|浮点/.test(response.answer), revisedWindow: /30\s*秒|三十秒/.test(response.answer), revisedCompatibility: /90\s*天|九十天/.test(response.answer), retainsRestriction: /不.*删除|保留.*旧字段|旧字段.*保留/.test(response.answer)
       }));
     }
@@ -152,7 +182,8 @@ async function liveProbe(options) {
     }
     const greetingMs = samples.filter((sample) => sample.scenario === "baseline-greeting").map((sample) => sample.answerMs);
     return { model: config.codexModel, configuredEffort: config.codexReasoningEffort, codexVersion: readCodexVersion(config), startupMs, warmMs,
-      greeting: { count: greetingMs.length, p50: percentile(greetingMs, 0.5), p95: percentile(greetingMs, 0.95) }, samples,
+      greeting: { count: greetingMs.length, p50: percentile(greetingMs, 0.5), p95: percentile(greetingMs, 0.95) },
+      workloadVersion: options.workload ? "general-fixed-v1" : null, workloadStartsCold: options.workload, summary: summarizeLiveSamples(samples), samples,
       caveat: "低频小样本；未向企微发送消息；不代表生产SLA、手机首字或持续在线率。" };
   } finally {
     let closeFailed = false;
@@ -203,4 +234,4 @@ async function main(args = process.argv.slice(2)) {
 }
 
 if (require.main === module) main().catch(() => { process.stderr.write("生产探针未通过；未输出正文或上游异常详情，请核查本机登录与安全状态日志。\n"); process.exitCode = 1; });
-module.exports = { parseOptions, liveProbe, main };
+module.exports = { FIXED_WORKLOADS, parseOptions, summarizeLiveSamples, liveProbe, main };

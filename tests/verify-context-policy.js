@@ -76,6 +76,10 @@ function verify() {
   assert.equal(isTaskContinuation("继续", business, "general"), false);
   assert.equal(isTaskContinuation("继续", context, "general"), true);
   assert.equal(isTaskContinuation("不要删除索引", context, "general"), true);
+  for (const correction of ["改用新版 SQL 材料。", "修正：字段需要允许空值。", "替换为刚才提供的表结构。"])
+    assert.equal(isTaskContinuation(correction, context, "general"), true);
+  assert.equal(isTaskContinuation("新问题：改用另一套数据库。", context, "general"), false);
+  assert.equal(isTaskContinuation("换个话题：替换手机电池。", context, "general"), false);
   assert.equal(isTaskContinuation("新问题：解释数据库原理", context, "general"), false);
   assert.equal(isTaskContinuation("你好", context, "general"), false);
   assert.equal(isTaskContinuation("为什么天空是蓝色？", context, "general"), false, "独立 why 问题不能仅凭问句词继承数据库目标");

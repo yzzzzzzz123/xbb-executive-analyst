@@ -11,6 +11,10 @@ const SUITES = Object.freeze({
   unit: Object.freeze([
     "verify-project-boundaries.js",
     "verify-context-policy.js",
+    "verify-task-checkpoint.js",
+    "verify-delivery-deadline.js",
+    "verify-live-benchmark-contract.js",
+    "verify-runtime-observation.js",
     "verify-production-metrics.js",
     "verify-access-control.js",
     "verify-rag-knowledge-base.js",
@@ -25,6 +29,9 @@ const SUITES = Object.freeze({
     "verify-multi-period-consumers.js",
     "verify-charts.js",
     "verify-codex-app-server.js",
+    "verify-request-lifecycle.js",
+    "verify-reliability-benchmark.js",
+    "verify-database-rehearsal.py",
     "verify-wecom-long-connection.js",
   ]),
   windows: Object.freeze([
@@ -36,7 +43,7 @@ const SUITES = Object.freeze({
 function validateSuiteManifest(projectRoot = PROJECT_ROOT) {
   const registered = Object.values(SUITES).flat();
   const discovered = fs.readdirSync(path.join(projectRoot, "tests"))
-    .filter((file) => /^verify-.*\.(?:js|ps1)$/.test(file)).sort();
+    .filter((file) => /^verify-.*\.(?:js|ps1|py)$/.test(file)).sort();
   const duplicates = registered.filter((file, index) => registered.indexOf(file) !== index);
   const unregistered = discovered.filter((file) => !registered.includes(file));
   const missing = registered.filter((file) => !discovered.includes(file));
@@ -61,6 +68,14 @@ function windowsPowerShellEnvironment(environment = process.env) {
   return Object.fromEntries(Object.entries(environment).filter(([key]) => key.toLowerCase() !== "psmodulepath"));
 }
 
+function pythonRuntime() {
+  for (const [command, prefix] of [["python", []], ["py", ["-3"]]]) {
+    const probe = spawnSync(command, [...prefix, "--version"], { encoding: "utf8", windowsHide: true, shell: false, timeout: 10000 });
+    if (!probe.error && probe.status === 0 && /^Python 3\./.test(`${probe.stdout}${probe.stderr}`.trim())) return { command, prefix };
+  }
+  throw new Error("Python 3 is required for the isolated database rehearsal; no suite is skipped.");
+}
+
 function main(args = process.argv.slice(2)) {
   const options = parseArgs(args);
   const totalRegistered = validateSuiteManifest();
@@ -78,10 +93,11 @@ function main(args = process.argv.slice(2)) {
     for (const file of SUITES[group]) {
       const filePath = path.join(PROJECT_ROOT, "tests", file);
       const powershell = file.endsWith(".ps1");
-      const command = powershell ? "powershell.exe" : process.execPath;
+      const python = file.endsWith(".py") ? pythonRuntime() : null;
+      const command = powershell ? "powershell.exe" : python ? python.command : process.execPath;
       const commandArgs = powershell
         ? ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", filePath]
-        : [filePath];
+        : python ? [...python.prefix, filePath] : [filePath];
       process.stdout.write(`[test:start] ${group}/${file}\n`);
       const suiteStarted = performance.now();
       const child = spawnSync(command, commandArgs, {

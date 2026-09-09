@@ -147,7 +147,11 @@ async function buildRuntime(config, options = {}) {
         throw error;
       }
     }
-    const handler = handlerFactory({ policy, agent, statusWriter });
+    const handler = handlerFactory({
+      policy, agent, statusWriter,
+      businessRequestBudgetMs: agent.businessTotalTimeoutMs,
+      generalRequestBudgetMs: agent.generalTotalTimeoutMs
+    });
     return Object.freeze({
       handleMessage: (frame, client) => handler.handleMessage(frame, client),
       close,

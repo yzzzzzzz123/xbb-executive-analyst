@@ -839,20 +839,23 @@ class FakeAppServerClient extends EventEmitter {
     });
     await timingAgent.start();
     const timingPrincipal = principalKeyFromUserId("query-timing-user", access);
+    const sessionTimings = [];
     const timingAnswer = timingAgent.answer({ question: "集团8月业绩排名", access, principalKey: timingPrincipal, onTiming: (event) => {
-      originalTimings.push(event);
+      if (["session_started", "session_expired"].includes(event.stage)) sessionTimings.push(event);
+      else originalTimings.push(event);
       return new Promise(() => {});
     } });
     await nextImmediate();
     assert.deepEqual(timingAgent.sessions.get(timingPrincipal).active.queryPlan.months, ["2026-08"], "首次裸月份必须真正选中8月");
     assert.deepEqual(originalTimings.map((event) => event.stage), ["completed"], "预取终态时长应转发，阶段事件不重复计时");
+    assert.deepEqual(sessionTimings.map((event) => event.stage), ["session_started"], "会话排队与取数计时分开记录");
     assert.equal(timingClient.startTurnCalls.length, 1, "未完成的外部 timing Promise 不得阻塞模型启动");
     timingClient.emit("serverRequest", { id: 991, method: "item/tool/call", params: {
       threadId: "thread-1", turnId: "turn-1", tool: "query_xbb", arguments: { months: ["2026-09"], domains: ["performance"] }
     } });
     await waitUntil(() => Boolean(delayedTimingInvocation), "动态查询应建立独立计时订阅");
     const timingSteer = timingAgent.answer({ question: "集团9月业绩排名", access, principalKey: timingPrincipal, onTiming: (event) => {
-      steeredTimings.push(event);
+      if (!["session_started", "session_expired"].includes(event.stage)) steeredTimings.push(event);
       throw new Error("offline observer failure");
     } });
     await nextImmediate();
@@ -862,8 +865,8 @@ class FakeAppServerClient extends EventEmitter {
     delayedTimingInvocation.onTiming({ stage: "failed", elapsedMs: 38, queueWaitMs: 12, runMs: 26, shared: true });
     releaseTimingQuery();
     await waitUntil(() => timingClient.responses.some((item) => item.id === 991), "未完成的 observer 不能阻塞动态工具返回");
-    assert.equal(originalTimings.length, 2);
-    assert.equal(originalTimings.at(-1).runMs, 25);
+    assert.equal(originalTimings.length, 1, "已交接完成的旧 waiter 不接受迟到查询计时");
+    assert.equal(originalTimings.at(-1).runMs, 8, "只保留 handoff 前已完成的预取计时");
     assert.equal(steeredTimings.length, 0, "新 waiter 不得继承 steer 前查询的整段耗时");
     timingClient.emit("serverRequest", { id: 992, method: "item/tool/call", params: {
       threadId: "thread-1", turnId: "turn-1", tool: "query_xbb", arguments: { months: ["2026-07"], domains: ["performance"] }
@@ -1037,7 +1040,7 @@ class FakeAppServerClient extends EventEmitter {
       access,
       principalKey: prefetchPrincipal,
       messageId: "prefetch-old",
-      onTiming: (event) => oldPrefetchTimings.push(event)
+      onTiming: (event) => { if (!["session_started", "session_expired"].includes(event.stage)) oldPrefetchTimings.push(event); }
     });
     await firstPrefetchStarted;
     const latestPrefetch = prefetchAgent.answer({
@@ -1045,7 +1048,7 @@ class FakeAppServerClient extends EventEmitter {
       access,
       principalKey: prefetchPrincipal,
       messageId: "prefetch-new",
-      onTiming: (event) => newPrefetchTimings.push(event)
+      onTiming: (event) => { if (!["session_started", "session_expired"].includes(event.stage)) newPrefetchTimings.push(event); }
     });
     assert.match((await supersededPrefetch).answer, /最新一条消息/);
     for (let index = 0; index < 4; index += 1) await nextImmediate();
@@ -1513,19 +1516,20 @@ class FakeAppServerClient extends EventEmitter {
     await timeoutAgent.start();
     const timeoutPrincipal = principalKeyFromUserId("timeout-user", access);
     const timeoutAnswer = timeoutAgent.answer({ question: "你好", access, principalKey: timeoutPrincipal, messageId: "timeout-race" });
+    const timeoutRejected = assert.rejects(timeoutAnswer, /超时/);
     await nextImmediate();
     const timeoutSession = timeoutAgent.sessions.get(timeoutPrincipal);
     const timeoutActive = timeoutSession.active;
     const timeoutOperation = timeoutAgent._timeoutTurn(timeoutSession, timeoutActive);
+    await timeoutRejected;
     await nextImmediate();
     timeoutClient.complete("thread-1", "turn-1", JSON.stringify({ answer: "抢在中断确认前正常完成。", chart: null }));
-    assert.match((await timeoutAnswer).answer, /正常完成/);
     releaseInterrupt();
     await timeoutOperation;
-    assert.equal(timeoutSession.turnCount, 1);
-    assert.equal(timeoutSession.threadId, "thread-1");
-    assert.equal(timeoutActivities.some((value) => value.status === "context_invalidated"), false);
-    assert.equal(timeoutActivities.some((value) => value.status === "turn_failed"), false);
+    assert.equal(timeoutSession.turnCount, 0, "超时后的迟到完成不能复活或推进旧Turn");
+    assert.equal(timeoutSession.threadId, null);
+    assert.equal(timeoutActivities.some((value) => value.status === "context_invalidated"), true);
+    assert.equal(timeoutActivities.some((value) => value.status === "turn_failed"), true);
     await timeoutAgent.close();
 
     const failingClient = new FakeAppServerClient();

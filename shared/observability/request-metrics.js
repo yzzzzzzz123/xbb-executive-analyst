@@ -5,7 +5,7 @@ const { performance } = require("node:perf_hooks");
 
 const TIMING_FIELDS = Object.freeze([
   "firstReplyMs", "analysisMs", "answerReadyMs", "answerVisibleMs", "progressDrainMs",
-  "queryQueueMs", "queryRunMs", "renderMs", "uploadMs", "mediaDeliveryMs", "totalMs"
+  "sessionQueueMs", "queryQueueMs", "queryRunMs", "renderMs", "uploadMs", "mediaDeliveryMs", "totalMs"
 ]);
 const MAX_TIMING_MS = 24 * 60 * 60 * 1000;
 
@@ -17,6 +17,7 @@ function safeRequestMetrics(value) {
   if (["general", "xbb"].includes(value?.routeMode)) result.routeMode = value.routeMode;
   if (["success", "degraded", "failed", "unsupported"].includes(value?.outcome)) result.outcome = value.outcome;
   if (["none", "standalone", "inline", "failed"].includes(value?.imageDelivery)) result.imageDelivery = value.imageDelivery;
+  if (["deadline_exceeded", "cancelled", "analysis_timeout", "analysis_failed", "delivery_timeout", "transport_failed"].includes(value?.failureClass)) result.failureClass = value.failureClass;
   result.timings = {};
   for (const key of TIMING_FIELDS) {
     const number = value?.timings?.[key];
@@ -25,8 +26,7 @@ function safeRequestMetrics(value) {
   return result;
 }
 
-function createRequestMetrics({ now = () => performance.now() } = {}) {
-  const startedAt = now();
+function createRequestMetrics({ now = () => performance.now(), startedAt = now() } = {}) {
   const timings = {};
   const requestTrace = randomBytes(16).toString("hex");
   let completed = false;
@@ -36,6 +36,10 @@ function createRequestMetrics({ now = () => performance.now() } = {}) {
   return Object.freeze({
     mark(field) { record(field, now() - startedAt); },
     addQueryTiming(event) {
+      if (["session_started", "session_expired"].includes(event?.stage)) {
+        if (!Object.hasOwn(timings, "sessionQueueMs") && Number.isInteger(event.queueWaitMs) && event.queueWaitMs >= 0 && event.queueWaitMs <= MAX_TIMING_MS) record("sessionQueueMs", event.queueWaitMs);
+        return;
+      }
       if (!["completed", "failed", "cancelled", "expired", "rejected"].includes(event?.stage)) return;
       for (const [source, field] of [["queueWaitMs", "queryQueueMs"], ["runMs", "queryRunMs"]]) {
         if (Number.isInteger(event[source]) && event[source] >= 0 && event[source] <= MAX_TIMING_MS) record(field, (timings[field] || 0) + event[source]);
@@ -45,11 +49,11 @@ function createRequestMetrics({ now = () => performance.now() } = {}) {
       const before = now();
       try { return await operation(); } finally { record(field, (timings[field] || 0) + now() - before); }
     },
-    finish({ routeMode, outcome, imageDelivery }) {
+    finish({ routeMode, outcome, imageDelivery, failureClass }) {
       if (completed) return null;
       record("totalMs", now() - startedAt);
       completed = true;
-      return { status: "request_measured", ...safeRequestMetrics({ requestTrace, routeMode, outcome, imageDelivery, timings }) };
+      return { status: "request_measured", ...safeRequestMetrics({ requestTrace, routeMode, outcome, imageDelivery, failureClass, timings }) };
     }
   });
 }

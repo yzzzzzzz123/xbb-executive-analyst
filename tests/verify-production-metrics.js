@@ -125,10 +125,13 @@ async function run() {
   assert.deepEqual(result.timings, { firstReplyMs: 10, analysisMs: 20, answerReadyMs: 35, totalMs: 35 });
   assert.equal(metrics.finish({}), null, "同请求指标只发一次");
   const queryMetrics = createRequestMetrics();
+  queryMetrics.addQueryTiming({ stage: "session_started", queueWaitMs: 15 });
+  queryMetrics.addQueryTiming({ stage: "session_started", queueWaitMs: 999 });
   queryMetrics.addQueryTiming({ stage: "started", queueWaitMs: 99, runMs: 0 });
   queryMetrics.addQueryTiming({ stage: "completed", queueWaitMs: 10, runMs: 20, question: "PRIVATE" });
   queryMetrics.addQueryTiming({ stage: "completed", queueWaitMs: 2, runMs: 8 });
   const measuredQuery = queryMetrics.finish({});
+  assert.equal(measuredQuery.timings.sessionQueueMs, 15, "会话排队单独且只计一次");
   assert.equal(measuredQuery.timings.queryQueueMs, 12);
   assert.equal(measuredQuery.timings.queryRunMs, 28);
   assert.doesNotMatch(JSON.stringify(measuredQuery), /PRIVATE|question/);
@@ -136,6 +139,8 @@ async function run() {
   assert.doesNotMatch(JSON.stringify(clean), /SECRET|token|uploadMs|renderMs|mediaDeliveryMs/);
   assert.equal(Object.hasOwn(safeStatus({ status: "request_measured", requestTrace: "user-id", routeMode: "SECRET" }), "requestTrace"), false);
   assert.equal(Object.hasOwn(safeRequestMetrics({ requestTrace: { secret: "PRIVATE", toString: () => "a".repeat(32) } }), "requestTrace"), false);
+  assert.equal(safeRequestMetrics({ failureClass: "deadline_exceeded" }).failureClass, "deadline_exceeded");
+  assert.equal(Object.hasOwn(safeRequestMetrics({ failureClass: "PRIVATE" }), "failureClass"), false);
   assert.notEqual(createRequestMetrics().finish({}).requestTrace, result.requestTrace);
   assert.deepEqual(summarizeTimings([{ timings: { totalMs: 10 } }, { timings: { totalMs: 30 } }]).totalMs, { count: 2, p50: 10, p95: 30, max: 30 });
   await assert.rejects(withinBudget(() => new Promise(() => {}), 5), DeliveryTimeoutError);

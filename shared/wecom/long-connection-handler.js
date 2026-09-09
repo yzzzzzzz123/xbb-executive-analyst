@@ -1,14 +1,16 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { performance } = require("node:perf_hooks");
 const { AgentTurnFailureError, AgentTurnTimeoutError, principalKeyFromUserId } = require("../codex/persistent-agent.js");
+const { MAX_USER_QUESTION_BYTES } = require("../codex/context-policy.js");
 const { authorize, AccessDeniedError } = require("../security/access-control.js");
 const { routeSkill } = require("../rag/skill-router.js");
 const { chartTypeLabel, formatDuration } = require("../xbb/query-progress.js");
 const { createWecomAnswerImage, createWecomChartImage, createWecomEmergencyImage } = require("./chart-image.js");
 const { MessageStore, MessageStoreCapacityError } = require("./message-store.js");
 const { createRequestMetrics } = require("../observability/request-metrics.js");
-const { DeliveryTimeoutError, validateBudget, withinBudget } = require("./delivery-budget.js");
+const { DeliveryTimeoutError, createDeliveryDeadline, validateBudget, withinBudget } = require("./delivery-budget.js");
 
 const DEFAULT_ROUTE_MEMORY_MAX_ENTRIES = 4096;
 const XBB_FOLLOW_UP_HANDOFF_ANSWER = "已收到你的补充要求，正在继续分析。完整结果会回复到你最新一条消息。";
@@ -27,6 +29,8 @@ function extractQuestion(message) {
 
 function operationalFailure(error) {
   if (error instanceof AccessDeniedError) return error.message;
+  if (error?.code === "REQUEST_DEADLINE_EXCEEDED") return "本次请求已到达从接收开始计算的处理时限，包含排队等待；已停止等待并请求取消本请求仍在进行的分析或查询，不会把迟到结果补发为新结论。可以继续原问题；若需要精确材料，系统会重新核实。";
+  if (error?.code === "REQUEST_CANCELLED") return "本次请求已取消，不再发送它的迟到结果；其他请求不受本次取消影响。";
   if (error instanceof AgentTurnFailureError) {
     const message = {
       unauthorized: "机器人连接模型服务的登录已失效，暂时无法回答。请管理员在部署机器的 Windows 端重新登录 Codex 后恢复服务。",
@@ -188,11 +192,18 @@ function createLongConnectionHandler({
   renderBudgetMs = 10000,
   uploadBudgetMs = 15000,
   mediaDeliveryBudgetMs = 6000,
+  businessRequestBudgetMs = 20 * 60 * 1000,
+  generalRequestBudgetMs = 15 * 60 * 1000,
+  analysisDeliveryReserveMs = 30000,
+  monotonicNow = () => performance.now(),
   routeMemoryMaxEntries = DEFAULT_ROUTE_MEMORY_MAX_ENTRIES
 }) {
   if (!policy || !agent?.answer) throw new Error("企业微信长连接处理器初始化参数不完整。");
   if (!Number.isInteger(routeMemoryMaxEntries) || routeMemoryMaxEntries < 1) throw new Error("企业微信路由记忆上限无效。");
   [progressDrainBudgetMs, replyBudgetMs, renderBudgetMs, uploadBudgetMs, mediaDeliveryBudgetMs].forEach(validateBudget);
+  [businessRequestBudgetMs, generalRequestBudgetMs].forEach((budgetMs) => createDeliveryDeadline({ budgetMs }));
+  validateBudget(analysisDeliveryReserveMs);
+  if (typeof monotonicNow !== "function") throw new Error("请求单调时钟无效。");
   // 应急图在启动阶段只生成和校验一次。运行时拒绝/渲染故障只复用这个不可变项，
   // 避免未授权消息触发 Sharp CPU 开销，也消除最后一级兜底再次抛错的窗口。
   const emergencyRender = normalizeRenderedImage(emergencyImageFactory());
@@ -212,9 +223,11 @@ function createLongConnectionHandler({
       const message = validateFrame(frame);
       const messageId = message.msgid;
       const receivedAtMs = Date.now();
+      const receivedAtMonotonic = monotonicNow();
       const userId = String(message.from?.userid || "");
       const question = String(extractQuestion(message) || "").trim();
-      const inferredRoute = routeSkill(question, lastRouteByUser.get(userId) || null).mode;
+      const oversized = Buffer.byteLength(question, "utf8") > MAX_USER_QUESTION_BYTES;
+      const inferredRoute = oversized ? lastRouteByUser.get(userId) || "general" : routeSkill(question, lastRouteByUser.get(userId) || null).mode;
       // 路由意图不含经营事实，可以在鉴权前安全记忆。这样未授权用户收到拒绝后说
       // “继续”，仍会被识别为上一条销帮帮追问并附应急图；LRU 上限避免常驻泄漏。
       rememberRoute(userId, inferredRoute);
@@ -230,7 +243,7 @@ function createLongConnectionHandler({
         } catch (storeError) {
           if (!(storeError instanceof MessageStoreCapacityError)) throw storeError;
           const items = inferredRoute === "xbb" ? [emergencyRender.item] : [];
-          return client.replyStream(frame, streamIdFactory(), "当前请求已触发并发保护，系统仍在处理已接收的任务；本条未读取销帮帮，也未生成任何经营数字。", true, items);
+          return withinBudget(() => client.replyStream(frame, streamIdFactory(), "当前请求已触发并发保护，系统仍在处理已接收的任务；本条未读取销帮帮，也未生成任何经营数字。", true, items), replyBudgetMs);
         }
         const { state, isNew } = begun;
         if (isNew) {
@@ -238,10 +251,10 @@ function createLongConnectionHandler({
           const items = inferredRoute === "xbb" ? [emergencyRender.item] : [];
           messageStore.complete(messageId, content, items);
         }
-        return client.replyStream(frame, state.streamId, state.content, true, state.msgItem);
+        return withinBudget(() => client.replyStream(frame, state.streamId, state.content, true, state.msgItem), replyBudgetMs);
       }
 
-      const initialContent = question
+      const initialContent = oversized ? "本条输入超过 32 KiB 接收上限，未提交给模型或查询工具。请按表、模块或完整 SQL/JSON 代码块分条提供，并保留目标和约束；不要把同一个代码块从中间截断。" : question
         ? "正在识别问题范围和分析维度……"
         : "目前仅支持文字、语音转文字或图文中的文字问题。";
       let begun;
@@ -250,28 +263,34 @@ function createLongConnectionHandler({
       } catch (storeError) {
         if (!(storeError instanceof MessageStoreCapacityError)) throw storeError;
         const items = inferredRoute === "xbb" ? [emergencyRender.item] : [];
-        return client.replyStream(frame, streamIdFactory(), "当前请求已触发并发保护，系统仍在处理已接收的任务；本条未读取销帮帮，也未生成任何经营数字。", true, items);
+        return withinBudget(() => client.replyStream(frame, streamIdFactory(), "当前请求已触发并发保护，系统仍在处理已接收的任务；本条未读取销帮帮，也未生成任何经营数字。", true, items), replyBudgetMs);
       }
       const { state, isNew } = begun;
 
-      if (!isNew) return client.replyStream(frame, state.streamId, state.content, state.finish, state.finish ? state.msgItem : undefined);
-      const metrics = createRequestMetrics();
+      if (!isNew) return withinBudget(() => client.replyStream(frame, state.streamId, state.content, state.finish, state.finish ? state.msgItem : undefined), replyBudgetMs);
+      const requestBudgetMs = inferredRoute === "xbb" ? businessRequestBudgetMs : generalRequestBudgetMs;
+      const deadline = createDeliveryDeadline({ budgetMs: requestBudgetMs, startedAt: receivedAtMonotonic, now: monotonicNow });
+      const finalReplyReserveMs = Math.min(replyBudgetMs, Math.max(1, Math.floor(requestBudgetMs / 10)));
+      const analysisReserveMs = Math.max(finalReplyReserveMs, Math.min(analysisDeliveryReserveMs, Math.floor(requestBudgetMs / 5)));
+      const metrics = createRequestMetrics({ now: monotonicNow, startedAt: receivedAtMonotonic });
       let outcome = "success";
+      let failureClass;
       const finishMetrics = (routeMode, imageDelivery, result = outcome) => {
-        const value = metrics.finish({ routeMode, imageDelivery, outcome: result });
+        const value = metrics.finish({ routeMode, imageDelivery, outcome: result, failureClass });
         if (value) writeStatus(value);
       };
-      const replyStream = (content, finish, items) => withinBudget(
-        () => client.replyStream(frame, state.streamId, content, finish, items), replyBudgetMs
+      const replyStream = (content, finish, items) => deadline.run(
+        () => client.replyStream(frame, state.streamId, content, finish, items), replyBudgetMs, finish ? 0 : finalReplyReserveMs
       );
       writeStatus({ status: "message_received" });
-      if (!question) {
-        messageStore.complete(messageId, initialContent);
+      if (!question || oversized) {
+        const items = inferredRoute === "xbb" ? [emergencyRender.item] : [];
+        messageStore.complete(messageId, initialContent, items);
         let reply;
-        try { reply = await replyStream(initialContent, true); }
-        catch (error) { finishMetrics(inferredRoute, "none", "failed"); throw error; }
+        try { reply = await replyStream(initialContent, true, items); }
+        catch (error) { failureClass = error?.code === "REQUEST_DEADLINE_EXCEEDED" ? "deadline_exceeded" : error instanceof DeliveryTimeoutError ? "delivery_timeout" : "transport_failed"; finishMetrics(inferredRoute, "none", "failed"); throw error; }
         metrics.mark("firstReplyMs");
-        finishMetrics(inferredRoute, "none", "unsupported");
+        finishMetrics(inferredRoute, items.length ? "inline" : "none", "unsupported");
         writeStatus({ status: "reply_completed", elapsedMs: Date.now() - receivedAtMs });
         return reply;
       }
@@ -281,6 +300,7 @@ function createLongConnectionHandler({
         metrics.mark("firstReplyMs");
       } catch (error) {
         messageStore.delete(messageId);
+        failureClass = error?.code === "REQUEST_DEADLINE_EXCEEDED" ? "deadline_exceeded" : error instanceof DeliveryTimeoutError ? "delivery_timeout" : "transport_failed";
         finishMetrics(inferredRoute, "none", "failed");
         throw error;
       }
@@ -295,7 +315,7 @@ function createLongConnectionHandler({
       try {
         let latestStage = initialContent;
         progressPublisher = createProgressPublisher({
-          deliver: (content) => client.replyStream(frame, state.streamId, content, false),
+          deliver: (content) => replyStream(content, false),
           updateState: (content) => messageStore.update(messageId, content),
           drainBudgetMs: progressDrainBudgetMs
         });
@@ -308,27 +328,34 @@ function createLongConnectionHandler({
           progressPublisher.publish(`${latestStage}\n已用时：${formatDuration(seconds)}；当前阶段仍在继续。`);
         }, heartbeatMs);
         heartbeat.unref?.();
-        const result = await metrics.measure("analysisMs", () => agent.answer({
+        const result = await metrics.measure("analysisMs", () => deadline.run((_isOpen, signal, remainingMs) => agent.answer({
           question,
           access,
           principalKey: principalKeyFactory(userId, access),
           messageId,
           onProgress,
-          onTiming: (event) => metrics.addQueryTiming(event)
-        }));
+          onTiming: (event) => metrics.addQueryTiming(event),
+          signal,
+          remainingMs
+        }), requestBudgetMs, analysisReserveMs));
         answer = typeof result === "string" ? result : result.answer;
         chart = typeof result === "object" && result ? result.chart : null;
         if (result?.routeMode === "xbb" || result?.routeMode === "general") routeMode = result.routeMode;
         usePrebuiltOperationalImage = isXbbOperationalHandoff(result);
       } catch (error) {
         outcome = "failed";
+        failureClass = error?.code === "REQUEST_DEADLINE_EXCEEDED" ? "deadline_exceeded" : error?.code === "REQUEST_CANCELLED" ? "cancelled" : error instanceof AgentTurnTimeoutError ? "analysis_timeout" : "analysis_failed";
         answer = operationalFailure(error);
         if (error?.routeMode === "xbb") routeMode = "xbb";
         usePrebuiltOperationalImage = routeMode === "xbb";
       } finally {
         if (heartbeat) clearInterval(heartbeat);
         metrics.mark("answerReadyMs");
-        if (progressPublisher) await metrics.measure("progressDrainMs", () => progressPublisher.close());
+        if (progressPublisher) {
+          const closing = progressPublisher.close();
+          try { await metrics.measure("progressDrainMs", () => deadline.run(() => closing, progressDrainBudgetMs, finalReplyReserveMs)); }
+          catch { /* Closed synchronously; only an already-dispatched ACK may arrive. */ }
+        }
       }
       rememberRoute(userId, routeMode);
       const requiresImage = routeMode === "xbb";
@@ -350,12 +377,12 @@ function createLongConnectionHandler({
       let imageRender = null;
       if (chart) {
         try {
-          const rendered = normalizeRenderedImage(await metrics.measure("renderMs", () => withinBudget((isOpen) => retryTransient(() => chartRenderer(chart), {
+          const rendered = normalizeRenderedImage(await metrics.measure("renderMs", () => deadline.run((isOpen) => retryTransient(() => chartRenderer(chart), {
             canAttempt: isOpen,
             attempts: renderAttempts,
             wait: retryWait,
             shouldRetry: (error) => isOpen() && isTransientRenderError(error)
-          }), renderBudgetMs)));
+          }), renderBudgetMs, finalReplyReserveMs)));
           msgItem = [rendered.item];
           imageBuffer = rendered.buffer;
           writeStatus({ status: "chart_generated" });
@@ -374,12 +401,12 @@ function createLongConnectionHandler({
           imageBuffer = null;
         } else {
           try {
-            imageRender = normalizeRenderedImage(await metrics.measure("renderMs", () => withinBudget((isOpen) => retryTransient(() => answerRenderer(answer), {
+            imageRender = normalizeRenderedImage(await metrics.measure("renderMs", () => deadline.run((isOpen) => retryTransient(() => answerRenderer(answer), {
               canAttempt: isOpen,
               attempts: renderAttempts,
               wait: retryWait,
               shouldRetry: (error) => isOpen() && isTransientRenderError(error)
-            }), renderBudgetMs)));
+            }), renderBudgetMs, finalReplyReserveMs)));
             msgItem = [imageRender.item];
             imageBuffer = imageRender.buffer;
             writeStatus({ status: "chart_generated" });
@@ -397,14 +424,14 @@ function createLongConnectionHandler({
       const target = message.chattype === "group" ? String(message.chatid || "") : userId;
       if (imageBuffer && target && typeof client.uploadMedia === "function" && typeof client.sendMediaMessage === "function") {
         try {
-          const uploaded = await metrics.measure("uploadMs", () => withinBudget((isOpen) => retryTransient(
+          const uploaded = await metrics.measure("uploadMs", () => deadline.run((isOpen) => retryTransient(
             async () => {
               const result = await client.uploadMedia(imageBuffer, { type: "image", filename: "经营分析图表.png" });
               if (!result?.media_id) throw new Error("企业微信未返回图片 media_id。");
               return result;
             },
             { attempts: transportAttempts, canAttempt: isOpen, wait: retryWait, shouldRetry: (error) => isOpen() && isTransientTransportError(error) }
-          ), uploadBudgetMs));
+          ), uploadBudgetMs, finalReplyReserveMs));
           uploadedMediaId = uploaded.media_id;
           writeStatus({ status: "chart_uploaded" });
         } catch {
@@ -416,10 +443,10 @@ function createLongConnectionHandler({
       let standaloneDelivered = false;
       if (uploadedMediaId) {
         try {
-          await metrics.measure("mediaDeliveryMs", () => withinBudget((isOpen) => retryTransient(
+          await metrics.measure("mediaDeliveryMs", () => deadline.run((isOpen) => retryTransient(
             () => client.sendMediaMessage(target, "image", uploadedMediaId),
             { attempts: Math.min(2, transportAttempts), canAttempt: isOpen, wait: retryWait, shouldRetry: (error) => isOpen() && isTransientTransportError(error) }
-          ), mediaDeliveryBudgetMs));
+          ), mediaDeliveryBudgetMs, finalReplyReserveMs));
           standaloneDelivered = true;
           writeStatus({ status: "chart_delivered" });
         } catch {
@@ -437,6 +464,7 @@ function createLongConnectionHandler({
         reply = await replyStream(answer, true, inlineItems);
         if (!answerVisible) metrics.mark("answerVisibleMs");
       } catch (error) {
+        failureClass = error?.code === "REQUEST_DEADLINE_EXCEEDED" ? "deadline_exceeded" : error instanceof DeliveryTimeoutError ? "delivery_timeout" : "transport_failed";
         finishMetrics(routeMode, standaloneDelivered ? "standalone" : msgItem.length ? "failed" : "none", "failed");
         throw error;
       }

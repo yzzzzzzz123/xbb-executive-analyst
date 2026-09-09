@@ -258,9 +258,15 @@ Get-ScheduledTask -TaskName 'Codex-XBB-Executive-Analyst-WeCom-Watchdog' |
 ```powershell
 npm run verify:production
 npm run bench:production
+npm run bench:reliability
+npm run observe:runtime -- --samples=6 --interval-ms=60000
 ```
 
 统一验收分为 unit、integration、windows 三组；`npm test` 保留全部套件，`npm run verify` 仅做语法与 Skill 合同检查，不再重复执行测试。依赖边界、真实只读探针、复杂任务切分和空闲重载方法见[生产验收与运行手册](docs/production-readiness.md)。
+
+新接受请求共用从接收开始的单调截止预算，排队、模型和图片交付不能逐阶段重新计时；`sessionQueueMs` 与查询排队分别记录。数据库通用任务使用进程内有界检查点管理材料指纹、版本失效、阶段依赖和待验证项，模型上报完成不等于实际执行。SQLite 演练仅使用隔离临时库，正式机器人仍只读。
+
+固定版本的真实模型小样本基线可显式运行 `npm run bench:production -- --live --workload --repeat=4`；首个通用 Thread 不做经营预热，完整报告保留失败和超时。`bench:reliability` 只验证离线替身与真实组件组合行为，禁止把其 P95 当作线上响应速率。`observe:runtime` 只读采样本机租约和认证状态，不发送消息，也不代表长期在线率。
 
 验证覆盖事实编译、单月/跨月大包压力、零活动月份、96 KiB 模型视图、混合 RAG 的强制规则/向量近邻/硬字节边界、独立字段 ID 路由、无标点域排除、访问控制、App Server token 预算轮换与懒恢复、慢预取即时接管、技术性拒答接管、范围变化后的迟到查询隔离、runner v2 标记/身份/双空快照/临时目录回收与失败关闭、受控工具循环、企微重连看门狗、启动和退出硬截止、代际租约、产品级计划任务 fencing、旧新版标记恢复、孤儿卸载保护、安装回滚、排重缓存容量、未授权消息洪泛、群内 `@` 路由、流式回复、经营图/结论图/应急图三级降级、媒体与内联发送、隐私日志和一次性 USERID 识别。测试构造数据只验证确定性代码，不会进入生产 runner 或作为经营事实回退。
 
