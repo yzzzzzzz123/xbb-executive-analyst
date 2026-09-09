@@ -40,7 +40,10 @@ const CODEX_XBB_MODULES = new Set([
   "shared/xbb/fast-query-plan.js",
   "shared/xbb/query-progress.js",
 ]);
-const CHART_CONTRACT = "skills/xbb-executive-chart/scripts/chart-contract.js";
+const CHART_MODULES = new Set([
+  "skills/xbb-executive-chart/scripts/chart-contract.js",
+  "skills/xbb-executive-chart/scripts/chart-findings.js"
+]);
 
 function sourceFiles(directory) {
   return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
@@ -55,14 +58,14 @@ function relative(file) {
 
 function layerOf(file) {
   const name = relative(file);
-  if (name === CHART_CONTRACT) return "chart-contract";
+  if (CHART_MODULES.has(name)) return "chart-contract";
   if (name === "shared/config.js") return "config";
   const match = /^shared\/([^/]+)\//.exec(name);
   assert.ok(match && Object.hasOwn(ALLOWED_LAYERS, match[1]), `Unowned runtime module: ${name}`);
   return match[1];
 }
 
-const files = [...sourceFiles(path.join(PROJECT_ROOT, "shared")), path.join(PROJECT_ROOT, CHART_CONTRACT)];
+const files = [...sourceFiles(path.join(PROJECT_ROOT, "shared")), ...[...CHART_MODULES].map((file) => path.join(PROJECT_ROOT, file))];
 const graph = new Map(files.map((file) => [file, []]));
 let dependencies = 0;
 

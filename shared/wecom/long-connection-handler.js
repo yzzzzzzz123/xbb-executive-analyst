@@ -13,6 +13,7 @@ const { createRequestMetrics } = require("../observability/request-metrics.js");
 const { DeliveryTimeoutError, createDeliveryDeadline, validateBudget, withinBudget } = require("./delivery-budget.js");
 
 const DEFAULT_ROUTE_MEMORY_MAX_ENTRIES = 4096;
+const MAX_ANSWER_PREVIEW_UPDATES = 12;
 const XBB_FOLLOW_UP_HANDOFF_ANSWER = "已收到你的补充要求，正在继续分析。完整结果会回复到你最新一条消息。";
 
 function extractQuestion(message) {
@@ -123,21 +124,55 @@ function validateFrame(frame) {
   return message;
 }
 
-function createProgressPublisher({ deliver, updateState, drainBudgetMs = 6000 }) {
+function createProgressPublisher({ deliver, updateState, drainBudgetMs = 6000, now = () => performance.now() }) {
   validateBudget(drainBudgetMs);
   let pending = null;
   let running = false;
   let closed = false;
   let current = Promise.resolve();
+  let wakeTimer = null;
+  let wakeFinished = Promise.resolve();
+  let resolveWake = null;
+  let lastPreviewAt = -Infinity;
+  const stopWaiting = () => {
+    if (wakeTimer) clearTimeout(wakeTimer);
+    wakeTimer = null;
+    resolveWake?.();
+    resolveWake = null;
+  };
+  const valid = (entry) => {
+    try { return !entry.isCurrent || entry.isCurrent() === true; } catch { return false; }
+  };
 
   const pump = () => {
-    if (running || closed) return current;
+    if (running || closed || wakeTimer) return current;
     running = true;
     current = (async () => {
       while (!closed && pending !== null) {
-        const content = pending;
+        const entry = pending;
         pending = null;
-        await deliver(content);
+        if (!valid(entry)) continue;
+        const remaining = entry.minimumIntervalMs - (now() - lastPreviewAt);
+        if (entry.minimumIntervalMs > 0 && remaining > 0) {
+          pending = entry;
+          wakeFinished = new Promise((resolve) => { resolveWake = resolve; });
+          wakeTimer = setTimeout(() => { stopWaiting(); void pump(); }, Math.ceil(remaining));
+          wakeTimer.unref?.();
+          break;
+        }
+        if (entry.minimumIntervalMs > 0) lastPreviewAt = now();
+        try {
+          const delivered = await deliver(entry.content, () => !closed && valid(entry), () => {
+            try { entry.onDispatch?.(); } catch {}
+          });
+          if (delivered !== false && typeof entry.onDelivered === "function") {
+            try { Promise.resolve(entry.onDelivered()).catch(() => {}); } catch {}
+          }
+        } catch {
+          if (typeof entry.onDeliveryFailed === "function") {
+            try { Promise.resolve(entry.onDeliveryFailed()).catch(() => {}); } catch {}
+          }
+        }
       }
     })().catch(() => { /* 中间进度失败不能阻断最终答复 */ }).finally(() => {
       running = false;
@@ -147,23 +182,34 @@ function createProgressPublisher({ deliver, updateState, drainBudgetMs = 6000 })
   };
 
   return Object.freeze({
-    publish(content) {
+    publish(content, options = {}) {
       if (closed) return;
       const value = String(content || "").trim();
       if (!value) return;
-      pending = value;
-      updateState(value);
+      const entry = { content: value,
+        isCurrent: typeof options.isCurrent === "function" ? options.isCurrent : null,
+        minimumIntervalMs: Number.isInteger(options.minimumIntervalMs) && options.minimumIntervalMs > 0 && options.minimumIntervalMs <= 60000 ? options.minimumIntervalMs : 0,
+        onDispatch: options.onDispatch, onDelivered: options.onDelivered, onDeliveryFailed: options.onDeliveryFailed };
+      if (!valid(entry)) return;
+      pending = entry;
+      // Preview text is deliberately absent from the replay cache. A duplicate
+      // incoming message can replay status or the final result, never a stale
+      // draft whose turn/owner validity cannot be represented in that cache.
+      if (options.store !== false) updateState(value);
+      if (!entry.minimumIntervalMs && wakeTimer) stopWaiting();
       void pump();
     },
     async flush() {
       do {
         if (!running && pending !== null) void pump();
         await current;
+        if (wakeTimer) await wakeFinished;
       } while (running || pending !== null);
     },
     async close() {
       closed = true;
       pending = null;
+      stopWaiting();
       // SDK serializes already submitted replies by req_id. Only that one
       // in-flight update may finish; no queued/late stage can follow the answer.
       try { await withinBudget(() => current, drainBudgetMs); return true; }
@@ -195,6 +241,7 @@ function createLongConnectionHandler({
   businessRequestBudgetMs = 20 * 60 * 1000,
   generalRequestBudgetMs = 15 * 60 * 1000,
   analysisDeliveryReserveMs = 30000,
+  answerPreviewIntervalMs = 1000,
   monotonicNow = () => performance.now(),
   routeMemoryMaxEntries = DEFAULT_ROUTE_MEMORY_MAX_ENTRIES
 }) {
@@ -203,6 +250,7 @@ function createLongConnectionHandler({
   [progressDrainBudgetMs, replyBudgetMs, renderBudgetMs, uploadBudgetMs, mediaDeliveryBudgetMs].forEach(validateBudget);
   [businessRequestBudgetMs, generalRequestBudgetMs].forEach((budgetMs) => createDeliveryDeadline({ budgetMs }));
   validateBudget(analysisDeliveryReserveMs);
+  if (!Number.isInteger(answerPreviewIntervalMs) || answerPreviewIntervalMs < 1 || answerPreviewIntervalMs > 60000) throw new Error("正文预览间隔必须为 1–60000 毫秒。");
   if (typeof monotonicNow !== "function") throw new Error("请求单调时钟无效。");
   // 应急图在启动阶段只生成和校验一次。运行时拒绝/渲染故障只复用这个不可变项，
   // 避免未授权消息触发 Sharp CPU 开销，也消除最后一级兜底再次抛错的窗口。
@@ -311,19 +359,36 @@ function createLongConnectionHandler({
       let heartbeat;
       let onProgress;
       let progressPublisher;
+      let previewOpen = true;
+      let activePreview = null;
+      let previewDispatches = 0;
+      let previewAttempted = false;
       let usePrebuiltOperationalImage = false;
       try {
         let latestStage = initialContent;
         progressPublisher = createProgressPublisher({
-          deliver: (content) => replyStream(content, false),
+          deliver: (content, isCurrent, onDispatch) => deadline.run(() => {
+            if (!isCurrent()) return false;
+            onDispatch();
+            return client.replyStream(frame, state.streamId, content, false);
+          }, replyBudgetMs, finalReplyReserveMs),
           updateState: (content) => messageStore.update(messageId, content),
-          drainBudgetMs: progressDrainBudgetMs
+          drainBudgetMs: progressDrainBudgetMs,
+          now: monotonicNow
         });
+        const previewIsCurrent = (preview) => {
+          try { return previewOpen && inferredRoute === "general" && preview?.isCurrent?.() === true; } catch { return false; }
+        };
         onProgress = (content) => {
           latestStage = String(content || "").trim() || latestStage;
-          progressPublisher.publish(latestStage);
+          if (!previewIsCurrent(activePreview)) {
+            activePreview = null;
+            progressPublisher.publish(latestStage);
+          }
         };
         heartbeat = setInterval(() => {
+          if (previewIsCurrent(activePreview)) return;
+          activePreview = null;
           const seconds = Math.max(1, Math.floor((Date.now() - receivedAtMs) / 1000));
           progressPublisher.publish(`${latestStage}\n已用时：${formatDuration(seconds)}；当前阶段仍在继续。`);
         }, heartbeatMs);
@@ -334,6 +399,24 @@ function createLongConnectionHandler({
           principalKey: principalKeyFactory(userId, access),
           messageId,
           onProgress,
+          onAnswerPreview: (preview) => {
+            if (!previewIsCurrent(preview) || typeof preview.text !== "string" || !preview.text.trim()
+                || Buffer.byteLength(preview.text, "utf8") > 18000 || previewDispatches >= MAX_ANSWER_PREVIEW_UPDATES) return;
+            activePreview = preview;
+            progressPublisher.publish(`正文预览（生成中，请以最终答复为准）\n\n${preview.text}`, {
+              store: false, minimumIntervalMs: answerPreviewIntervalMs,
+              isCurrent: () => previewIsCurrent(preview) && previewDispatches < MAX_ANSWER_PREVIEW_UPDATES,
+              onDispatch: () => { previewAttempted = true; previewDispatches += 1; },
+              onDelivered: () => metrics.markFirst("answerPreviewVisibleMs"),
+              onDeliveryFailed: () => {
+                // An older in-flight failure must not remove a newer queued
+                // preview. Only its own failed draft stops suppressing status.
+                if (activePreview !== preview) return;
+                activePreview = null;
+                progressPublisher.publish(latestStage);
+              }
+            });
+          },
           onTiming: (event) => metrics.addQueryTiming(event),
           signal,
           remainingMs
@@ -346,9 +429,11 @@ function createLongConnectionHandler({
         outcome = "failed";
         failureClass = error?.code === "REQUEST_DEADLINE_EXCEEDED" ? "deadline_exceeded" : error?.code === "REQUEST_CANCELLED" ? "cancelled" : error instanceof AgentTurnTimeoutError ? "analysis_timeout" : "analysis_failed";
         answer = operationalFailure(error);
+        if (previewAttempted) answer = `本轮未完成，之前显示的正文预览不是完整结果，请以本条状态为准。\n\n${answer}`;
         if (error?.routeMode === "xbb") routeMode = "xbb";
         usePrebuiltOperationalImage = routeMode === "xbb";
       } finally {
+        previewOpen = false;
         if (heartbeat) clearInterval(heartbeat);
         metrics.mark("answerReadyMs");
         if (progressPublisher) {

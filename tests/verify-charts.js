@@ -101,7 +101,9 @@ function assertSupportedOutputSchema(schema, path = "$") {
     assert.match(svg, /^<\?xml version="1\.0" encoding="UTF-8"\?>/);
     assert.match(svg, /<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
     assert.match(svg, new RegExp(spec.title));
-    assert.match(svg, new RegExp(spec.insight));
+    assert.match(svg, /兼容概述/);
+    assert.equal(normalized.finding, null);
+    assert.notEqual(normalized.insight, spec.insight, "历史自由洞察不能未经计算原样发布");
     assert.match(svg, /关键发现/);
     assert.doesNotMatch(svg, /<(?:script|foreignObject)\b|\b(?:href|xlink:href)\s*=/i);
     assert.doesNotMatch(svg.replace('xmlns="http://www.w3.org/2000/svg"', ""), /https?:\/\//i);
@@ -114,7 +116,7 @@ function assertSupportedOutputSchema(schema, path = "$") {
   assert.throws(() => { normalizedBar.categories.push("公司丙"); }, TypeError);
 
   const parsed = parseAgentResponse(JSON.stringify({ answer: " 真实结论。 ", chart: specs[0] }));
-  assert.equal(parsed.chart.insight, specs[0].insight);
+  assert.equal(parsed.chart.insight, validateSpec(specs[0]).insight);
   assert.ok(Object.isFrozen(parsed.chart));
 
   const longTextChart = {
@@ -123,7 +125,8 @@ function assertSupportedOutputSchema(schema, path = "$") {
     note: "口".repeat(170)
   };
   const longTextParsed = parseAgentResponse(JSON.stringify({ answer: "长字段仍保留文字结论。", chart: longTextChart }));
-  assert.equal(Array.from(longTextParsed.chart.insight).length, 160);
+  assert.match(longTextParsed.chart.insight, /^兼容概述/u);
+  assert.doesNotMatch(longTextParsed.chart.insight, /🔎/u);
   assert.equal(Array.from(longTextParsed.chart.note).length, 170);
 
   let rejectedChartError = null;
@@ -257,17 +260,23 @@ function assertSupportedOutputSchema(schema, path = "$") {
     assert.equal(validateSpec(spec).focus, null, "旧规格仍可用");
     const focus = spec.series ? { series: spec.series[0].name, category: spec.categories.at(-1) }
       : { series: "", category: (spec.items || spec.points).at(-1).name || spec.points.at(-1).label };
-    const normalized = validateSpec({ ...spec, focus });
+    const first = spec.series ? { series: spec.series[0].name, category: spec.categories[0] }
+      : { series: "", category: (spec.items || spec.points)[0].name || spec.points[0].label };
+    const axis = spec.type === "scatter" ? "y" : "value";
+    const finding = { relation: "difference", subject: { ...focus, axis }, baseline: { ...first, axis } };
+    const normalized = validateSpec({ ...spec, focus, finding });
     assert.deepEqual(normalized.focus, focus);
     assert.ok(Object.isFrozen(normalized.focus));
     assert.doesNotThrow(() => render(normalized));
     assert.throws(() => validateSpec({ ...spec, focus: { ...focus, category: "不存在的重点" } }), /focus.category/);
     assert.throws(() => validateSpec({ ...spec, focus: { ...focus, color: "red" } }), /不支持字段/);
   }
-  const focusedBar = render({ ...specs[0], focus: { series: "回款", category: specs[0].categories[3] } });
+  const focusedBar = render({ ...specs[0], focus: null, finding: { relation: "difference",
+    subject: { series: "回款", category: specs[0].categories[3], axis: "value" }, baseline: { series: "回款", category: specs[0].categories[0], axis: "value" } } });
   assert.match(focusedBar, /距最高差 ¥77万/);
   assert.match(focusedBar, /fill="#087F8C" data-value="510000" data-baseline="0"/);
-  const percentLine = render({ ...specs[2], categories: ["一月", "二月", "三月", "四月"], series: [{ name: "完成率", values: [40, 50, 55, 70] }], valueFormat: "percent", unit: "", focus: { series: "完成率", category: "三月" } });
+  const percentLine = render({ ...specs[2], categories: ["一月", "二月", "三月", "四月"], series: [{ name: "完成率", values: [40, 50, 55, 70] }], valueFormat: "percent", unit: "", focus: null,
+    finding: { relation: "period-change", subject: { series: "完成率", category: "三月", axis: "value" }, baseline: { series: "完成率", category: "二月", axis: "value" } } });
   assert.match(percentLine, /\+5 个百分点/);
   assert.match(percentLine, /峰值 70%/);
 

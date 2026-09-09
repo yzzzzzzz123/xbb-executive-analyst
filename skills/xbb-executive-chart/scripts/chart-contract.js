@@ -1,7 +1,8 @@
 "use strict";
 
+const { RELATIONS_BY_TYPE, normalizeFinding } = require("./chart-findings.js");
 const FORMAT_VALUES = Object.freeze(["number", "money", "percent"]);
-const COMMON_FIELDS = Object.freeze(["type", "title", "subtitle", "insight", "note", "focus"]);
+const COMMON_FIELDS = Object.freeze(["type", "title", "subtitle", "insight", "note", "focus", "finding"]);
 const PERCENT_TOTAL_TOLERANCE = 0.5;
 
 const LIMITS = Object.freeze({
@@ -29,7 +30,7 @@ const commonProperties = {
     type: "string",
     minLength: 1,
     maxLength: LIMITS.insight,
-    description: "仅陈述图中可见事实支持的一句关键发现，建议不超过 36 个中文字；因果、建议与预测留在文字答复。"
+    description: "兼容输入字段。填写由finding生成；发布时由程序按finding计算覆盖，finding为null时改为可见值兼容概述，绝不原样发布自由洞察。"
   },
   note: { type: "string", maxLength: LIMITS.note }
 };
@@ -130,11 +131,24 @@ function makeSeriesSchema(maxValues, nonnegative) {
 
 function chartVariant(type, specificProperties) {
   const hasSeries = ["bar", "stacked-bar", "line"].includes(type);
+  const reference = strictObject({
+    series: hasSeries ? { type: "string", minLength: 1, maxLength: LIMITS.name } : { type: "string", enum: [""] },
+    category: { type: "string", minLength: 1, maxLength: LIMITS.category },
+    axis: { type: "string", enum: type === "scatter" ? ["x", "y"] : ["value"] }
+  });
   return strictObject({
     type: { type: "string", enum: [type] },
     ...commonProperties,
+    finding: {
+      description: "选择图内已展示数据及关系；不填写计算结果。程序计算insight，并以subject产生focus。这里只验证图内算术，不绑定完整事实源。无适用关系时null。",
+      anyOf: [strictObject({
+        relation: { type: "string", enum: RELATIONS_BY_TYPE[type] },
+        subject: reference,
+        baseline: { anyOf: [reference, { type: "null" }] }
+      }), { type: "null" }]
+    },
     focus: {
-      description: "选择最能支撑 insight 的已展示数据位置，可为低位、回落或非最大值；没有单一重点时为 null。不得从自由文字猜测。",
+      description: "新规格推荐null，由finding.subject生成。非空时必须与finding.subject指向相同位置；finding为null时旧focus仅校验后清除。",
       anyOf: [
         strictObject({
           series: hasSeries
@@ -169,7 +183,14 @@ function validateSpec(spec) {
 
   const normalized = validator(spec);
   const focus = Object.prototype.hasOwnProperty.call(spec, "focus") ? spec.focus : null;
-  normalized.focus = normalizeFocus(focus, normalized);
+  const requestedFocus = normalizeFocus(focus, normalized);
+  const derived = normalizeFinding(Object.hasOwn(spec, "finding") ? spec.finding : null, normalized);
+  if (derived.finding && requestedFocus && JSON.stringify(requestedFocus) !== JSON.stringify(derived.focus)) {
+    fail("focus 必须与 finding.subject 指向同一数据位置");
+  }
+  normalized.finding = derived.finding;
+  normalized.insight = normalizeString(derived.insight, "计算后的 insight", LIMITS.insight, false);
+  normalized.focus = derived.focus;
   return deepFreeze(normalized);
 }
 
@@ -178,7 +199,7 @@ function validateSeriesChart(spec) {
   ensureExactFields(spec, [
     ...COMMON_FIELDS,
     "valueFormat", "unit", "categories", "series"
-  ], "图表", ["focus"]);
+  ], "图表", ["focus", "finding"]);
   const common = normalizeCommon(spec);
   const valueFormat = normalizeFormat(spec.valueFormat, "valueFormat");
   const unit = normalizeUnit(spec.unit, valueFormat, "unit");
@@ -197,7 +218,7 @@ function validateDonut(spec) {
   ensureExactFields(spec, [
     ...COMMON_FIELDS,
     "valueFormat", "unit", "items", "centerLabel"
-  ], "图表", ["focus"]);
+  ], "图表", ["focus", "finding"]);
   const common = normalizeCommon(spec);
   const valueFormat = normalizeFormat(spec.valueFormat, "valueFormat");
   const items = normalizeItems(spec.items, valueFormat, false);
@@ -217,7 +238,7 @@ function validateFunnel(spec) {
   ensureExactFields(spec, [
     ...COMMON_FIELDS,
     "valueFormat", "unit", "items"
-  ], "图表", ["focus"]);
+  ], "图表", ["focus", "finding"]);
   const common = normalizeCommon(spec);
   const valueFormat = normalizeFormat(spec.valueFormat, "valueFormat");
   const items = normalizeItems(spec.items, valueFormat, true);
@@ -234,7 +255,7 @@ function validateScatter(spec) {
   ensureExactFields(spec, [
     ...COMMON_FIELDS,
     "points", "xLabel", "yLabel", "xFormat", "yFormat", "xUnit", "yUnit"
-  ], "图表", ["focus"]);
+  ], "图表", ["focus", "finding"]);
   const common = normalizeCommon(spec);
   const xFormat = normalizeFormat(spec.xFormat, "xFormat");
   const yFormat = normalizeFormat(spec.yFormat, "yFormat");

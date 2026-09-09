@@ -37,6 +37,7 @@ const {
 const { readCodexVersion, verifyCodexChatGptLogin } = require("./runtime.js");
 const { REQUEST_CANCELLED, REQUEST_DEADLINE_EXCEEDED, createRequestLifecycle, isRequestLifecycleError } = require("./request-lifecycle.js");
 const { applyPlanUpdate, bindCheckpointTurn, createTaskCheckpoint, formatTaskCheckpoint, reviseTaskCheckpoint } = require("./task-checkpoint.js");
+const { extractAnswerPreview } = require("./answer-preview.js");
 
 const MAX_SESSION_ESTIMATED_INPUT_BYTES = 256 * 1024;
 const MAX_SESSION_TURNS = 24;
@@ -428,8 +429,8 @@ class PersistentCodexAgent extends EventEmitter {
     }
   }
 
-  async answer({ question, access, principalKey, messageId, onProgress, onTiming, signal, remainingMs }) {
-    return this._enqueue({ question, access, principalKey, messageId, onProgress, onTiming, signal, remainingMs });
+  async answer({ question, access, principalKey, messageId, onProgress, onTiming, onAnswerPreview, signal, remainingMs }) {
+    return this._enqueue({ question, access, principalKey, messageId, onProgress, onTiming, onAnswerPreview, signal, remainingMs });
   }
 
   _assertOperational() {
@@ -464,7 +465,7 @@ class PersistentCodexAgent extends EventEmitter {
     return Object.freeze({ ...stats, principals: principals.length });
   }
 
-  async _enqueue({ question, access, principalKey, messageId, onProgress, onTiming, signal, remainingMs, warmup = false }) {
+  async _enqueue({ question, access, principalKey, messageId, onProgress, onTiming, onAnswerPreview, signal, remainingMs, warmup = false }) {
     if (typeof question !== "string" || !question.trim()) throw new Error("问题不能为空。");
     if (Buffer.byteLength(question.trim(), "utf8") > MAX_USER_QUESTION_BYTES) {
       throw new Error(`问题长度不能超过 ${MAX_USER_QUESTION_BYTES} 字节。`);
@@ -485,13 +486,13 @@ class PersistentCodexAgent extends EventEmitter {
       },
       onCancel: (error) => {
         if (request && !request.waiter.executionStarted && error.code === REQUEST_DEADLINE_EXCEEDED) {
-          this._notifyTiming(request.waiter, { stage: "session_expired", queueWaitMs: Math.max(0, performance.now() - enqueuedAtMs) });
+          this._notifyTiming(request.waiter, { stage: "session_expired", queueWaitMs: Math.max(0, Math.round(performance.now() - enqueuedAtMs)) });
         }
         if (session && request) this._cancelRequest(session, request, error);
       }
     });
-    const waiter = { promise: lifecycle.promise, resolve: lifecycle.resolve, reject: lifecycle.reject, lifecycle, onProgress, onTiming,
-      enqueuedAtMs, executionStarted: false };
+    const waiter = { promise: lifecycle.promise, resolve: lifecycle.resolve, reject: lifecycle.reject, lifecycle, onProgress, onTiming, onAnswerPreview,
+      enqueuedAtMs, executionStarted: false, firstModelDeltaSeen: false, firstAnswerPreviewSeen: false };
     request = { question: question.trim(), access, messageId, waiter, warmup };
     if (lifecycle.settled) return waiter.promise;
     try {
@@ -531,7 +532,76 @@ class PersistentCodexAgent extends EventEmitter {
     waiter.lifecycle?.throwIfStopped();
     if (waiter.executionStarted) return;
     waiter.executionStarted = true;
-    this._notifyTiming(waiter, { stage: "session_started", queueWaitMs: Math.max(0, performance.now() - waiter.enqueuedAtMs) });
+    this._notifyTiming(waiter, { stage: "session_started", queueWaitMs: Math.max(0, Math.round(performance.now() - waiter.enqueuedAtMs)) });
+  }
+
+  _invalidateAnswerPreview(active, disableTiming = false) {
+    if (!active.answerPreview) return;
+    active.answerPreview.enabled = false;
+    if (disableTiming) active.answerPreview.timingEnabled = false;
+  }
+
+  _resetAnswerPreview(active) {
+    active.answerPreview = {
+      enabled: !active.businessMode && !active.warmup,
+      timingEnabled: !active.warmup,
+      owners: active.waiters.slice(), itemId: null, lastText: ""
+    };
+  }
+
+  _recordFirstModelDelta(session, active, delta) {
+    const state = active.answerPreview;
+    if (!state?.timingEnabled || typeof delta !== "string" || !delta.trim()
+        || session.active !== active || active.abortController.signal.aborted) return;
+    for (const waiter of state.owners) {
+      if (waiter.lifecycle?.settled || !active.waiters.includes(waiter) || waiter.firstModelDeltaSeen) continue;
+      waiter.firstModelDeltaSeen = true;
+      this._notifyTiming(waiter, { stage: "model_first_delta", elapsedMs: Math.max(0, Math.round(performance.now() - waiter.enqueuedAtMs)) });
+    }
+  }
+
+  _trackAnswerPreviewItem(active, item) {
+    const state = active.answerPreview;
+    if (!state?.enabled) return;
+    if (item.phase !== "final_answer") {
+      if (item.id === state.itemId) this._invalidateAnswerPreview(active);
+      return;
+    }
+    if (typeof item.id !== "string" || !item.id || active.messages.has(item.id)
+        || (state.itemId !== null && state.itemId !== item.id)) {
+      this._invalidateAnswerPreview(active);
+      return;
+    }
+    state.itemId = item.id;
+  }
+
+  _offerAnswerPreview(session, active, itemId, current, { finished = false } = {}) {
+    const state = active.answerPreview;
+    if (!state?.enabled || active.businessMode || active.warmup || !current?.startedWithFinalPhase
+        || current.phase !== "final_answer" || itemId !== state.itemId) return;
+    const threadId = session.threadId;
+    const turnId = active.turnId;
+    const currentOwner = (waiter) => session.active === active && active.answerPreview === state && state.enabled
+      && !active.abortController.signal.aborted && !active.steerInFlight
+      && session.threadId === threadId && active.turnId === turnId
+      && !waiter.lifecycle?.settled && active.waiters.includes(waiter);
+    let preview;
+    try { preview = extractAnswerPreview(current.text, { phase: "final_answer", itemType: "agentMessage", finished }); }
+    catch { this._invalidateAnswerPreview(active); return; }
+    if (preview?.status === "blocked") { this._invalidateAnswerPreview(active); return; }
+    if (!["preview", "complete"].includes(preview?.status) || typeof preview.text !== "string" || !preview.text.trim()) return;
+    if (state.lastText && !preview.text.startsWith(state.lastText)) { this._invalidateAnswerPreview(active); return; }
+    if (preview.text === state.lastText) return;
+    state.lastText = preview.text;
+    for (const waiter of state.owners) {
+      if (!currentOwner(waiter)) continue;
+      if (!waiter.firstAnswerPreviewSeen) {
+        waiter.firstAnswerPreviewSeen = true;
+        this._notifyTiming(waiter, { stage: "answer_preview_ready", elapsedMs: Math.max(0, Math.round(performance.now() - waiter.enqueuedAtMs)) });
+      }
+      if (!currentOwner(waiter) || typeof waiter.onAnswerPreview !== "function") continue;
+      try { Promise.resolve(waiter.onAnswerPreview(Object.freeze({ text: preview.text, isCurrent: () => currentOwner(waiter) }))).catch(() => {}); } catch {}
+    }
   }
 
   _interruptTurn(threadId, turnId) {
@@ -711,6 +781,7 @@ class PersistentCodexAgent extends EventEmitter {
     const active = this._newActive(null, waiter, { allowTools: businessMode && !warmup, businessMode, routeReason: route.reason, warmup, timeoutMs, totalTimeoutMs,
       deadlineAtMs: waiter.lifecycle?.deadline });
     session.active = active;
+    this._resetAnswerPreview(active);
     this._armAbsoluteTimeout(session, active);
     let turnStartFailureCandidate = false;
     try {
@@ -922,6 +993,9 @@ class PersistentCodexAgent extends EventEmitter {
   }
 
   async _steerActiveTurn(session, active, request, input = steerInput(request.question), steerBytes = inputBytes(input)) {
+    // Even a locally rejected steer attempt conservatively retires this turn's
+    // previews. ACK-pending output cannot safely be attributed to either owner.
+    this._invalidateAnswerPreview(active, true);
     if (!active.turnId) throw new AgentTurnFailureError("Codex 活动 Turn 尚未就绪，无法追加追问。", active.businessMode ? "xbb" : "general");
     // Reject an invalid/future scope before sending a steer or transferring the
     // answer owner. A rejected correction must leave the original turn intact.
@@ -1052,6 +1126,7 @@ class PersistentCodexAgent extends EventEmitter {
     active.modelErrorCode = null;
     active.modelRetrying = false;
     active.streamedMessageBytes = 0;
+    this._resetAnswerPreview(active);
     this._invalidateThread(session, "cancelled_steer");
     this._interruptTurn(oldThreadId, oldTurnId);
     try {
@@ -1253,6 +1328,7 @@ class PersistentCodexAgent extends EventEmitter {
   }
 
   _finishActive(session, active) {
+    this._invalidateAnswerPreview(active, true);
     if (active.timeout) clearTimeout(active.timeout);
     if (active.absoluteTimeout) clearTimeout(active.absoluteTimeout);
     active.timeout = null;
@@ -1321,6 +1397,7 @@ class PersistentCodexAgent extends EventEmitter {
       taskCheckpoint: null,
       inputBytes: 0,
       replayTurnParams: null,
+      answerPreview: null,
       startedAtMs: Date.now(),
       toolStartedAtMs: null,
       timeoutMs: Number(options.timeoutMs || 0),
@@ -1648,17 +1725,20 @@ class PersistentCodexAgent extends EventEmitter {
       void this._notifyProgress(session, "模型连接已恢复，正在生成答复……");
     }
     if (method === "item/started" && params?.item?.type === "agentMessage" && session.active && params.turnId === session.active.turnId) {
+      this._trackAnswerPreviewItem(session.active, params.item);
       if (session.active.messages.has(params.item.id) || session.active.messages.size < MAX_AGENT_MESSAGE_ITEMS) {
-        session.active.messages.set(params.item.id, { text: "", phase: params.item.phase || null });
+        session.active.messages.set(params.item.id, { text: "", phase: params.item.phase || null,
+          startedWithFinalPhase: params.item.phase === "final_answer" });
       }
       return;
     }
     if (method === "item/agentMessage/delta" && session.active && params.turnId === session.active.turnId) {
       const active = session.active;
+      this._recordFirstModelDelta(session, active, params.delta);
       let current = active.messages.get(params.itemId);
       if (!current) {
         if (active.messages.size >= MAX_AGENT_MESSAGE_ITEMS) return;
-        current = { text: "", phase: null };
+        current = { text: "", phase: null, startedWithFinalPhase: false };
       }
       const remainingBytes = Math.min(
         MAX_AGENT_MESSAGE_BYTES - Buffer.byteLength(current.text, "utf8"),
@@ -1668,11 +1748,20 @@ class PersistentCodexAgent extends EventEmitter {
       current.text += delta;
       active.streamedMessageBytes += Buffer.byteLength(delta, "utf8");
       active.messages.set(params.itemId, current);
+      this._offerAnswerPreview(session, active, params.itemId, current);
       return;
     }
     if (method === "item/completed" && params?.item?.type === "agentMessage" && session.active && params.turnId === session.active.turnId) {
-      const text = utf8Prefix(params.item.text || session.active.messages.get(params.item.id)?.text || "", MAX_AGENT_MESSAGE_BYTES).trim();
-      const phase = params.item.phase || session.active.messages.get(params.item.id)?.phase || null;
+      const current = session.active.messages.get(params.item.id);
+      const text = utf8Prefix(params.item.text || current?.text || "", MAX_AGENT_MESSAGE_BYTES).trim();
+      const phase = params.item.phase || current?.phase || null;
+      if ((phase === "final_answer" && (!current?.startedWithFinalPhase || session.active.answerPreview?.itemId !== params.item.id))
+          || (current?.startedWithFinalPhase && Object.hasOwn(params.item, "phase") && params.item.phase !== "final_answer")
+          || (current?.text && typeof params.item.text === "string" && !params.item.text.startsWith(current.text))) {
+        this._invalidateAnswerPreview(session.active);
+      }
+      this._offerAnswerPreview(session, session.active, params.item.id,
+        { text, phase, startedWithFinalPhase: current?.startedWithFinalPhase === true }, { finished: true });
       if (text) {
         session.active.lastText = text;
         if (phase === "final_answer") session.active.finalText = text;

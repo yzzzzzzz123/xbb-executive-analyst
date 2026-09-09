@@ -26,12 +26,12 @@ function summarizeLiveSamples(samples) {
 }
 
 function parseOptions(args) {
-  const allowed = /^(?:--live|--business|--context|--workload|--repeat=[1-5])$/;
-  if (args.some((arg) => !allowed.test(arg))) throw new Error("参数仅支持 --live [--repeat=1..5] [--context] [--business] [--workload]。");
+  const allowed = /^(?:--live|--business|--context|--workload|--preview|--repeat=[1-5])$/;
+  if (args.some((arg) => !allowed.test(arg))) throw new Error("参数仅支持 --live [--repeat=1..5] [--context] [--business] [--workload] [--preview]。");
   if (!args.includes("--live") && args.some((arg) => arg !== "--repeat=1")) {
     if (args.length) throw new Error("在线场景必须显式指定 --live；默认只运行离线交付故障基准。");
   }
-  return { live: args.includes("--live"), business: args.includes("--business"), context: args.includes("--context"), workload: args.includes("--workload"), repeat: Number(args.find((arg) => arg.startsWith("--repeat="))?.split("=")[1] || 3) };
+  return { live: args.includes("--live"), business: args.includes("--business"), context: args.includes("--context"), workload: args.includes("--workload"), preview: args.includes("--preview"), repeat: Number(args.find((arg) => arg.startsWith("--repeat="))?.split("=")[1] || 3) };
 }
 
 function runtimeRoot() {
@@ -95,13 +95,24 @@ async function liveProbe(options) {
     dataSources = new Set();
     allowBusinessQuery = scenario === "live-readonly-performance" && options.business;
     const before = performance.now();
+    const preview = { count: 0, firstReadyMs: null, modelFirstDeltaMs: null, maxBytes: 0 };
     let response;
-    try { response = await agent.answer({ question, access, principalKey, messageId: `local-probe-${samples.length + 1}` }); }
+    try { response = await agent.answer({ question, access, principalKey, messageId: `local-probe-${samples.length + 1}`,
+      onTiming: (event) => {
+        if (event.stage === "model_first_delta" && preview.modelFirstDeltaMs === null) preview.modelFirstDeltaMs = Math.round(performance.now() - before);
+      },
+      onAnswerPreview: (value) => {
+        if (value?.isCurrent?.() !== true || typeof value.text !== "string" || !value.text.trim()) return;
+        preview.count += 1;
+        if (preview.firstReadyMs === null) preview.firstReadyMs = Math.round(performance.now() - before);
+        preview.maxBytes = Math.max(preview.maxBytes, Buffer.byteLength(value.text, "utf8"));
+      }
+    }); }
     catch (error) {
       const failure = { scenario, passed: false, answerMs: Math.round(performance.now() - before),
         failure: error?.code === "REQUEST_DEADLINE_EXCEEDED" ? error.code : ["AgentTurnTimeoutError", "AgentTurnFailureError", "AccessDeniedError"].includes(error?.name) ? error.name : "probe_failed",
         modelErrorCode: ["unauthorized", "connection_failed", "usage_limit", "context_limit", "invalid_request", "service_error"].includes(error?.modelErrorCode) ? error.modelErrorCode : null,
-        stages: events.slice(eventIndex).map((event) => event.status), scheduling: [...scheduling]
+        stages: events.slice(eventIndex).map((event) => event.status), scheduling: [...scheduling], preview
       };
       samples.push(failure);
       options.onSample?.(failure);
@@ -110,18 +121,19 @@ async function liveProbe(options) {
     }
     const answerMs = Math.round(performance.now() - before);
     const currentEvents = events.slice(eventIndex);
-    const checks = await validate(response, currentEvents);
+    preview.leadMs = preview.firstReadyMs === null ? null : Math.max(0, answerMs - preview.firstReadyMs);
+    const checks = await validate(response, currentEvents, preview);
     const sample = { scenario, answerMs, passed: Object.values(checks).every(Boolean), checks,
-      answerBytes: Buffer.byteLength(response.answer, "utf8"), hasChart: Boolean(response.chart),
+      answerBytes: Buffer.byteLength(response.answer, "utf8"), hasChart: Boolean(response.chart), hasFinding: Boolean(response.chart?.finding),
       toolMs: currentEvents.find((event) => event.status === "tool_completed")?.elapsedMs ?? null,
       contextRotations: currentEvents.filter((event) => event.status === "context_rotated").length,
       dataSources: [...dataSources],
-      scheduling: [...scheduling]
+      scheduling: [...scheduling], preview
     };
     samples.push(sample);
     options.onSample?.(sample);
     // No answer, question, tool output, user ID, thread ID or business figure is printed.
-    process.stdout.write(`${JSON.stringify({ probe: scenario, answerMs, passed: sample.passed, hasChart: sample.hasChart })}\n`);
+    process.stdout.write(`${JSON.stringify({ probe: scenario, answerMs, passed: sample.passed, hasChart: sample.hasChart, preview })}\n`);
   };
   try {
     const start = performance.now();
@@ -141,6 +153,13 @@ async function liveProbe(options) {
     } else {
       for (let index = 0; index < options.repeat; index += 1) await probe("baseline-greeting", GREETING, generalChecks);
       await probe("strict-greeting", "你好", generalChecks);
+    }
+    if (options.preview) {
+      await probe("general-answer-preview", "不调用任何工具。请为新入职的后端工程师解释幂等、事务、重试、超时、取消五个概念及它们之间的区别，每个概念用两个自然段给出解释与一个贴近日常开发的例子，总计约700字。用空行分段，不使用HTML、代码块或表格。只输出给读者的正文。", (response, currentEvents, preview) => ({
+        ...generalChecks(response, currentEvents), meaningfulLength: response.answer.length >= 400,
+        previewAvailable: preview.count > 0, earlierThanFinal: preview.leadMs > 0,
+        boundedPreview: preview.maxBytes <= 18000
+      }));
     }
     if (options.context) {
       const question = [
@@ -170,14 +189,15 @@ async function liveProbe(options) {
       assertProductionIdle();
       const month = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit" }).replace(/\//g, "-");
       const [year, currentMonth] = month.match(/^\d{4}-\d{2}$/) ? month.split("-") : [String(new Date().getFullYear()), String(new Date().getMonth() + 1).padStart(2, "0")];
-      await probe("live-readonly-performance", `请只查询${year}年${Number(currentMonth)}月集团业绩（performance），按公司名称排名，给简短结论并配一张辅助图，不扩展其他数据域。`, async (response, currentEvents) => {
+      await probe("live-readonly-performance", `请只查询${year}年${Number(currentMonth)}月集团业绩（performance），按公司名称排名，给简短结论并配一张辅助图，不扩展其他数据域。`, async (response, currentEvents, preview) => {
         const { createWecomChartImage, createWecomAnswerImage } = require("../shared/wecom/chart-image.js");
         let supportingImage = false;
         try {
           const rendered = await (response.chart ? createWecomChartImage(response.chart) : createWecomAnswerImage(response.answer));
           supportingImage = Boolean(rendered?.item?.image?.base64 && rendered?.buffer?.length);
         } catch {}
-        return { queried: currentEvents.some((event) => event.status === "tool_started"), verified: currentEvents.some((event) => event.status === "tool_completed"), supportingImage, businessRoute: response.routeMode === "xbb" };
+        return { queried: currentEvents.some((event) => event.status === "tool_started"), verified: currentEvents.some((event) => event.status === "tool_completed"), supportingImage, businessRoute: response.routeMode === "xbb", noBusinessPreview: preview.count === 0,
+          governedInsight: !response.chart || (response.chart.finding ? response.chart.insight.startsWith("图内计算") : response.chart.insight.startsWith("兼容概述")) };
       });
     }
     const greetingMs = samples.filter((sample) => sample.scenario === "baseline-greeting").map((sample) => sample.answerMs);

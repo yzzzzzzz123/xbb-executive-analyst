@@ -116,7 +116,9 @@ assert.ok(performance.domains.includes("performance"));
 assert.match(performance.text, /业绩与收入结构/);
 assert.match(performance.text, /课程、咨询、其他金额和占比/);
 assert.match(performance.text, /图片与经营图/);
-assert.match(performance.text, /先写一句关键发现，再选图/);
+assert.match(performance.text, /结构化 `finding`/);
+assert.match(performance.text, /确定性程序从这些位置计算并生成 `insight`/);
+assert.match(performance.text, /不能证明.*数字已绑定完整事实源/);
 assert.match(performance.text, /xbb-executive-chart/);
 assert.match(performance.text, /不可突破的边界/);
 

@@ -3,6 +3,8 @@ const assert = require("node:assert/strict");
 const { FIXED_WORKLOADS, parseOptions, summarizeLiveSamples } = require("../scripts/benchmark-production.js");
 assert.equal(parseOptions(["--live", "--workload", "--repeat=4"]).repeat, 4);
 assert.throws(() => parseOptions(["--workload"]));
+assert.throws(() => parseOptions(["--preview"]));
+assert.equal(parseOptions(["--live", "--preview"]).preview, true);
 assert.throws(() => parseOptions(["--live", "--repeat=500"]));
 assert.equal(FIXED_WORKLOADS.length, 3);
 assert.equal(FIXED_WORKLOADS[0].matches("READY"), true);

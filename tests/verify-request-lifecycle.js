@@ -112,6 +112,7 @@ function callSyntheticQuery(f, month, id = `synthetic-query-${month}`, turn = f.
     assert.equal(f.client.interrupts.length, 0, "queued cancellation must preserve original owner");
     assert.deepEqual(queueTimings.map((event) => event.stage), ["session_expired"]);
     assert.ok(queueTimings[0].queueWaitMs >= 15);
+    assert.ok(Number.isInteger(queueTimings[0].queueWaitMs), "real monotonic queue timing must satisfy the metrics integer contract");
     f.client.complete(); await active;
     assert.deepEqual(timings.map((event) => event.stage), ["session_started"]);
   } finally { await f.agent.close(); }

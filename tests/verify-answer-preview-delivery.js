@@ -1,0 +1,197 @@
+"use strict";
+
+const assert = require("node:assert/strict");
+const { createLongConnectionHandler, createProgressPublisher } = require("../shared/wecom/long-connection-handler.js");
+const { MessageStore } = require("../shared/wecom/message-store.js");
+const { safeStatus } = require("../shared/wecom/status-writer.js");
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+const pending = () => { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; };
+const keepAlive = setInterval(() => {}, 1000);
+const syntheticImage = { msgtype: "image", image: { base64: "synthetic-preview-only", md5: "synthetic-preview-only" } };
+function fixture(id, answer, options = {}) {
+  const replies = [];
+  const statuses = [];
+  const store = new MessageStore();
+  const handler = createLongConnectionHandler({
+    policy: { schemaVersion: "1.0", users: { "synthetic-preview-user": { scope: "all" } } },
+    agent: { answer }, messageStore: store, statusWriter: (event) => statuses.push(safeStatus(event)),
+    emergencyImageFactory: () => syntheticImage, answerRenderer: async () => syntheticImage,
+    heartbeatMs: 8, answerPreviewIntervalMs: 5, replyBudgetMs: 200, progressDrainBudgetMs: 20,
+    ...options
+  });
+  const frame = { headers: { req_id: `preview-${id}` }, body: {
+    msgid: `preview-${id}`, from: { userid: "synthetic-preview-user" }, chattype: "single", msgtype: "text", text: { content: "解释二分查找" }
+  } };
+  const client = { replyStream: async (_frame, _stream, content, finish, items) => { replies.push({ content, finish, items }); } };
+  return { frame, client, handler, replies, statuses, store };
+}
+function previews(replies) { return replies.filter((reply) => reply.content.startsWith("正文预览")); }
+
+(async () => {
+  let callback;
+  const finish = pending();
+  const started = pending();
+  const visible = fixture("visible", async ({ onAnswerPreview, onProgress, onTiming }) => {
+    callback = onAnswerPreview;
+    onTiming({ stage: "model_first_delta", elapsedMs: 1, private: "NEVER_LOG" });
+    onTiming({ stage: "answer_preview_ready", elapsedMs: 2 });
+    onAnswerPreview({ text: "第一段：每次把候选范围减半。", isCurrent: () => true });
+    onProgress("旧阶段状态");
+    started.resolve();
+    await finish.promise;
+    return { answer: "完整结果：每次减半，直到找到目标或范围为空。", chart: null, routeMode: "general" };
+  });
+  const handling = visible.handler.handleMessage(visible.frame, visible.client);
+  await started.promise; await tick();
+  assert.equal(previews(visible.replies).length, 1);
+  assert.equal(visible.replies.at(-1).finish, false);
+  assert.equal(visible.store.messages.get(visible.frame.body.msgid).content.includes("第一段"), false, "draft is never cached for replay");
+  await wait(20);
+  assert.equal(visible.replies.some((reply) => reply.content.includes("旧阶段状态")), false, "status/heartbeat must not overwrite a current useful preview");
+  finish.resolve(); await handling;
+  assert.equal(visible.replies.at(-1).finish, true);
+  assert.match(visible.replies.at(-1).content, /^完整结果/);
+  callback({ text: "迟到段落", isCurrent: () => true }); await wait(10);
+  assert.equal(visible.replies.some((reply) => reply.content.includes("迟到段落")), false);
+  const metric = visible.statuses.find((event) => event.status === "request_measured");
+  assert.equal(metric.outcome, "success");
+  for (const name of ["modelFirstDeltaMs", "answerPreviewReadyMs", "answerPreviewVisibleMs"]) assert.ok(Number.isInteger(metric.timings[name]));
+  assert.ok(metric.timings.answerPreviewVisibleMs < metric.timings.answerVisibleMs);
+  assert.doesNotMatch(JSON.stringify(visible.statuses), /NEVER_LOG|第一段|synthetic-preview-user/);
+
+  const blocker = pending();
+  let ownerCurrent = true;
+  const sent = [];
+  const cached = [];
+  const publisher = createProgressPublisher({
+    deliver: async (content, isCurrent, onDispatch) => {
+      if (!isCurrent()) return false;
+      onDispatch(); sent.push(content);
+      if (content === "already dispatched") await blocker.promise;
+    }, updateState: (content) => cached.push(content), drainBudgetMs: 20
+  });
+  publisher.publish("already dispatched");
+  publisher.publish("old-owner draft", { store: false, isCurrent: () => ownerCurrent });
+  ownerCurrent = false; blocker.resolve(); await publisher.flush();
+  assert.deepEqual(sent, ["already dispatched"]);
+  assert.deepEqual(cached, ["already dispatched"]);
+  await publisher.close();
+
+  const failAfterPreview = fixture("failed", async ({ onAnswerPreview }) => {
+    onAnswerPreview({ text: "未完成的第一段", isCurrent: () => true });
+    await wait(5); throw new Error("synthetic failure");
+  });
+  await failAfterPreview.handler.handleMessage(failAfterPreview.frame, failAfterPreview.client);
+  assert.match(failAfterPreview.replies.at(-1).content, /正文预览不是完整结果/);
+  assert.equal(failAfterPreview.statuses.at(-1).outcome, "failed");
+
+  const stalled = pending();
+  const unacked = fixture("unacked", async ({ onAnswerPreview }) => {
+    onAnswerPreview({ text: "未得到通道回执的段落", isCurrent: () => true });
+    await wait(20); throw new Error("synthetic failure after send");
+  }, { replyBudgetMs: 10 });
+  unacked.client.replyStream = async (_frame, _stream, content, finish) => {
+    unacked.replies.push({ content, finish });
+    if (content.startsWith("正文预览")) await stalled.promise;
+  };
+  await unacked.handler.handleMessage(unacked.frame, unacked.client);
+  assert.match(unacked.replies.at(-1).content, /正文预览不是完整结果/);
+  assert.equal(Object.hasOwn(unacked.statuses.at(-1).timings, "answerPreviewVisibleMs"), false, "no ACK means no visible-time success");
+  stalled.resolve(); await tick();
+  assert.equal(Object.hasOwn(unacked.statuses.at(-1).timings, "answerPreviewVisibleMs"), false);
+
+  const rejectedPreview = fixture("preview-rejected", async ({ onAnswerPreview, onProgress }) => {
+    onAnswerPreview({ text: "发送失败的正文段落", isCurrent: () => true });
+    onProgress("继续整理验证结果");
+    await wait(25);
+    return { answer: "预览失败不影响完整答复", chart: null, routeMode: "general" };
+  }, { heartbeatMs: 5 });
+  rejectedPreview.client.replyStream = async (_frame, _stream, content, finish) => {
+    if (content.startsWith("正文预览")) throw new Error("synthetic immediate preview rejection");
+    rejectedPreview.replies.push({ content, finish });
+  };
+  await rejectedPreview.handler.handleMessage(rejectedPreview.frame, rejectedPreview.client);
+  assert.ok(rejectedPreview.replies.some((reply) => reply.content === "继续整理验证结果"), "failed current preview must restore the latest stage");
+  assert.ok(rejectedPreview.replies.some((reply) => reply.content.includes("已用时")), "failed current preview must no longer suppress heartbeat");
+  assert.equal(rejectedPreview.replies.at(-1).finish, true);
+  assert.equal(rejectedPreview.statuses.at(-1).outcome, "success");
+  assert.equal(Object.hasOwn(rejectedPreview.statuses.at(-1).timings, "answerPreviewVisibleMs"), false, "rejected preview must not claim an ACK");
+
+  const oldSending = pending();
+  const failOld = pending();
+  const newerQueued = fixture("newer-preview", async ({ onAnswerPreview, onProgress }) => {
+    onAnswerPreview({ text: "旧预览发送中", isCurrent: () => true });
+    await oldSending.promise;
+    onAnswerPreview({ text: "更新后的正文预览", isCurrent: () => true });
+    onProgress("不应覆盖新预览的状态");
+    failOld.resolve();
+    await wait(25);
+    return { answer: "完整最终答复", chart: null, routeMode: "general" };
+  });
+  newerQueued.client.replyStream = async (_frame, _stream, content, finish) => {
+    if (content.includes("旧预览发送中")) {
+      oldSending.resolve(); await failOld.promise;
+      throw new Error("synthetic old preview failure after newer draft queued");
+    }
+    newerQueued.replies.push({ content, finish });
+  };
+  await newerQueued.handler.handleMessage(newerQueued.frame, newerQueued.client);
+  assert.equal(previews(newerQueued.replies).length, 1);
+  assert.match(previews(newerQueued.replies)[0].content, /更新后的正文预览/);
+  assert.equal(newerQueued.replies.some((reply) => reply.content.includes("不应覆盖新预览的状态")), false, "older failure cannot replace a newer queued preview with status");
+  assert.ok(Number.isInteger(newerQueued.statuses.at(-1).timings.answerPreviewVisibleMs));
+  assert.equal(newerQueued.replies.at(-1).finish, true);
+
+  const failureEvents = [];
+  const failureObserver = createProgressPublisher({
+    deliver: async (content) => { failureEvents.push(content); if (content === "failed") throw new Error("synthetic publisher delivery failure"); },
+    updateState: () => {}
+  });
+  failureObserver.publish("failed", { onDeliveryFailed: () => new Promise(() => {}) });
+  failureObserver.publish("continues");
+  await failureObserver.flush(); await failureObserver.close();
+  assert.deepEqual(failureEvents, ["failed", "continues"], "unsettled failure observer must not block the publisher");
+
+  const business = fixture("business", async ({ onAnswerPreview }) => {
+    onAnswerPreview({ text: "禁止提前发送的合成经营数字", isCurrent: () => true });
+    return { answer: "经营测试最终状态", chart: null, routeMode: "xbb" };
+  });
+  business.frame.body.text.content = "集团2026年8月业绩";
+  await business.handler.handleMessage(business.frame, business.client);
+  assert.equal(previews(business.replies).length, 0);
+  assert.equal(business.replies.at(-1).items.length, 1);
+
+  const capped = fixture("cap", async ({ onAnswerPreview }) => {
+    for (let index = 0; index < 20; index += 1) {
+      onAnswerPreview({ text: `完整测试段落 ${index}`, isCurrent: () => true });
+      await wait(3);
+    }
+    return { answer: "最终答复不受预览限额限制", chart: null, routeMode: "general" };
+  }, { answerPreviewIntervalMs: 1 });
+  await capped.handler.handleMessage(capped.frame, capped.client);
+  assert.equal(previews(capped.replies).length, 12);
+  assert.equal(capped.replies.at(-1).finish, true);
+
+  const coalesced = fixture("coalesced", async ({ onAnswerPreview }) => {
+    onAnswerPreview({ text: "首段", isCurrent: () => true }); await tick();
+    for (let index = 0; index < 20; index += 1) onAnswerPreview({ text: `最新段落 ${index}`, isCurrent: () => true });
+    await wait(35);
+    return { answer: "完整答复", chart: null, routeMode: "general" };
+  }, { answerPreviewIntervalMs: 20 });
+  await coalesced.handler.handleMessage(coalesced.frame, coalesced.client);
+  assert.equal(previews(coalesced.replies).length, 2);
+  assert.match(previews(coalesced.replies)[1].content, /最新段落 19/);
+
+  const invalid = fixture("invalid", async ({ onAnswerPreview }) => {
+    onAnswerPreview({ text: "错误guard", isCurrent: () => { throw new Error("synthetic guard failure"); } });
+    onAnswerPreview({ text: "没有guard" });
+    onAnswerPreview({ text: "长".repeat(6001), isCurrent: () => true });
+    return { answer: "安全完成", chart: null, routeMode: "general" };
+  });
+  await invalid.handler.handleMessage(invalid.frame, invalid.client);
+  assert.equal(previews(invalid.replies).length, 0);
+  assert.equal(Object.hasOwn(invalid.statuses.at(-1).timings, "answerPreviewVisibleMs"), false);
+  console.log(JSON.stringify({ success: true, synthetic: true, scenarios: 11, realMessagesSent: 0 }));
+})().catch((error) => { console.error(error); process.exitCode = 1; }).finally(() => clearInterval(keepAlive));

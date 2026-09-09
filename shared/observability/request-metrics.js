@@ -4,7 +4,8 @@ const { randomBytes } = require("node:crypto");
 const { performance } = require("node:perf_hooks");
 
 const TIMING_FIELDS = Object.freeze([
-  "firstReplyMs", "analysisMs", "answerReadyMs", "answerVisibleMs", "progressDrainMs",
+  "firstReplyMs", "modelFirstDeltaMs", "answerPreviewReadyMs", "answerPreviewVisibleMs",
+  "analysisMs", "answerReadyMs", "answerVisibleMs", "progressDrainMs",
   "sessionQueueMs", "queryQueueMs", "queryRunMs", "renderMs", "uploadMs", "mediaDeliveryMs", "totalMs"
 ]);
 const MAX_TIMING_MS = 24 * 60 * 60 * 1000;
@@ -35,7 +36,16 @@ function createRequestMetrics({ now = () => performance.now(), startedAt = now()
   };
   return Object.freeze({
     mark(field) { record(field, now() - startedAt); },
+    markFirst(field) { if (!Object.hasOwn(timings, field)) record(field, now() - startedAt); },
     addQueryTiming(event) {
+      const modelField = { model_first_delta: "modelFirstDeltaMs", answer_preview_ready: "answerPreviewReadyMs" }[event?.stage];
+      if (modelField) {
+        // Agent elapsedMs starts at enqueue, after the initial channel ACK.
+        // Measure here on the request's own monotonic clock so all first-event
+        // fields have the same received-message origin and cannot expose text.
+        if (!Object.hasOwn(timings, modelField) && Number.isInteger(event.elapsedMs) && event.elapsedMs >= 0 && event.elapsedMs <= MAX_TIMING_MS) record(modelField, now() - startedAt);
+        return;
+      }
       if (["session_started", "session_expired"].includes(event?.stage)) {
         if (!Object.hasOwn(timings, "sessionQueueMs") && Number.isInteger(event.queueWaitMs) && event.queueWaitMs >= 0 && event.queueWaitMs <= MAX_TIMING_MS) record("sessionQueueMs", event.queueWaitMs);
         return;
