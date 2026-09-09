@@ -855,35 +855,67 @@ async function main() {
 
   if (process.platform === "win32") {
     const bindingTestRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-root-binding-test-"));
-    fs.mkdirSync(defaultGatewayWorkRoot(), { recursive: true });
-    const bindingWorkDirectory = fs.mkdtempSync(path.join(defaultGatewayWorkRoot(), "request-"));
-    const bindingRunner = path.resolve(__dirname, "..", "skills", "xbb-executive-analyst", "scripts", "query-xbb.ps1");
-    const bindingOutput = path.join(bindingWorkDirectory, "fact-pack.json");
-    const bindingMarker = createRunnerIsolationMarker({
-      serviceLeasePath: path.join(bindingTestRoot, "service-lease.json"),
-      projectRoot: path.resolve(__dirname, ".."),
-      runner: bindingRunner,
-      gatewayWorkDirectory: bindingWorkDirectory
-    });
-    const bindingArgs = ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", bindingRunner,
-      "-OutputPath", bindingOutput, "-RequestFromStdin", "-IsolationToken", bindingMarker.token,
-      "-IsolationMarkerPath", bindingMarker.markerPath];
-    const bindingScope = { months: ["2099-01"], domains: ["all"], company: null, person: null, forceRefresh: false };
+    const previousTemp = process.env.TEMP;
+    const previousTmp = process.env.TMP;
     try {
-      for (const businessValue of ["2099-01", "all"]) assert.equal(bindingArgs.includes(businessValue), false);
-      await assert.rejects(runRunnerProcess(util.promisify(childProcess.execFile), "powershell.exe", bindingArgs, {
-        platform: "linux",
-        windowsHide: true,
-        encoding: "utf8",
-        timeoutMs: 10000,
-        stdinText: `${JSON.stringify(bindingScope)}\n`
-      }));
-      const boundMarker = readRunnerIsolationMarker(bindingMarker.markerPath);
-      assert.equal(Number.isInteger(boundMarker.rootProcess?.pid), true,
-        "真实 Windows PowerShell runner 必须从无业务 argv 严格绑定 root PID/creation/exe");
+      // Exercise the same short TEMP path used by Windows CI when 8.3 names are
+      // enabled. PowerShell GetFullPath expands it; Node path.resolve does not.
+      const shortTempRoot = childProcess.execFileSync("powershell.exe", [
+        "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+        "(New-Object -ComObject Scripting.FileSystemObject).GetFolder($env:XBB_TEST_TEMP_ROOT).ShortPath"
+      ], { env: { ...process.env, XBB_TEST_TEMP_ROOT: bindingTestRoot }, encoding: "utf8", windowsHide: true, timeout: 10000 }).trim();
+      assert.equal(fs.realpathSync.native(shortTempRoot), fs.realpathSync.native(bindingTestRoot));
+      process.env.TEMP = shortTempRoot;
+      process.env.TMP = shortTempRoot;
+      fs.mkdirSync(defaultGatewayWorkRoot(), { recursive: true });
+      const bindingWorkDirectory = fs.mkdtempSync(path.join(defaultGatewayWorkRoot(), "request-"));
+      const bindingRunner = path.resolve(__dirname, "..", "skills", "xbb-executive-analyst", "scripts", "query-xbb.ps1");
+      const bindingOutput = path.join(bindingWorkDirectory, "fact-pack.json");
+      const bindingMarker = createRunnerIsolationMarker({
+        serviceLeasePath: path.join(bindingTestRoot, "service-lease.json"),
+        projectRoot: path.resolve(__dirname, ".."),
+        runner: bindingRunner,
+        gatewayWorkDirectory: bindingWorkDirectory
+      });
+      try {
+        const markerBeforeBinding = readRunnerIsolationMarker(bindingMarker.markerPath);
+        assert.equal(markerBeforeBinding.gatewayWorkDirectory, fs.realpathSync.native(bindingWorkDirectory));
+        assert.equal(markerBeforeBinding.rootProcess, null);
+        const markerText = fs.readFileSync(bindingMarker.markerPath, "utf8");
+        fs.writeFileSync(bindingMarker.markerPath, JSON.stringify({ ...markerBeforeBinding,
+          gatewayWorkDirectory: path.join(fs.realpathSync.native(bindingTestRoot), "outside", "request-invalid")
+        }), "utf8");
+        assert.throws(() => readRunnerIsolationMarker(bindingMarker.markerPath), (error) => error?.code === RUNNER_ISOLATION_ERROR_CODE,
+          "短路径兼容不得接受固定临时根之外的伪造目录");
+        fs.writeFileSync(bindingMarker.markerPath, markerText, "utf8");
+        process.env.TEMP = path.join(bindingTestRoot, "missing-temp");
+        process.env.TMP = process.env.TEMP;
+        assert.throws(() => readRunnerIsolationMarker(bindingMarker.markerPath), (error) => error?.code === RUNNER_ISOLATION_ERROR_CODE,
+          "固定临时根不存在时必须继续失败关闭");
+        assert.equal(fs.existsSync(defaultGatewayWorkRoot()), false, "只读标记校验不得创建缺失根目录");
+        process.env.TEMP = shortTempRoot;
+        process.env.TMP = shortTempRoot;
+        const bindingArgs = ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", bindingRunner,
+          "-OutputPath", bindingOutput, "-RequestFromStdin", "-IsolationToken", bindingMarker.token,
+          "-IsolationMarkerPath", bindingMarker.markerPath];
+        const bindingScope = { months: ["2099-01"], domains: ["all"], company: null, person: null, forceRefresh: false };
+        for (const businessValue of ["2099-01", "all"]) assert.equal(bindingArgs.includes(businessValue), false);
+        await assert.rejects(runRunnerProcess(util.promisify(childProcess.execFile), "powershell.exe", bindingArgs, {
+          platform: "linux",
+          windowsHide: true,
+          encoding: "utf8",
+          timeoutMs: 10000,
+          stdinText: `${JSON.stringify(bindingScope)}\n`
+        }));
+        const boundMarker = readRunnerIsolationMarker(bindingMarker.markerPath);
+        assert.equal(Number.isInteger(boundMarker.rootProcess?.pid), true,
+          "真实 Windows PowerShell runner 必须从无业务 argv 严格绑定 root PID/creation/exe");
+      } finally {
+        clearRunnerIsolationMarker(bindingMarker);
+      }
     } finally {
-      clearRunnerIsolationMarker(bindingMarker);
-      fs.rmSync(bindingWorkDirectory, { recursive: true, force: true });
+      if (previousTemp === undefined) delete process.env.TEMP; else process.env.TEMP = previousTemp;
+      if (previousTmp === undefined) delete process.env.TMP; else process.env.TMP = previousTmp;
       fs.rmSync(bindingTestRoot, { recursive: true, force: true });
     }
   }

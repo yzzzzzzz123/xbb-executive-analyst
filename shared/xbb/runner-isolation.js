@@ -165,7 +165,7 @@ function readRunnerIsolationMarker(markerPath) {
     }
     const expectedQuery = path.join(payload.projectRoot, QUERY_SCRIPT_RELATIVE_PATH);
     const expectedChildren = CHILD_SCRIPT_RELATIVE_PATHS.map((relative) => path.join(payload.projectRoot, relative));
-    const expectedGatewayRoot = path.resolve(defaultGatewayWorkRoot());
+    const expectedGatewayRoot = canonicalExistingPath(defaultGatewayWorkRoot(), "runner gateway 临时根目录");
     if (!samePath(payload.queryScriptPath, expectedQuery)
         || payload.childScriptPaths.some((item, index) => !samePath(item, expectedChildren[index]))
         || !samePath(path.dirname(payload.gatewayWorkDirectory), expectedGatewayRoot)
