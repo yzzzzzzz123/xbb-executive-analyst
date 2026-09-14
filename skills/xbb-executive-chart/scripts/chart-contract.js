@@ -2,7 +2,7 @@
 
 const { RELATIONS_BY_TYPE, normalizeFinding } = require("./chart-findings.js");
 const FORMAT_VALUES = Object.freeze(["number", "money", "percent"]);
-const COMMON_FIELDS = Object.freeze(["type", "title", "subtitle", "insight", "note", "focus", "finding"]);
+const COMMON_FIELDS = Object.freeze(["type", "title", "subtitle", "insight", "note", "focus", "finding", "findings"]);
 const PERCENT_TOTAL_TOLERANCE = 0.5;
 
 const LIMITS = Object.freeze({
@@ -30,7 +30,7 @@ const commonProperties = {
     type: "string",
     minLength: 1,
     maxLength: LIMITS.insight,
-    description: "兼容输入字段。填写由finding生成；发布时由程序按finding计算覆盖，finding为null时改为可见值兼容概述，绝不原样发布自由洞察。"
+    description: "兼容输入字段。填写由finding生成；发布时由程序按finding计算覆盖，绝不原样发布自由洞察。"
   },
   note: { type: "string", maxLength: LIMITS.note }
 };
@@ -60,7 +60,7 @@ const pointsSchema = {
   })
 };
 
-const CHART_SCHEMA = deepFreeze({
+const SINGLE_CHART_SCHEMA = deepFreeze({
   anyOf: [
     chartVariant("bar", {
       valueFormat: formatSchema,
@@ -103,6 +103,19 @@ const CHART_SCHEMA = deepFreeze({
   ]
 });
 
+// A bounded, non-recursive composition retains the existing per-panel contract.
+const CHART_SCHEMA = deepFreeze({ anyOf: [
+  ...SINGLE_CHART_SCHEMA.anyOf,
+  strictObject({
+    type: { type: "string", enum: ["composite"] },
+    title: commonProperties.title,
+    subtitle: commonProperties.subtitle,
+    note: commonProperties.note,
+    panels: { type: "array", minItems: 2, maxItems: 8, items: SINGLE_CHART_SCHEMA,
+      description: "两个及以上有效分析维度必须分别成图；宽泛问题也应分析出图。逐项覆盖全部维度，面板互补且不同，顺序与文字分析一致。" }
+  })
+] });
+
 function strictObject(properties) {
   return {
     type: "object",
@@ -136,16 +149,21 @@ function chartVariant(type, specificProperties) {
     category: { type: "string", minLength: 1, maxLength: LIMITS.category },
     axis: { type: "string", enum: type === "scatter" ? ["x", "y"] : ["value"] }
   });
+  const findingSchema = strictObject({
+    relation: { type: "string", enum: RELATIONS_BY_TYPE[type] },
+    subject: reference,
+    baseline: { anyOf: [reference, { type: "null" }] }
+  });
   return strictObject({
     type: { type: "string", enum: [type] },
     ...commonProperties,
     finding: {
       description: "选择图内已展示数据及关系；不填写计算结果。程序计算insight，并以subject产生focus。这里只验证图内算术，不绑定完整事实源。无适用关系时null。",
-      anyOf: [strictObject({
-        relation: { type: "string", enum: RELATIONS_BY_TYPE[type] },
-        subject: reference,
-        baseline: { anyOf: [reference, { type: "null" }] }
-      }), { type: "null" }]
+      anyOf: [findingSchema, { type: "null" }]
+    },
+    findings: {
+      type: "array", minItems: 0, maxItems: 4, items: findingSchema,
+      description: "按阅读顺序选择0–4条不同的可验证关系，每个充分数据的分析维度建议2–4条。只填图内引用，禁止文案和计算结果。finding非空时必须等于首条；可填finding:null让程序采用首条。"
     },
     focus: {
       description: "新规格推荐null，由finding.subject生成。非空时必须与finding.subject指向相同位置；finding为null时旧focus仅校验后清除。",
@@ -167,6 +185,26 @@ function validateSpec(spec) {
   ensureObject(spec, "图表");
   if (!Object.prototype.hasOwnProperty.call(spec, "type")) fail("缺少 type");
   if (typeof spec.type !== "string") fail("type 必须是字符串");
+  if (spec.type === "composite") {
+    ensureExactFields(spec, ["type", "title", "subtitle", "note", "panels"], "综合图");
+    ensureArrayRange(spec.panels, "panels", 2, 8);
+    const panels = spec.panels.map((panel) => {
+      ensureObject(panel, "panel");
+      if (panel.type === "composite") fail("综合图不能嵌套");
+      return validateSpec(panel);
+    });
+    ensureUnique(panels.map((panel) => panel.title), "panels.title");
+    const panelData = panels.map((panel) => JSON.stringify(Object.fromEntries(Object.entries(panel)
+      .filter(([key]) => !["title", "subtitle", "note", "focus", "insight", "finding", "findings"].includes(key)))));
+    if (new Set(panelData).size !== panelData.length) fail("综合图不能复制相同图形和数据凑数");
+    return deepFreeze({
+      type: "composite",
+      title: normalizeString(spec.title, "title", LIMITS.title, false),
+      subtitle: normalizeString(spec.subtitle, "subtitle", LIMITS.subtitle, true),
+      note: normalizeString(spec.note, "note", LIMITS.note, true),
+      panels
+    });
+  }
 
   const validators = {
     bar: validateSeriesChart,
@@ -184,11 +222,28 @@ function validateSpec(spec) {
   const normalized = validator(spec);
   const focus = Object.prototype.hasOwnProperty.call(spec, "focus") ? spec.focus : null;
   const requestedFocus = normalizeFocus(focus, normalized);
-  const derived = normalizeFinding(Object.hasOwn(spec, "finding") ? spec.finding : null, normalized);
+  const legacy = normalizeFinding(Object.hasOwn(spec, "finding") ? spec.finding : null, normalized);
+  let findings = [];
+  if (Object.hasOwn(spec, "findings")) {
+    ensureArrayRange(spec.findings, "findings", 0, 4);
+    findings = spec.findings.map((finding) => {
+      if (finding === null) fail("findings 不能包含 null");
+      return normalizeFinding(finding, normalized);
+    });
+    const keys = findings.map((finding) => JSON.stringify(finding.finding));
+    if (new Set(keys).size !== keys.length) fail("findings 不能重复同一关系");
+    if (legacy.finding && findings.length && JSON.stringify(legacy.finding) !== JSON.stringify(findings[0].finding)) {
+      fail("finding 必须与 findings 首条相同");
+    }
+  }
+  if (!findings.length && legacy.finding) findings = [legacy];
+  for (const finding of findings) normalizeString(finding.insight, "计算后的 finding", LIMITS.insight, false);
+  const derived = findings[0] || legacy;
   if (derived.finding && requestedFocus && JSON.stringify(requestedFocus) !== JSON.stringify(derived.focus)) {
     fail("focus 必须与 finding.subject 指向同一数据位置");
   }
   normalized.finding = derived.finding;
+  normalized.findings = findings.map((finding) => finding.finding);
   normalized.insight = normalizeString(derived.insight, "计算后的 insight", LIMITS.insight, false);
   normalized.focus = derived.focus;
   return deepFreeze(normalized);
@@ -199,7 +254,7 @@ function validateSeriesChart(spec) {
   ensureExactFields(spec, [
     ...COMMON_FIELDS,
     "valueFormat", "unit", "categories", "series"
-  ], "图表", ["focus", "finding"]);
+  ], "图表", ["focus", "finding", "findings"]);
   const common = normalizeCommon(spec);
   const valueFormat = normalizeFormat(spec.valueFormat, "valueFormat");
   const unit = normalizeUnit(spec.unit, valueFormat, "unit");
@@ -218,7 +273,7 @@ function validateDonut(spec) {
   ensureExactFields(spec, [
     ...COMMON_FIELDS,
     "valueFormat", "unit", "items", "centerLabel"
-  ], "图表", ["focus", "finding"]);
+  ], "图表", ["focus", "finding", "findings"]);
   const common = normalizeCommon(spec);
   const valueFormat = normalizeFormat(spec.valueFormat, "valueFormat");
   const items = normalizeItems(spec.items, valueFormat, false);
@@ -238,7 +293,7 @@ function validateFunnel(spec) {
   ensureExactFields(spec, [
     ...COMMON_FIELDS,
     "valueFormat", "unit", "items"
-  ], "图表", ["focus", "finding"]);
+  ], "图表", ["focus", "finding", "findings"]);
   const common = normalizeCommon(spec);
   const valueFormat = normalizeFormat(spec.valueFormat, "valueFormat");
   const items = normalizeItems(spec.items, valueFormat, true);
@@ -255,7 +310,7 @@ function validateScatter(spec) {
   ensureExactFields(spec, [
     ...COMMON_FIELDS,
     "points", "xLabel", "yLabel", "xFormat", "yFormat", "xUnit", "yUnit"
-  ], "图表", ["focus", "finding"]);
+  ], "图表", ["focus", "finding", "findings"]);
   const common = normalizeCommon(spec);
   const xFormat = normalizeFormat(spec.xFormat, "xFormat");
   const yFormat = normalizeFormat(spec.yFormat, "yFormat");

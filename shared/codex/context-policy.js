@@ -133,6 +133,7 @@ function isTaskContinuation(question, prior, mode, routeReason = "") {
   if (!prior || prior.mode !== mode) return false;
   if (TASK_RESET_PATTERN.test(question.trim())) return false;
   if (mode === "general" && WHY_QUESTION_PATTERN.test(question.trim())) return WHY_CONTINUATION_PATTERN.test(question.trim());
+  if (mode === "xbb" && /^(?:(?:请|麻烦)(?:帮我)?)?(?:其次|再者|再补充|那(?:么)?[，,]?)/u.test(question.trim())) return true;
   return /follow-up/u.test(routeReason) || CONTINUATION_PATTERN.test(question.trim());
 }
 
@@ -151,7 +152,9 @@ function updateTaskContext(prior, question, { mode = "general", continuation = f
   const constraintUnits = units.filter((part) => CONSTRAINT_PATTERN.test(part));
   const constraints = constraintUnits
     .map((part) => sanitizeIntent(part, mode, MAX_CONSTRAINT_BYTES));
-  const intentUnits = [units[0], units.length > 1 ? units.at(-1) : ""].filter(Boolean);
+  // A business amendment can itself ask several dimensions. Keep every clause
+  // within the existing intent budget, including the middle subquestions.
+  const intentUnits = mode === "xbb" ? units : [units[0], units.length > 1 ? units.at(-1) : ""].filter(Boolean);
   const intent = sanitizeIntent(intentUnits.join("\n"), mode);
   const explicitGoal = units.find((part) => EXPLICIT_GOAL_PATTERN.test(part));
   const goalUnit = explicitGoal || (!inherited ? units[0] : null);
@@ -163,7 +166,7 @@ function updateTaskContext(prior, question, { mode = "general", continuation = f
   const context = {
     version: 1,
     mode,
-    goal: goalUnit ? sanitizeIntent(goalUnit, mode) : inherited?.goal || "用户提供了代码或结构化材料；需核实原文后继续。",
+    goal: goalUnit ? sanitizeIntent(mode === "xbb" && !inherited && !explicitGoal ? units.join("\n") : goalUnit, mode) : inherited?.goal || "用户提供了代码或结构化材料；需核实原文后继续。",
     constraints: retainedConstraints,
     omittedConstraints: Math.min(999, (inherited?.omittedConstraints || 0) + allConstraints.length - retainedConstraints.length),
     corrections: [...(inherited?.corrections || []), ...(inherited && intent ? [intent] : [])].slice(-4),

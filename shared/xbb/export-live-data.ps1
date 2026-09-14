@@ -4,7 +4,13 @@ param(
     [ValidatePattern('^\d{4}-(0[1-9]|1[0-2])$')]
     [string]$Month,
 
+    [string]$Date,
+
     [string[]]$Domains = @('all'),
+
+    [string[]]$Metrics,
+    [string]$Company,
+    [string]$Person,
 
     [Parameter(Mandatory = $true)]
     [string]$OutputPath,
@@ -59,7 +65,12 @@ try {
     if (-not [string]::IsNullOrWhiteSpace($IsolationToken)) {
         $extractorArguments += @('--isolation-token', $IsolationToken)
     }
-    $extractRequest = [ordered]@{ month = $Month; domains = @($Domains) } | ConvertTo-Json -Depth 3 -Compress
+    $extractScope = [ordered]@{ month = $Month; domains = @($Domains) }
+    if (-not [string]::IsNullOrWhiteSpace($Date)) { $extractScope['date'] = $Date }
+    if (@($Metrics).Count -gt 0) { $extractScope['metrics'] = @($Metrics) }
+    if (-not [string]::IsNullOrWhiteSpace($Company)) { $extractScope['company'] = $Company }
+    if (-not [string]::IsNullOrWhiteSpace($Person)) { $extractScope['person'] = $Person }
+    $extractRequest = $extractScope | ConvertTo-Json -Depth 4 -Compress
     $previousOutputEncoding = $OutputEncoding
     try {
         $OutputEncoding = [Text.UTF8Encoding]::new($false)

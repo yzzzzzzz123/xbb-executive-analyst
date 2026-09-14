@@ -15,11 +15,15 @@ const {
 } = require("../xbb/tool-gateway.js");
 const { RUNNER_ISOLATION_ERROR_CODE } = require("../xbb/runner-isolation.js");
 const { MAX_MODEL_FACT_VIEW_BYTES, buildModelFactView } = require("../xbb/model-fact-view.js");
-const { QUERY_XBB_DYNAMIC_TOOL, queryToolContractHash } = require("../xbb/query-tool.js");
-const { chooseTurnEffort, hasExplicitPeriod, planFastQuery, validateRequestedMonths } = require("../xbb/fast-query-plan.js");
+const { QUERY_XBB_DYNAMIC_TOOL, queryToolContractHash, bindQueryDemand } = require("../xbb/query-tool.js");
+const { chooseTurnEffort, hasExplicitPeriod, parseDate, planFastQuery, validateRequestedMonths } = require("../xbb/fast-query-plan.js");
 const { formatContextAnalysisProgress, formatGeneralAnalysisProgress, formatQueryProgress } = require("../xbb/query-progress.js");
 const { AppServerClient } = require("./app-server-client.js");
 const { LocalAppServerHost } = require("./app-server-host.js");
+const { modelContextConfig } = require("./model-context.js");
+const { CHART_AGENT_CONFIG, chartAgentContract } = require("./chart-agent-config.js");
+const { ChartAgentTracker } = require("./chart-agent-tracker.js");
+const { VALIDATE_CHART_TOOL, validateChartPreview } = require("./chart-validation-tool.js");
 const { classifyModelError, safeModelErrorCode } = require("./model-error.js");
 const { buildVerifiedFallbackAnswer, falseTechnicalRefusalReason, hasUsableFacts } = require("./recovery-answer.js");
 const { GENERAL_RESPONSE_SCHEMA, WECOM_RESPONSE_SCHEMA, parseAgentResponse, responseContractHash } = require("./response-contract.js");
@@ -41,7 +45,7 @@ const { extractAnswerPreview } = require("./answer-preview.js");
 
 const MAX_SESSION_ESTIMATED_INPUT_BYTES = 256 * 1024;
 const MAX_SESSION_TURNS = 24;
-const CONTEXT_ROTATION_RATIO = 0.7;
+const CONTEXT_ROTATION_RATIO = 0.9;
 const MAX_TURN_FACT_BYTES = 128 * 1024;
 const MAX_STEER_COUNT = 8;
 const MAX_STEER_INPUT_BYTES = 64 * 1024;
@@ -69,7 +73,7 @@ function sha256(value) {
 
 function queryFingerprint(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const allowed = new Set(["months", "domains", "company", "person", "forceRefresh"]);
+  const allowed = new Set(["months", "date", "domains", "metrics", "company", "person", "forceRefresh"]);
   if (Object.keys(value).some((key) => !allowed.has(key))) return null;
   const months = Array.isArray(value.months) ? value.months.map(String).sort() : [];
   const domains = Array.isArray(value.domains) ? value.domains.map(String).sort() : [];
@@ -77,6 +81,8 @@ function queryFingerprint(value) {
   return sha256(JSON.stringify({
     months,
     domains,
+    ...(value.date ? { date: value.date } : {}),
+    ...(value.metrics ? { metrics: [...value.metrics].sort() } : {}),
     company: typeof value.company === "string" ? value.company.trim() : "",
     person: typeof value.person === "string" ? value.person.trim() : "",
     forceRefresh: value.forceRefresh === true
@@ -204,12 +210,16 @@ function appendPreStartContext(context, question) {
 function inheritedCorrectionPlan(question, activePlan) {
   if (!activePlan || !Array.isArray(activePlan.months) || !Array.isArray(activePlan.domains)) return planFastQuery(question);
   const directPlan = planFastQuery(question);
-  const domains = directPlan?.domains?.length ? [...directPlan.domains] : [...activePlan.domains];
   const text = String(question || "");
+  const additive = /^(?:(?:请|麻烦)(?:帮我)?)?(?:其次|还有|另外|再者|再补充|也看)/u.test(text.trim());
+  const domains = directPlan?.domains?.length
+    ? [...new Set([...(additive ? activePlan.domains : []), ...directPlan.domains])]
+    : [...activePlan.domains];
   const standaloneMonth = !hasExplicitPeriod(text)
     ? [...text.matchAll(/(?<!\d)(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月/g)].at(-1)
     : null;
   const hasPeriodCorrection = hasExplicitPeriod(text) || Boolean(standaloneMonth);
+  const requestedDate = parseDate(text);
   let months = [...activePlan.months];
   if (hasPeriodCorrection) {
     const hints = domains.map((domain) => DOMAIN_QUERY_HINTS[domain] || "").filter(Boolean).join(" ");
@@ -223,11 +233,15 @@ function inheritedCorrectionPlan(question, activePlan) {
       months = validateRequestedMonths([`${year}-${String(month).padStart(2, "0")}`]);
     }
   }
-  return Object.freeze({
+  if (requestedDate) months = [requestedDate.slice(0, 7)];
+  const corrected = {
     ...activePlan,
     months: Object.freeze(months),
     domains: Object.freeze(domains)
-  });
+  };
+  if (requestedDate) corrected.date = requestedDate;
+  else if (hasPeriodCorrection) delete corrected.date;
+  return Object.freeze(corrected);
 }
 
 function createSession(principalKey, stored = {}) {
@@ -291,7 +305,9 @@ class PersistentCodexAgent extends EventEmitter {
   constructor(config, options = {}) {
     super();
     this.config = config;
+    this.modelContext = modelContextConfig(config);
     this.projectRoot = config.projectRoot || path.resolve(__dirname, "..", "..");
+    this.threadConfig = Object.freeze({ ...this.modelContext, ...CHART_AGENT_CONFIG });
     this.knowledgeBase = options.knowledgeBase || new SkillKnowledgeBase(this.projectRoot);
     this.instructions = options.instructions || buildThreadInstructions(this.projectRoot);
     this.hostFactory = options.hostFactory || LocalAppServerHost;
@@ -308,9 +324,12 @@ class PersistentCodexAgent extends EventEmitter {
     this.contractHash = sha256(JSON.stringify({
       instructions: this.instructions,
       tool: queryToolContractHash(),
+      chartValidationTool: VALIDATE_CHART_TOOL,
       response: responseContractHash(),
       model: config.codexModel,
       effort: config.codexReasoningEffort,
+      modelContext: this.modelContext,
+      chartAgent: { config: CHART_AGENT_CONFIG, instructions: chartAgentContract(this.projectRoot) },
       interaction: "bounded-task-context-recoverable-xbb-skill-v5",
       knowledge: this.knowledgeBase.digest,
       sandbox: "read-only",
@@ -789,7 +808,9 @@ class PersistentCodexAgent extends EventEmitter {
       const semanticPlan = businessMode && !warmup
         ? (hasFastPlanOverride ? fastPlanOverride : planFastQuery(question))
         : null;
-      const fastPlan = requiresDynamicEntityQuery ? null : semanticPlan;
+      // Strict production queries let the model resolve named entities before
+      // any business records are read. The gateway still enforces the demand.
+      const fastPlan = requiresDynamicEntityQuery || this.config.strictDataDemand ? null : semanticPlan;
       const retrieved = businessMode ? this.knowledgeBase.retrieve(question, {
         domains: semanticPlan?.domains || [],
         periodCount: semanticPlan?.months?.length || 1
@@ -799,9 +820,18 @@ class PersistentCodexAgent extends EventEmitter {
       const continuation = !warmup && (Boolean(preStartContext) || isTaskContinuation(question, session.taskContext, route.mode, route.reason));
       const priorTaskContext = preStartContext || (continuation ? session.taskContext : null);
       active.taskContext = warmup ? null : updateTaskContext(priorTaskContext, question, { mode: route.mode, continuation });
+      active.demandPlan = semanticPlan;
+      if (businessMode && this.config.strictDataDemand && active.taskContext) {
+        active.demandPlan = planFastQuery(active.taskContext.goal);
+        for (const correction of [...(active.taskContext.corrections || []), question]) {
+          active.demandPlan = inheritedCorrectionPlan(correction, active.demandPlan);
+        }
+      }
       active.taskCheckpoint = this._checkpointForContext(session, businessMode, active.taskContext, question, continuation);
       session.taskCheckpoint = active.taskCheckpoint;
-      const turnEffort = warmup ? "none" : businessMode ? chooseTurnEffort(question, this.config.codexReasoningEffort) : chooseGeneralTurnEffort(question, this.config.codexReasoningEffort);
+      const turnEffort = warmup ? (this.config.codexModel.startsWith("gpt-6") ? "low" : "none")
+        : this.config.codexModel.startsWith("gpt-6") ? this.config.codexReasoningEffort
+          : businessMode ? chooseTurnEffort(question, this.config.codexReasoningEffort) : chooseGeneralTurnEffort(question, this.config.codexReasoningEffort);
       let prefetchedFactPack = null;
       let prefetchedFactView = null;
       if (fastPlan) {
@@ -878,7 +908,10 @@ class PersistentCodexAgent extends EventEmitter {
             "$xbb-executive-analyst",
             "$xbb-executive-chart",
             "【能力路由】销帮帮经营 Skill",
-            "本轮如需辅助图，必须由 xbb-executive-chart 完成数据充足性判断、选型和最小规格；不适合时 chart 必须为 null。",
+            "需要出图时必须实际调用原生 xbb_chart 子 Agent：model=gpt-6-astra、reasoning_effort=ultra、fork_turns=none。先拿到本轮 ready 事实，再把完整有效问题、必要事实与日期分母覆盖边界、图 Skill 与合同交给它；等待逐项分析及图规格，主 Agent 复核后统一答复。不得仅自行出图却声称已委派；子 Agent 不查询业务或再委派。",
+            "出图前由子 Agent 或你调用 validate_xbb_chart 校验完整图并检查返回的手机预览，按具体错误修正直到通过。money的unit必须为空字符串。最终chart直接使用工具返回的validated引用，不再复制完整规格；子 Agent 未暴露校验工具时由你校验它返回的规格，不能跳过。",
+            "本轮必须交付可独立阅读的文字答复，需要出图时同时交付合格经营图；answer 逐项写明结论、关键数字、依据及限制，图中有数字也不能删减正文，不能只写见图或图表已生成。先合并原问题和仍有效追问，按语义识别全部维度并逐项回答，不按数据域或句号数计数。两个及以上维度必须综合出图，宽泛问题也出图：例如‘今天业绩怎么样’应检查同日总体与公司贡献；明确某公司某日单一金额可免图。总体、时间趋势、分公司比较是三个维度，即使只查询 performance。多个合格维度必须在 composite 分别呈现；缺数维度单独说明，不拖累其他面板。用户明确只要文字时尊重要求。要求图表呈现或综合一点时保留全部原意图。",
+            "查询必须明确 months、domains、metrics，并按用户指定填写 company/person。问今天或明确单日业绩时必须传入上海 date=YYYY-MM-DD，months 仅该日期所属月；月累计不能充当今日值。宽泛业绩分析可取同期间 total 与 ranking，明确总额或某公司单标量只取 total；未问跨期不擅加趋势。只拿回答所需指标、表单与关联记录，不扩大期间或对象。分析深度来自比较、口径复核与证据解释；无目标、同比、利润或因果证据时说明边界。",
             "【销帮帮 Skill RAG 适用规则】",
             retrieved.text,
             ...(prefetchedFactView ? [
@@ -1021,6 +1054,7 @@ class PersistentCodexAgent extends EventEmitter {
         active.waiters = [request.waiter];
         active.steerFactBoundary = null;
         active.steerCount += 1;
+        void active.chartAgents?.stop();
         active.steerInputBytes += steerBytes;
         active.inputBytes += steerBytes;
         active.replayTurnParams = { ...active.replayTurnParams, input: [...active.replayTurnParams.input, ...input] };
@@ -1041,6 +1075,7 @@ class PersistentCodexAgent extends EventEmitter {
           active.successfulFactQueryCount = 0;
         }
         active.queryPlan = incomingPlan;
+        if (active.businessMode && this.config.strictDataDemand) active.demandPlan = inheritedCorrectionPlan(request.question, active.demandPlan);
         active.question = request.question;
         active.taskContext = request.taskContext || updateTaskContext(active.taskContext, request.question, {
           mode: active.businessMode ? "xbb" : "general", continuation: true
@@ -1117,6 +1152,7 @@ class PersistentCodexAgent extends EventEmitter {
     this._pauseTurnTimeout(active);
     this._cancelActiveQuery(active, "已取消的追问不再参与当前分析。");
     active.factGeneration += 1;
+    void active.chartAgents?.stop();
     Object.assign(active, confirmedBoundary);
     active.turnId = null;
     active.pendingCompletion = null;
@@ -1165,8 +1201,9 @@ class PersistentCodexAgent extends EventEmitter {
       approvalPolicy: "never",
       sandbox: "read-only",
       developerInstructions: this.instructions,
+      config: this.threadConfig,
       ephemeral: false,
-      dynamicTools: [QUERY_XBB_DYNAMIC_TOOL]
+      dynamicTools: [QUERY_XBB_DYNAMIC_TOOL, VALIDATE_CHART_TOOL]
     });
     const result = lifecycle ? await lifecycle.wait(starting) : await starting;
     lifecycle?.throwIfStopped();
@@ -1208,6 +1245,7 @@ class PersistentCodexAgent extends EventEmitter {
         approvalPolicy: "never",
         sandbox: "read-only",
         developerInstructions: this.instructions,
+        config: this.threadConfig,
         excludeTurns: true
       });
       void Promise.resolve(resuming).then((result) => {
@@ -1277,14 +1315,19 @@ class PersistentCodexAgent extends EventEmitter {
 
   _shouldRotateThread(session, upcomingBytes, options = {}) {
     if (!session.threadId || options.warmup) return false;
+    // Carry bounded user intent, never a previous question's business facts.
+    if (this.config.strictDataDemand && options.businessMode && (session.turnCount > 0 || session.resumed)) return true;
     if (session.resumed && options.businessMode && options.hasFacts) return true;
     const usage = session.tokenUsage;
     const last = usage?.last || usage;
     const contextWindow = Number(usage?.modelContextWindow);
     const usedTokens = Number(last?.totalTokens ?? last?.inputTokens);
     const upcomingTokens = Math.ceil(Number(upcomingBytes || 0) / 2);
-    if (Number.isFinite(contextWindow) && contextWindow > 0 && Number.isFinite(usedTokens)
-        && usedTokens + upcomingTokens >= contextWindow * CONTEXT_ROTATION_RATIO) return true;
+    if (Number.isFinite(contextWindow) && contextWindow > 0 && Number.isFinite(usedTokens) && usedTokens >= 0) {
+      // Actual model accounting takes precedence over the coarse legacy byte
+      // and turn-count estimates, so the larger window can really be used.
+      return usedTokens + upcomingTokens >= Math.min(contextWindow * CONTEXT_ROTATION_RATIO, this.modelContext.model_auto_compact_token_limit);
+    }
     if (session.turnCount >= MAX_SESSION_TURNS) return true;
     return session.estimatedInputBytes > 0
       && session.estimatedInputBytes + Number(upcomingBytes || 0) > MAX_SESSION_ESTIMATED_INPUT_BYTES;
@@ -1337,6 +1380,7 @@ class PersistentCodexAgent extends EventEmitter {
     active.prefetchedFactAvailable = false;
     active.prefetchedFactView = null;
     active.latestFactView = null;
+    active.validatedCharts.clear();
     active.steerFactBoundary = null;
     if (session.active === active) session.active = null;
     active.done.resolve();
@@ -1385,6 +1429,10 @@ class PersistentCodexAgent extends EventEmitter {
       prefetchedFactView: null,
       latestFactView: null,
       factGeneration: 0,
+      chartAgents: null,
+      validatedCharts: new Map(),
+      chartValidationCalls: 0,
+      chartValidationInFlight: false,
       fallbackBlockedUntilFreshScope: false,
       requiredFallbackQueryFingerprint: null,
       fallbackFactFingerprint: null,
@@ -1422,6 +1470,7 @@ class PersistentCodexAgent extends EventEmitter {
   }
 
   _abortActive(active, message) {
+    void active.chartAgents?.stop();
     this._cancelActiveQuery(active, message);
     if (!active.abortController.signal.aborted) active.abortController.abort(abortError(message));
     active.prefetchWake?.resolve("aborted");
@@ -1468,7 +1517,7 @@ class PersistentCodexAgent extends EventEmitter {
 
   _armTurnTimeout(session, active, { resetAfterTool = false } = {}) {
     this._pauseTurnTimeout(active);
-    if (session.active !== active || active.deadlineExceeded || !active.turnId || active.inFlightToolCount > 0) return;
+    if (session.active !== active || active.deadlineExceeded || !active.turnId || active.inFlightToolCount > 0 || active.chartAgents?.running) return;
     if (resetAfterTool) active.generationRemainingMs = active.timeoutMs;
     active.generationRunningAt = performance.now();
     active.timeout = setTimeout(() => {
@@ -1502,13 +1551,27 @@ class PersistentCodexAgent extends EventEmitter {
       this.client.reject(request.id, "企业微信 Codex Agent 不支持此交互请求。");
       return;
     }
-    const { threadId, turnId, tool, arguments: args } = request.params || {};
+    const { threadId, turnId, tool } = request.params || {};
+    if (tool === "validate_xbb_chart") {
+      await this._validateChartRequest(request);
+      return;
+    }
+    let args = request.params?.arguments;
     const session = [...this.sessions.values()].find((value) => value.threadId === threadId);
     if (!session?.active || session.active.turnId !== turnId || tool !== "query_xbb" || !session.access) {
       this.client.reject(request.id, "未授权或失效的经营分析工具请求。");
       return;
     }
     const active = session.active;
+    if (this.config.strictDataDemand && active.allowTools) {
+      try {
+        const intent = [active.taskContext?.goal, ...(active.taskContext?.corrections || []), active.question].filter(Boolean).join("\n");
+        args = bindQueryDemand(args || {}, intent, active.demandPlan);
+      } catch (error) {
+        this.client.respond(request.id, { success: false, contentItems: [{ type: "inputText", text: JSON.stringify({ status: "error", message: error.message }) }] });
+        return;
+      }
+    }
     if (!active.allowTools) {
       const message = active.businessMode ? "后台预热不允许查询业务数据。" : "本轮不是销帮帮经营问题，不能调用 query_xbb。";
       this.client.respond(request.id, { success: false, contentItems: [{ type: "inputText", text: JSON.stringify({ status: "error", message }) }] });
@@ -1539,6 +1602,7 @@ class PersistentCodexAgent extends EventEmitter {
     }
     const priorFallbackFingerprint = active.fallbackFactFingerprint;
     if (active.latestFactView && (!toolQueryFingerprint || toolQueryFingerprint !== priorFallbackFingerprint)) {
+      void active.chartAgents?.stop();
       if (priorFallbackFingerprint) active.supersededFactFingerprints.add(priorFallbackFingerprint);
       if (toolQueryFingerprint) active.supersededFactFingerprints.delete(toolQueryFingerprint);
       active.factGeneration += 1;
@@ -1628,7 +1692,7 @@ class PersistentCodexAgent extends EventEmitter {
       }
       const remainingBytes = MAX_TURN_FACT_BYTES - active.factBytesSent;
       if (remainingBytes < 16 * 1024) throw new Error("本轮事实预算已被当前查询占用；请使用已返回的完整汇总继续回答。");
-      const view = buildModelFactView(result, { maxBytes: Math.min(MAX_MODEL_FACT_VIEW_BYTES, remainingBytes) });
+      const view = buildModelFactView(result, { maxBytes: Math.min(MAX_MODEL_FACT_VIEW_BYTES, remainingBytes), metrics: args.metrics });
       const viewText = JSON.stringify(view);
       const fallbackScopeMatches = !active.fallbackBlockedUntilFreshScope
         || (active.requiredFallbackQueryFingerprint && toolQueryFingerprint === active.requiredFallbackQueryFingerprint);
@@ -1682,6 +1746,22 @@ class PersistentCodexAgent extends EventEmitter {
     const threadId = params?.threadId || params?.thread?.id;
     const session = [...this.sessions.values()].find((value) => value.threadId === threadId);
     if (!session) return;
+    if (method === "item/completed" && params?.item?.type === "subAgentActivity"
+        && session.active?.businessMode && params.turnId === session.active.turnId) {
+      const active = session.active;
+      active.chartAgents ||= new ChartAgentTracker(this.client);
+      const stage = active.chartAgents.observe(params.item, { parentThreadId: session.threadId,
+        factGeneration: active.factGeneration, revision: active.steerCount, hasFacts: active.latestFactView?.status === "ready" });
+      if (stage === "started") {
+        this._pauseTurnTimeout(active);
+        this._emit("activity", { status: "chart_agent_started" });
+        void this._notifyProgress(session, "已取得本轮数据，图表子 Agent 正在逐项分析比较关系并设计综合图……");
+      } else if (stage) {
+        this._emit("activity", { status: stage === "completed" ? "chart_agent_completed" : "chart_agent_failed" });
+        this._armTurnTimeout(session, active, { resetAfterTool: true });
+      }
+      return;
+    }
     if (method === "thread/tokenUsage/updated") {
       const usage = params?.tokenUsage;
       if (usage && typeof usage === "object") session.tokenUsage = usage;
@@ -1775,7 +1855,41 @@ class PersistentCodexAgent extends EventEmitter {
     }
   }
 
-  _completeTurn(session, turn) {
+  async _validateChartRequest(request) {
+    const { threadId, turnId, arguments: args } = request.params || {};
+    const session = [...this.sessions.values()].find((value) => value.threadId === threadId || value.active?.chartAgents?.children.has(threadId));
+    const active = session?.active;
+    const scope = { parentThreadId: session?.threadId, factGeneration: active?.factGeneration, revision: active?.steerCount };
+    const current = () => session?.active === active && !active.abortController.signal.aborted
+      && active.factGeneration === scope.factGeneration && active.steerCount === scope.revision && !active.steerInFlight;
+    if (!active?.businessMode || !active.allowTools || active.latestFactView?.status !== "ready"
+        || (session.threadId === threadId ? active.turnId !== turnId : !await active.chartAgents.accepts(threadId, scope)) || !current()) {
+      this.client.reject(request.id, "未授权或已失效的图表校验请求。");
+      return;
+    }
+    if (active.chartValidationInFlight || ++active.chartValidationCalls > 8) {
+      this.client.respond(request.id, { success: false, contentItems: [{ type: "inputText", text: "已有校验正在执行或校验次数超过上限。" }] });
+      return;
+    }
+    active.chartValidationInFlight = true;
+    try {
+      const result = await validateChartPreview(args);
+      if (!current()) { this.client.reject(request.id, "图表范围已改变，请基于最新问题重新分析。"); return; }
+      active.validatedCharts.set(result.id, { spec: result.spec, ...scope });
+      this.client.respond(request.id, { success: true, contentItems: [
+        { type: "inputText", text: JSON.stringify({ status: "valid", chart: { type: "validated", id: result.id }, panels: result.panelCount,
+          findings: result.findingCount, message: "已通过字段、算术和渲染校验。请检查下面的390px手机预览；若清晰且覆盖完整，最终chart原样返回此引用，不再次抄写规格。改图后重新校验。" }) },
+        { type: "inputImage", imageUrl: `data:image/png;base64,${result.preview.toString("base64")}` }
+      ] });
+      this._emit("activity", { status: "chart_validated" });
+    } catch (error) {
+      if (current()) this.client.respond(request.id, { success: false, contentItems: [{ type: "inputText", text: JSON.stringify({ status: "invalid",
+        message: sanitizeAgentText(error.message, { maxBytes: 1200 }), action: "修正完整规格后再次调用validate_xbb_chart；money金额原值用元，unit必须为空字符串。" }) }] });
+      else this.client.reject(request.id, "图表校验所属请求已结束。");
+    } finally { active.chartValidationInFlight = false; }
+  }
+
+  async _completeTurn(session, turn) {
     const active = session.active;
     if (!active) return;
     if (active.timeout) clearTimeout(active.timeout);
@@ -1785,9 +1899,25 @@ class PersistentCodexAgent extends EventEmitter {
     const rawAnswer = active.finalText || utf8Prefix(finalItem?.text || "", MAX_AGENT_MESSAGE_BYTES) || active.lastText || "";
     if (turn?.status === "completed" && rawAnswer) {
       try {
-        const answer = parseAgentResponse(rawAnswer, {
-          onChartInvalid: () => this._emit("activity", { status: "chart_failed" })
+        let answer = parseAgentResponse(rawAnswer, {
+          onChartInvalid: () => this._emit("activity", { status: "chart_failed" }),
+          resolveChart: (id) => {
+            const chart = active.validatedCharts.get(id);
+            return chart && chart.factGeneration === active.factGeneration && chart.revision === active.steerCount ? chart.spec : null;
+          }
         });
+        if (active.businessMode && answer.chart) {
+          const revision = active.steerCount;
+          const generation = active.factGeneration;
+          const verified = await active.chartAgents?.completedFor({ parentThreadId: session.threadId, factGeneration: generation, revision });
+          if (session.active !== active || active.abortController.signal.aborted || active.turnId !== turn.id
+              || active.steerCount !== revision || active.factGeneration !== generation) return;
+          if (active.steerInFlight) { active.pendingCompletion = turn; return; }
+          if (!verified) {
+            this._emit("activity", { status: "chart_agent_failed" });
+            answer = { answer: `${answer.answer}\n\n本次图表未通过专职 ultra 子 Agent 完成校验，暂未生成；以上为已核验的数据分析。`, chart: null };
+          }
+        }
         const refusalReason = active.businessMode ? falseTechnicalRefusalReason(answer.answer, active.latestFactView) : null;
         if (refusalReason) {
           if (this._resolveVerifiedFallback(session, active, refusalReason)) {

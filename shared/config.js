@@ -110,8 +110,11 @@ function loadConfig(options = {}) {
     ...transport,
     modelProvider,
     projectRoot,
-    codexModel: validateCodexModel(envValue(env, "XBB_CODEX_MODEL", stored.codexModel || "gpt-5.6-sol")),
-    codexReasoningEffort: validateReasoningEffort(envValue(env, "XBB_CODEX_REASONING_EFFORT", stored.codexReasoningEffort || "medium")),
+    codexModel: validateCodexModel(envValue(env, "XBB_CODEX_MODEL", stored.codexModel || "gpt-6-astra")),
+    codexReasoningEffort: validateReasoningEffort(envValue(env, "XBB_CODEX_REASONING_EFFORT", stored.codexReasoningEffort || "xhigh")),
+    codexContextWindow: parseInteger(envValue(env, "XBB_CODEX_CONTEXT_WINDOW", stored.codexContextWindow ?? 872000), "Codex 上下文窗口", 32768, 872000),
+    codexAutoCompactTokenLimit: parseInteger(envValue(env, "XBB_CODEX_AUTO_COMPACT_TOKEN_LIMIT", stored.codexAutoCompactTokenLimit ?? 750000), "Codex 自动压缩阈值", 16384, 784800),
+    strictDataDemand: true,
     agentTurnTimeoutMs: parseInteger(envValue(env, "XBB_AGENT_TURN_TIMEOUT_MS", stored.agentTurnTimeoutMs || 300000), "Codex Agent 单轮超时", 30000, 1800000),
     generalTurnTimeoutMs: parseInteger(envValue(env, "XBB_GENERAL_TURN_TIMEOUT_MS", stored.generalTurnTimeoutMs || 900000), "Codex 通用问答单轮超时", 60000, 3600000),
     agentStatePath: requireOutsideProject(envValue(env, "XBB_AGENT_STATE_PATH", stored.agentStatePath || path.join(localRoot, "agent-state.json")), "Codex Agent 状态文件"),
@@ -120,8 +123,13 @@ function loadConfig(options = {}) {
     accessPolicyPath: path.resolve(envValue(env, "XBB_ACCESS_POLICY_PATH", stored.accessPolicyPath || path.join(localRoot, "access-policy.json")))
   };
 
+  if (config.codexAutoCompactTokenLimit > Math.floor(config.codexContextWindow * 0.9)) {
+    throw new Error("Codex 自动压缩阈值不能超过配置窗口的 90%。");
+  }
   const codexCommand = envValue(env, "XBB_CODEX_COMMAND", stored.codexCommand);
   if (codexCommand) config.codexCommand = codexCommand;
+  const codexProxyUrl = envValue(env, "XBB_CODEX_PROXY_URL", stored.codexProxyUrl);
+  if (codexProxyUrl) config.codexProxyUrl = codexProxyUrl;
   return Object.freeze(config);
 }
 

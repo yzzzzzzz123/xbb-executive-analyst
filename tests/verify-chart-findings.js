@@ -8,7 +8,7 @@ const { createWecomChartImage } = require("../shared/wecom/chart-image.js");
 const { parseAgentResponse } = require("../shared/codex/response-contract.js");
 
 // Every number below is a synthetic arithmetic fixture, never a business fact.
-const common = { title: "离线计算验收", subtitle: "虚构数据，不是经营结果", note: "仅证明图内计算一致，未绑定完整事实源", insight: "乙比甲下降了九成", focus: null };
+const common = { title: "离线计算验收", subtitle: "虚构数据，不是经营结果", note: "离线虚构验收，仅验证引用关系与算术", insight: "乙比甲下降了九成", focus: null };
 const ref = (category, series = "指标", axis = "value") => ({ series, category, axis });
 const finding = (relation, subject, baseline = null) => ({ relation, subject, baseline });
 const bar = { ...common, type: "bar", categories: ["甲", "乙"], series: [{ name: "指标", values: [10, 30] }], valueFormat: "number", unit: "单" };
@@ -25,7 +25,7 @@ function changed(spec, relation, subject, baseline) {
 
 async function run() {
   const difference = changed(bar, "difference", ref("乙"), ref("甲"));
-  assert.equal(difference.insight, "图内计算：「指标·乙」比「指标·甲」高20单。");
+  assert.equal(difference.insight, "「指标·乙」比「指标·甲」高20单。");
   assert.deepEqual(difference.focus, { series: "指标", category: "乙" });
   assert.doesNotMatch(render(difference), /下降了九成/u, "Contradictory prose must never survive chart normalization");
   assert.deepEqual(changed(bar, "difference", ref("甲"), ref("乙")).focus, { series: "指标", category: "甲" }, "A lower point can be the finding, never force maximum focus");
@@ -37,13 +37,35 @@ async function run() {
   assert.match(percentChange.insight, /增加20个百分点/u);
   assert.doesNotMatch(percentChange.insight, /变化100%/u, "Percentage-point change is not a relative percentage");
   const change = changed(line, "period-change", ref("四期"), ref("二期"));
-  assert.match(change.insight, /增加20单，相对基准变化100%/u);
-  assert.match(changed({ ...line, series: [{ name: "指标", values: [10, -10, 0, 1] }] }, "period-change", ref("二期"), ref("一期")).insight, /减少20单，相对基准变化-200%/u);
+  assert.match(change.insight, /增加20单，变化率100%/u);
+  assert.match(changed({ ...line, series: [{ name: "指标", values: [10, -10, 0, 1] }] }, "period-change", ref("二期"), ref("一期")).insight, /减少20单，变化率-200%/u);
+
+  // Realistic operating scenario with synthetic amounts: an annual collection
+  // curve may include September MTD while comparing complete July and August.
+  const annualCollections = { ...common, type: "line", title: "年度回款趋势（离线虚构验收）",
+    subtitle: "2026年1–9月，9月MTD截至14日", note: "1–8月为完整自然月；9月MTD仅为1–14日累计，不与完整月计算变化率。",
+    categories: ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月MTD"],
+    series: [{ name: "回款", values: [760000, 920000, 850000, 1120000, 1040000, 1280000, 1420000, 1310000, 560000] }],
+    valueFormat: "money", unit: "" };
+  const completeMonthChange = changed(annualCollections, "period-change", ref("8月", "回款"), ref("7月", "回款"));
+  assert.match(completeMonthChange.insight, /减少11万元，变化率约-7\.746%/u);
+  assert.equal(completeMonthChange.categories.at(-1), "9月MTD", "有效比较不删掉同图中的MTD数据");
+  assert.deepEqual(completeMonthChange.focus, { series: "回款", category: "8月" });
+  const annualSvg = render(completeMonthChange);
+  assert.match(annualSvg, /data-partial-period="true"/u);
+  assert.match(annualSvg, /9月MTD/u);
+  assert.match(annualSvg, /约-7\.746%/u);
+  const invalidMtdComparison = { ...annualCollections,
+    finding: finding("period-change", ref("9月MTD", "回款"), ref("8月", "回款")) };
+  assert.throws(() => validateSpec(invalidMtdComparison), /subject 或 baseline 标记为未完整期间/u);
+  const preservedAnnualAnswer = parseAgentResponse(JSON.stringify({ answer: "8月完整月较7月减少11万元；9月仅截至14日。", chart: invalidMtdComparison }));
+  assert.equal(preservedAnnualAnswer.chart, null);
+  assert.match(preservedAnnualAnswer.answer, /8月完整月较7月减少11万元/u);
 
   const share = changed(donut, "share", ref("甲", ""));
-  assert.match(share.insight, /占图示合计30%（分母100单）/u);
+  assert.match(share.insight, /占所示合计30%（合计100单）/u);
   const stackShare = changed(stacked, "share", ref("乙", "咨询"));
-  assert.match(stackShare.insight, /该类别图示合计40%（分母100单）/u);
+  assert.match(stackShare.insight, /该类别所示合计40%（合计100单）/u);
   assert.deepEqual(stackShare.focus, { series: "咨询", category: "乙" });
   assert.match(changed({ ...donut, items: [{ name: "甲", value: 1 }, { name: "乙", value: 2 }] }, "share", ref("甲", "")).insight, /约33\.33%/u);
   const retention = changed(funnel, "retention", ref("完成", ""), ref("中间", ""));
@@ -54,6 +76,45 @@ async function run() {
   const pointDifference = changed(scatter, "difference", ref("乙", "", "y"), ref("甲", "", "y"));
   assert.match(pointDifference.insight, /高30元/u);
   assert.match(pointDifference.insight, /y轴（金额）/u);
+
+  const ranked = { ...bar, categories: ["乙", "丁", "甲", "丙"], series: [{ name: "指标", values: [30, 10, 50, 10] }] };
+  assert.match(changed(ranked, "maximum", ref("甲"), null).insight, /所示4项中的最高值：50单/u);
+  assert.match(changed(ranked, "minimum", ref("丁"), null).insight, /并列最低值：10单/u);
+  assert.match(changed(ranked, "share", ref("甲"), null).insight, /该系列所示合计50%（合计100单）/u);
+  assert.match(changed(ranked, "top-share", ref("乙"), null).insight, /前2项.*合计80单.*80%（合计100单）/u);
+  const rankedDonut = { ...donut, items: ranked.categories.map((name, index) => ({ name, value: ranked.series[0].values[index] })) };
+  assert.match(changed(rankedDonut, "top-share", ref("乙", ""), null).insight, /前2项.*80%/u);
+  const relationships = [finding("maximum", ref("甲"), null), finding("difference", ref("甲"), ref("乙")), finding("top-share", ref("乙"), null)];
+  const analysis = validateSpec({ ...ranked, finding: null, findings: relationships });
+  assert.equal(analysis.findings.length, 3);
+  assert.deepEqual(analysis.finding, relationships[0]);
+  assert.deepEqual(analysis.focus, { series: "指标", category: "甲" });
+  assert.deepEqual(validateSpec(JSON.parse(JSON.stringify(analysis))), analysis);
+  assert.ok(Object.isFrozen(analysis.findings) && Object.isFrozen(analysis.findings[1]));
+  const analysisSvg = render(analysis);
+  assert.equal((analysisSvg.match(/data-finding="/gu) || []).length, 3);
+  assert.match(analysisSvg, /最高值：50单|高20单|合计80单/u);
+  const fourFindings = validateSpec({ ...ranked, findings: [...relationships, finding("minimum", ref("丁"), null)] });
+  assert.equal(fourFindings.findings.length, 4);
+  assert.equal((render(fourFindings).match(/data-finding="/gu) || []).length, 4);
+  for (const invalidAnalysis of [
+    { ...ranked, finding: finding("maximum", ref("乙"), null) },
+    { ...ranked, finding: finding("maximum", ref("甲"), ref("乙")) },
+    { ...bar, series: [{ name: "指标", values: [10, 10] }], finding: finding("minimum", ref("甲"), null) },
+    { ...ranked, finding: finding("top-share", ref("丙"), null) },
+    { ...bar, finding: finding("top-share", ref("甲"), null) },
+    { ...ranked, series: [...ranked.series, { name: "第二", values: [1, 2, 3, 4] }], finding: finding("top-share", ref("乙"), null) },
+    { ...ranked, findings: [relationships[0], relationships[0]] },
+    { ...ranked, findings: Array(5).fill(relationships[0]) },
+    { ...ranked, findings: [null] },
+    { ...ranked, findings: null },
+    { ...ranked, findings: [{ ...relationships[0], text: "虚构事实" }] },
+    { ...ranked, finding: relationships[1], findings: relationships },
+    { ...line, categories: ["一期", "二期", "三期", "四期MTD"], finding: finding("period-change", ref("四期MTD"), ref("三期")) }
+  ]) assert.throws(() => validateSpec(invalidAnalysis), /finding|findings/u);
+  const evidenceLine = { ...line, finding: finding("period-change", ref("四期"), ref("三期")) };
+  assert.match(render(evidenceLine), /逐期数值/u);
+  for (const category of evidenceLine.categories) assert.ok(render(evidenceLine).includes(category));
 
   const longNames = ["具有完全相同的类别名称前缀甲", "具有完全相同的类别名称前缀乙"];
   const longSeries = ["具有完全相同的系列名称前缀甲", "具有完全相同的系列名称前缀乙"];
@@ -83,7 +144,7 @@ async function run() {
     const old = { ...spec, focus: spec.series ? { series: spec.series[0].name, category: spec.categories[0] }
       : { series: "", category: (spec.items || spec.points)[0].name || spec.points[0].label } };
     const normalized = validateSpec(old);
-    assert.match(normalized.insight, /^兼容概述：/u);
+    assert.doesNotMatch(normalized.insight, /兼容概述|图内计算/u);
     assert.notEqual(normalized.insight, old.insight);
     assert.equal(normalized.finding, null);
     assert.equal(normalized.focus, null, "Unverified legacy focus does not become a claimed finding");
@@ -94,7 +155,9 @@ async function run() {
     assert.deepEqual(validateSpec(spec), spec, "Finding normalization is idempotent across parse/render passes");
     assert.deepEqual(validateSpec(JSON.parse(JSON.stringify(spec))), spec, "Serialization cannot change finding meaning");
     const svg = render(spec);
-    assert.ok(svg.includes(spec.insight));
+    assert.ok(svg.includes(spec.insight), "已校验算术发现须在图或相邻证据注释显示");
+    assert.match(svg, /data-finding="1"/u);
+    assert.doesNotMatch(svg, /兼容概述|图内计算/u);
     assert.doesNotMatch(svg, /下降了九成/u);
     const parsed = parseAgentResponse(JSON.stringify({ answer: "保留独立文字答复。", chart: spec }));
     assert.deepEqual(parsed.chart, spec);
@@ -102,7 +165,7 @@ async function run() {
   const png = await createWecomChartImage(retention);
   assert.equal((await sharp(png.buffer).metadata()).format, "png");
   assert.ok(png.buffer.length < 10 * 1024 * 1024);
-  for (const variant of CHART_SCHEMA.anyOf) {
+  for (const variant of CHART_SCHEMA.anyOf.flatMap((entry) => entry.properties.panels?.items.anyOf || [entry])) {
     assert.ok(variant.required.includes("finding"));
     assert.ok(variant.properties.finding.anyOf.some((entry) => entry.type === "null"));
   }
@@ -161,8 +224,8 @@ async function run() {
   // Rounding tolerance remains available to legacy charts, but cannot become
   // the denominator of a purportedly exact percentage finding.
   assert.doesNotThrow(() => validateSpec({ ...donut, valueFormat: "percent", unit: "", items: [{ name: "甲", value: 33.5 }, { name: "乙", value: 67 }] }));
-  process.stdout.write(`${JSON.stringify({ success: true, mode: "synthetic-chart-local-findings", chartTypes: 6, invalidCases: invalid.length,
-    checks: "computed-insight/focus/ref-units/zero-overflow-underflow/decimal/compatibility/idempotence/parse-degrade/svg/png", sourceFactBinding: false })}\n`);
+  process.stdout.write(`${JSON.stringify({ success: true, mode: "synthetic-chart-local-findings", chartTypes: 6, invalidCases: invalid.length + 14,
+    checks: "computed-insight/focus/ref-units/zero-overflow-underflow/decimal/compatibility/idempotence/findings-4/extrema/top-share/MTD/parse-degrade/svg/png", sourceFactBinding: false })}\n`);
 }
 
 run().catch((error) => { process.stderr.write(`${error.stack || error.message}\n`); process.exitCode = 1; });

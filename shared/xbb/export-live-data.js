@@ -3,6 +3,8 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { validateMetrics, sourceCollections, sourceFields } = require("./data-demand.js");
+const { validateRequestedDate, validateDateScope } = require("./fast-query-plan.js");
 
 const API_BASE = String(process.env.XBB_API_BASE || "").replace(/\/$/, "");
 const CORPID = String(process.env.XBB_CORPID || "");
@@ -147,17 +149,28 @@ function monthRange(month, now = new Date()) {
   const start = Math.floor(Date.parse(`${month}-01T00:00:00+08:00`) / 1000);
   const next = Math.floor(Date.parse(`${nextYear}-${String(nextMonth).padStart(2, "0")}-01T00:00:00+08:00`) / 1000);
   if (!Number.isFinite(start) || !Number.isFinite(next)) throw new Error("月份超出可处理的日期范围");
+  const end = Math.min(next - 1, Math.floor(now.getTime() / 1000));
   return {
     month,
     start,
-    end: next - 1,
+    end,
     startLabel: `${month}-01`,
-    endLabel: new Date((next - 1) * 1000).toLocaleDateString("zh-CN", {
+    endLabel: new Date(end * 1000).toLocaleDateString("zh-CN", {
       timeZone: "Asia/Shanghai",
       year: "numeric",
       month: "2-digit",
       day: "2-digit"
     }).replace(/\//g, "-")
+  };
+}
+
+function dateRange(date, now = new Date()) {
+  validateRequestedDate(date, now);
+  const start = Date.parse(`${date}T00:00:00+08:00`) / 1000;
+  return {
+    month: date.slice(0, 7), start,
+    end: Math.min(start + 86400 - 1, Math.floor(now.getTime() / 1000)),
+    startLabel: date, endLabel: date
   };
 }
 
@@ -573,9 +586,9 @@ function normalizeRelation(value) {
   return normalized.length === 1 ? normalized[0] : normalized;
 }
 
-function normalizeValue(collection, attr, raw, schema) {
+function normalizeValue(collection, attr, raw, schema, selectedFields = null) {
   if (raw === undefined || raw === null || raw === "") return null;
-  const subfields = SUBTABLE_ALLOWLIST[collection] && SUBTABLE_ALLOWLIST[collection][attr];
+  const subfields = selectedFields?.[`${collection}.${attr}`] || SUBTABLE_ALLOWLIST[collection]?.[attr];
   if (subfields) {
     return parseMaybeArray(raw).map((item) => {
       let row = item;
@@ -586,7 +599,7 @@ function normalizeValue(collection, attr, raw, schema) {
       const values = row.data && typeof row.data === "object" && !Array.isArray(row.data) ? row.data : row;
       const normalized = {};
       for (const subfield of subfields) {
-        const value = normalizeValue(collection, `${attr}.${subfield}`, values[subfield], schema);
+        const value = normalizeValue(collection, `${attr}.${subfield}`, values[subfield], schema, selectedFields);
         if (value === null || value === "" || (Array.isArray(value) && !value.length)) continue;
         normalized[subfield] = value;
       }
@@ -605,15 +618,15 @@ function normalizeValue(collection, attr, raw, schema) {
   return raw;
 }
 
-function fieldCatalog(collection, schema) {
+function fieldCatalog(collection, schema, selectedFields = null) {
   const catalog = {};
-  for (const attr of FIELD_ALLOWLIST[collection] || []) {
+  for (const attr of selectedFields?.[collection] || FIELD_ALLOWLIST[collection] || []) {
     const field = schema && schema.get(attr);
     catalog[attr] = {
       label: field ? field.name : (SYSTEM_LABELS[attr] || attr),
       options: field ? Object.fromEntries(field.items) : {}
     };
-    for (const subfield of (SUBTABLE_ALLOWLIST[collection] && SUBTABLE_ALLOWLIST[collection][attr]) || []) {
+    for (const subfield of selectedFields?.[`${collection}.${attr}`] || SUBTABLE_ALLOWLIST[collection]?.[attr] || []) {
       const nestedAttr = `${attr}.${subfield}`;
       const nested = schema && schema.get(nestedAttr);
       catalog[nestedAttr] = {
@@ -625,12 +638,12 @@ function fieldCatalog(collection, schema) {
   return catalog;
 }
 
-function normalizeRecord(collection, record, schema) {
+function normalizeRecord(collection, record, schema, selectedFields = null) {
   const rawId = asText(record.dataId || record.serialNo || `${record.addTime}:${record.updateTime}`);
   const evidenceRef = publicId(collection, `${FORM[collection] || collection}:${rawId}`);
   const fields = {};
-  for (const attr of FIELD_ALLOWLIST[collection] || []) {
-    const value = normalizeValue(collection, attr, record[attr], schema);
+  for (const attr of selectedFields?.[collection] || FIELD_ALLOWLIST[collection] || []) {
+    const value = normalizeValue(collection, attr, record[attr], schema, selectedFields);
     if (value === null || value === "" || (Array.isArray(value) && !value.length)) continue;
     fields[attr] = value;
   }
@@ -658,21 +671,86 @@ function normalizeUser(user) {
   };
 }
 
-async function buildLiveDataset(month, domains = "all") {
-  const range = monthRange(month);
-  const required = collectionsForDomains(domains);
+function resolveLabelCondition(schema, attr, label) {
+  const options = [...(schema?.get(attr)?.items || [])];
+  if (!options.length) return relationEqualCondition(attr, label);
+  let matches = options.filter(([, text]) => text === label);
+  if (!matches.length) matches = options.filter(([, text]) => text.includes(label));
+  if (matches.length !== 1) throw new Error("指定公司未能唯一识别，请提供准确公司名称；未扩大查询范围。");
+  return relationEqualCondition(attr, matches[0][0]);
+}
+
+async function buildLiveDataset(month, domains = "all", demand = {}) {
+  const date = validateDateScope(demand.date, [month], normalizeDomains(domains));
+  const range = date ? dateRange(date) : monthRange(month);
+  const metrics = demand.metrics ? validateMetrics(demand.metrics, normalizeDomains(domains)) : null;
+  const required = metrics ? sourceCollections(metrics) : collectionsForDomains(domains);
+  const metadata = await loadMetadata(required);
+  let resolvedCompany = null;
+  const identityUsers = demand.person ? await loadUserDirectory() : [];
+  const personMatches = demand.person ? identityUsers.filter((user) => user.name === demand.person) : [];
+  if (demand.person && personMatches.length !== 1) throw new Error("指定销售未能唯一识别，请提供准确姓名；未读取集团商机。");
+  if (demand.person && !required.has("opportunity")) throw new Error("当前数据口径不支持按此销售筛选，未扩大查询。");
+  let organizerCondition = null;
+  let knownDepartments = [];
+  if (demand.company && required.has("course")) {
+    const departments = await listAll(ENDPOINT.department, {}, "depList");
+    knownDepartments = departments.map((department) => ({ id: asText(department.id), name: asText(department.name) }));
+    let matches = departments.filter((department) => department.name === demand.company);
+    if (!matches.length) matches = departments.filter((department) => asText(department.name).includes(demand.company));
+    if (matches.length !== 1) throw new Error("课程举办方未能唯一识别，请提供准确公司名称；未读取集团课程。");
+    organizerCondition = relationEqualCondition("text_5", matches[0].id);
+    resolvedCompany = matches[0].name;
+  }
+  const conditions = (collection, attr) => {
+    const result = dateConditions(attr, range);
+    if (demand.company) {
+      const companyField = collection === "performance" ? "text_63" : collection === "oppOrder"
+        ? (metadata.oppOrder?.get("text_6")?.name === "所属公司" && !metadata.oppOrder?.has("text_31") ? "text_6" : "text_31")
+          : collection === "opportunity" ? "text_11" : null;
+      if (companyField) {
+        const condition = resolveLabelCondition(metadata[collection], companyField, demand.company);
+        result.push(condition);
+        const label = metadata[collection]?.get(companyField)?.items?.get(String(condition.value[0]));
+        if (label) resolvedCompany = label;
+      }
+      if (collection === "course") result.push(organizerCondition);
+    }
+    if (collection === "opportunity" && demand.person) result.push(relationEqualCondition("creatorId", personMatches[0].userId));
+    if (collection === "opportunity" && metrics?.length === 1 && metrics[0] === "opportunities.wins") result.push(relationEqualCondition("text_17", "5738a7bf4bed4cdb95ea862f0a58934e"));
+    return result;
+  };
   const loadIf = (collection, loader) => required.has(collection) ? loader() : Promise.resolve([]);
-  const [metadata, performanceListRaw, oppOrdersRaw, coursesRaw, opportunitiesRaw] = await Promise.all([
-    loadMetadata(required),
-    loadIf("performance", () => loadNamedCollection("performance", FORM.performance, () => listAll(ENDPOINT.contract, { formId: FORM.performance, conditions: dateConditions("date_1", range), viewApproval: 0 }))),
-    loadIf("oppOrder", () => loadNamedCollection("oppOrder", FORM.oppOrder, () => listAll(ENDPOINT.paas, { formId: FORM.oppOrder, conditions: dateConditions("date_1", range), viewApproval: 0 }))),
-    loadIf("course", () => loadNamedCollection("course", FORM.course, () => listAll(ENDPOINT.paas, { formId: FORM.course, conditions: dateConditions("date_1", range), viewApproval: 0 }))),
-    loadIf("opportunity", () => loadNamedCollection("opportunity", FORM.opportunity, () => listAll(ENDPOINT.opportunity, { formId: FORM.opportunity, conditions: dateConditions("addTime", range), viewApproval: 0 })))
+  const [performanceListRaw, oppOrdersRaw, coursesRaw, opportunitiesRaw] = await Promise.all([
+    loadIf("performance", () => loadNamedCollection("performance", FORM.performance, () => listAll(ENDPOINT.contract, { formId: FORM.performance, conditions: conditions("performance", "date_1"), viewApproval: 0 }))),
+    loadIf("oppOrder", () => loadNamedCollection("oppOrder", FORM.oppOrder, () => listAll(ENDPOINT.paas, { formId: FORM.oppOrder, conditions: conditions("oppOrder", "date_1"), viewApproval: 0 }))),
+    loadIf("course", () => loadNamedCollection("course", FORM.course, () => listAll(ENDPOINT.paas, { formId: FORM.course, conditions: conditions("course", "date_1"), viewApproval: 0 }))),
+    loadIf("opportunity", () => loadNamedCollection("opportunity", FORM.opportunity, () => listAll(ENDPOINT.opportunity, { formId: FORM.opportunity, conditions: conditions("opportunity", "addTime"), viewApproval: 0 })))
   ]);
 
+  // Reject out-of-scope base responses before any dependent detail or join.
+  // Missing scalar list fields can legitimately require contract/detail.
+  const checkBaseScope = (rows, collection, dateAttr) => {
+    if (!metrics && !date) return;
+    for (const item of rows) {
+      const row = flattenRecord(item);
+      if (row[dateAttr] != null && !inRange(row, dateAttr, range)) throw new Error("来源返回了范围外日期，已停止关联查询。");
+      for (const condition of conditions(collection, dateAttr).filter((c) => c.symbol === "equal")) {
+        if (row[condition.attr] != null && relationId(row[condition.attr]) !== String(condition.value[0])) throw new Error("来源未遵守实体或阶段过滤，已停止关联查询。");
+      }
+    }
+  };
+  checkBaseScope(performanceListRaw, "performance", "date_1");
+  checkBaseScope(coursesRaw, "course", "date_1");
+  checkBaseScope(oppOrdersRaw, "oppOrder", "date_1");
+  checkBaseScope(opportunitiesRaw, "opportunity", "addTime");
   const performanceRaw = performanceListRaw.length
     ? await loadNamedCollection("performance-detail", FORM.performance, () => loadContractDetails(performanceListRaw))
     : [];
+  if (date) {
+    checkBaseScope(performanceRaw, "performance", "date_1");
+    if (performanceRaw.some((item) => !inRange(flattenRecord(item), "date_1", range))) throw new Error("来源详情缺少有效单日日期，无法确认查询范围。");
+  }
   const courseBase = coursesRaw.map(flattenRecord).filter((row) => inRange(row, "date_1", range));
   const courseIds = courseBase.map((row) => row.dataId).filter(Boolean);
   const courseIdSet = new Set(courseIds.map(asText));
@@ -690,7 +768,11 @@ async function buildLiveDataset(month, domains = "all") {
       : Promise.resolve([])
   ]);
   const courseOrderDetailsRaw = courseOrderListRaw.length
-    ? await loadNamedCollection("courseOrders-detail", FORM.courseOrders, () => loadContractDetails(courseOrderListRaw))
+    ? await loadNamedCollection("courseOrders-detail", FORM.courseOrders, () => Promise.all(courseOrderListRaw.map(async (record) => {
+      const row = flattenRecord(record);
+      if (metrics && row.num_1 != null && row.text_28 != null) return record;
+      return (await loadContractDetails([record]))[0];
+    })))
     : [];
 
   const performance = performanceRaw.map(flattenRecord).filter((row) => inRange(row, "date_1", range));
@@ -710,10 +792,10 @@ async function buildLiveDataset(month, domains = "all") {
   const courseOrganizerIds = courseBase.map((row) => asText(row.text_5)).filter((value) => /^\d+$/.test(value));
   const [product, users, departments] = await Promise.all([
     required.has("product") ? loadProducts(productIds) : [],
-    required.has("user") ? loadUserDirectory() : [],
-    required.has("course") ? loadDepartments(courseOrganizerIds) : []
+    demand.person ? personMatches : required.has("user") ? loadUserDirectory() : [],
+    required.has("course") ? loadDepartments(courseOrganizerIds.filter((id) => !knownDepartments.some((department) => department.id === id))) : []
   ]);
-  const departmentById = new Map(departments.map((department) => [department.id, department.name]));
+  const departmentById = new Map([...knownDepartments, ...departments].map((department) => [department.id, department.name]));
   const course = courseBase.map((row) => {
     const organizerId = asText(row.text_5);
     return departmentById.has(organizerId) ? { ...row, text_5: departmentById.get(organizerId) } : row;
@@ -723,9 +805,12 @@ async function buildLiveDataset(month, domains = "all") {
   const collections = Object.fromEntries([...required].filter((name) => name !== "user").map((name) => [name, available[name] || []]));
   return {
     month,
+    ...(date ? { date } : {}),
     range,
     loadedAt: new Date().toISOString(),
     metadata,
+    metrics,
+    resolvedScope: { company: resolvedCompany },
     collections,
     users
   };
@@ -734,10 +819,11 @@ async function buildLiveDataset(month, domains = "all") {
 function buildSourceBundle(dataset) {
   const records = {};
   const fields = {};
+  const selectedFields = dataset.metrics ? sourceFields(dataset.metrics) : null;
   for (const [collection, rows] of Object.entries(dataset.collections)) {
     const schema = dataset.metadata[collection];
-    records[collection] = rows.map((row) => normalizeRecord(collection, row, schema));
-    fields[collection] = fieldCatalog(collection, schema);
+    records[collection] = rows.map((row) => normalizeRecord(collection, row, schema, selectedFields));
+    fields[collection] = fieldCatalog(collection, schema, selectedFields);
   }
   records.user = dataset.users.map(normalizeUser);
   fields.user = {
@@ -753,6 +839,8 @@ function buildSourceBundle(dataset) {
     skill: "xbb-executive-analyst",
     mode: "live-readonly-source",
     month: dataset.month,
+    ...(dataset.date ? { date: dataset.date } : {}),
+    ...(dataset.resolvedScope ? { resolvedScope: dataset.resolvedScope } : {}),
     range: dataset.range,
     refreshedAt: dataset.loadedAt,
     provenance: {
@@ -822,14 +910,16 @@ function readScopeRequestFromStdin() {
   let request;
   try { request = JSON.parse(raw.toString("utf8")); } catch (_) { throw new Error("stdin 查询范围不是有效 JSON"); }
   if (!request || typeof request !== "object" || Array.isArray(request)
-      || JSON.stringify(Object.keys(request).sort()) !== JSON.stringify(["domains", "month"])) {
+      || Object.keys(request).some((key) => !["domains", "month", "date", "metrics", "company", "person"].includes(key))) {
     throw new Error("stdin 查询范围不符合精确 schema");
   }
   if (typeof request.month !== "string" || !Array.isArray(request.domains)
       || request.domains.some((value) => typeof value !== "string")) {
     throw new Error("stdin 查询范围字段类型无效");
   }
-  return { month: request.month, domains: request.domains };
+  if (request.metrics) validateMetrics(request.metrics, request.domains);
+  if ([request.company, request.person].some((value) => value !== undefined && value !== null && typeof value !== "string")) throw new Error("公司或人员字段类型无效");
+  return request;
 }
 
 function atomicWriteJson(outputPath, payload) {
@@ -851,7 +941,7 @@ async function main() {
   const request = args["request-stdin"]
     ? readScopeRequestFromStdin()
     : { month: args.month || currentMonthShanghai(), domains: args.domains || "all" };
-  const dataset = await buildLiveDataset(request.month, request.domains);
+  const dataset = await buildLiveDataset(request.month, request.domains, request);
   const bundle = buildSourceBundle(dataset);
   const output = atomicWriteJson(args.output, bundle);
   const sourceSha256 = crypto.createHash("sha256").update(fs.readFileSync(output)).digest("hex");
@@ -880,6 +970,7 @@ module.exports = {
   followOpportunityConditions,
   normalizeDomains,
   monthRange,
+  dateRange,
   paginationPlan,
   isRetryableApiMessage,
   isRetryableHttpStatus,

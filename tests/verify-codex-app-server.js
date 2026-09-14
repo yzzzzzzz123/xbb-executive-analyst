@@ -7,6 +7,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { AppServerClient } = require("../shared/codex/app-server-client.js");
 const { LocalAppServerHost, buildAppServerCommand } = require("../shared/codex/app-server-host.js");
+const { CHART_AGENT_CONFIG } = require("../shared/codex/chart-agent-config.js");
+const { modelContextConfig } = require("../shared/codex/model-context.js");
 const { PersistentCodexAgent, principalKeyFromUserId } = require("../shared/codex/persistent-agent.js");
 const { sanitizeCodexEnvironment } = require("../shared/codex/runtime.js");
 const { classifyModelError } = require("../shared/codex/model-error.js");
@@ -89,6 +91,7 @@ class FakeAppServerClient extends EventEmitter {
     this.responses = [];
     this.turnCounter = 0;
     this.threadCounter = 0;
+    this.childThreads = new Map();
   }
 
   async connect() { this.connected = true; }
@@ -116,6 +119,11 @@ class FakeAppServerClient extends EventEmitter {
   }
   respond(id, result) { this.responses.push({ id, result }); }
   reject(id, message, code) { this.responses.push({ id, error: { message, code } }); }
+  async request(method, { threadId }) {
+    assert.equal(method, "thread/read");
+    assert.ok(this.childThreads.has(threadId));
+    return { thread: this.childThreads.get(threadId) };
+  }
 
   complete(threadId, turnId, text) {
     const item = { type: "agentMessage", id: `item-${turnId}`, text, phase: "final_answer" };
@@ -125,6 +133,9 @@ class FakeAppServerClient extends EventEmitter {
 }
 
 (async () => {
+  assert.deepEqual(modelContextConfig(), { model_context_window: 872000, model_auto_compact_token_limit: 750000 });
+  assert.throws(() => modelContextConfig({ codexContextWindow: 1050000 }), /先验证/);
+  assert.throws(() => modelContextConfig({ codexAutoCompactTokenLimit: 872000 }), /90%/);
   const monthTestNow = new Date("2026-09-09T00:00:00Z");
   assert.deepEqual(planFastQuery("集团8月业绩排名", monthTestNow).months, ["2026-08"]);
   assert.deepEqual(planFastQuery("集团8月业绩排名并区分课程和咨询", monthTestNow).months, ["2026-08"], "裸月份覆盖集团排名的默认全年范围");
@@ -157,6 +168,17 @@ class FakeAppServerClient extends EventEmitter {
   assert.equal(Object.hasOwn(safeEnv, "XBB_WECOM_BOT_SECRET"), false);
   assert.equal(Object.hasOwn(safeEnv, "OPENAI_API_KEY"), false);
   for (const [name, value] of Object.entries(proxyEnv)) assert.equal(safeEnv[name], value, `${name} 必须保留部署网络配置`);
+  const overriddenEnv = sanitizeCodexEnvironment({ ...proxyEnv, XBB_WECOM_BOT_SECRET: "must-not-inherit" }, { codexProxyUrl: "http://127.0.0.1:18080" });
+  for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
+    assert.equal(overriddenEnv[name], "http://127.0.0.1:18080", "独立代理必须覆盖计划任务继承的所有旧代理变量");
+  }
+  assert.equal(overriddenEnv.NO_PROXY, proxyEnv.NO_PROXY);
+  assert.equal(overriddenEnv.no_proxy, proxyEnv.no_proxy);
+  assert.equal(Object.hasOwn(overriddenEnv, "XBB_WECOM_BOT_SECRET"), false);
+  assert.equal(proxyEnv.HTTP_PROXY, "http://127.0.0.1:7890", "不得改变父进程或其他应用的代理");
+  for (const codexProxyUrl of ["invalid", "http://user:password@127.0.0.1:18080", "http://public.example:18080", "http://127.0.0.1:18080/path"]) {
+    assert.throws(() => sanitizeCodexEnvironment({}, { codexProxyUrl }), /本机 HTTP\/HTTPS 代理地址/);
+  }
   assert.equal(classifyModelError({ codexErrorInfo: "unauthorized" }), "unauthorized");
   assert.equal(classifyModelError({ codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } } }), "connection_failed");
   assert.equal(classifyModelError({ codexErrorInfo: { HttpConnectionFailed: { httpStatusCode: 401 } } }), "unauthorized");
@@ -209,11 +231,16 @@ class FakeAppServerClient extends EventEmitter {
   };
   let markHostProbeStarted;
   const hostProbeStarted = new Promise((resolve) => { markHostProbeStarted = resolve; });
-  const abortedHostStart = LocalAppServerHost.start({ projectRoot: process.cwd() }, {
+  const abortedHostStart = LocalAppServerHost.start({ projectRoot: process.cwd(), codexProxyUrl: "http://127.0.0.1:18080" }, {
     signal: hostAbortController.signal,
     reservePort: async () => 43125,
     invocation: { command: "codex.exe", argsPrefix: [] },
-    spawn: () => hostChild,
+    env: { ...proxyEnv, XBB_WECOM_BOT_SECRET: "must-not-inherit" },
+    spawn: (_command, _args, options) => {
+      assert.equal(options.env.HTTPS_PROXY, "http://127.0.0.1:18080", "真实子进程启动边界必须使用独立代理");
+      assert.equal(Object.hasOwn(options.env, "XBB_WECOM_BOT_SECRET"), false);
+      return hostChild;
+    },
     probe: () => {
       markHostProbeStarted();
       return new Promise(() => {});
@@ -615,7 +642,7 @@ class FakeAppServerClient extends EventEmitter {
     assert.match(fakeClient.startTurnCalls[2].params.input[0].text, /本轮 query_xbb 实时预取事实包/);
     assert.equal(fakeClient.startTurnCalls[2].params.effort, "none");
     assert.deepEqual(fakeClient.startTurnCalls[2].params.sandboxPolicy, { type: "readOnly", networkAccess: false });
-    assert.equal(fakeClient.startTurnCalls[2].params.outputSchema.properties.chart.anyOf.length, 7);
+    assert.equal(fakeClient.startTurnCalls[2].params.outputSchema.properties.chart.anyOf.length, 9);
     assert.match(fakeClient.startTurnCalls[2].params.input[0].text, /业绩与收入结构/);
     assert.equal(agent.sessions.get(principal).active.timeoutMs, 30000);
     assert.equal(agent.sessions.get(principal).active.totalTimeoutMs, 20 * 60 * 1000, "业务生成预算与端到端绝对预算必须分离");
@@ -636,9 +663,30 @@ class FakeAppServerClient extends EventEmitter {
     assert.match(progress.join("\n"), /正在分析：2026年9月/);
     assert.match(progress.join("\n"), /已完成 0\/1/);
     assert.match(progress.join("\n"), /数据已就绪/);
+    fakeClient.childThreads.set("child-chart", { parentThreadId: "thread-1", model: "gpt-6-astra", reasoningEffort: "ultra", forkedFromId: null });
+    const chartActivity = (kind) => fakeClient.emit("notification", { method: "item/completed", params: { threadId: "thread-1", turnId: "turn-3",
+      item: { type: "subAgentActivity", id: `native-${kind}`, agentThreadId: "child-chart", kind } } });
+    chartActivity("started");
+    assert.equal(agent.sessions.get(principal).active.timeout, null, "子 Agent 分析暂停主模型生成预算");
+    assert.ok(agent.sessions.get(principal).active.absoluteTimeout, "子 Agent 不延长业务绝对截止");
+    fakeClient.emit("serverRequest", { id: 78, method: "item/tool/call", params: { threadId: "child-chart", turnId: "child-turn", tool: "query_xbb", arguments: {} } });
+    await nextImmediate();
+    assert.ok(fakeClient.responses.find((response) => response.id === 78).error, "图表子 Agent 不能自行取业务事实");
+    const reviewedSpec = { type: "bar", title: "公司排名 13800138000", subtitle: "MTD", insight: "公司A业绩高于公司B", note: "", valueFormat: "money", unit: "", categories: ["公司A", "公司B"], series: [{ name: "业绩", values: [123, 80] }] };
+    await agent._handleServerRequest({ id: 79, method: "item/tool/call", params: { threadId: "child-chart", turnId: "child-turn", tool: "validate_xbb_chart", arguments: { spec: { ...reviewedSpec, unit: "元" } } } });
+    assert.equal(fakeClient.responses.find((response) => response.id === 79).result.success, false, "金额单位格式错误必须在子 Agent 内可修正");
+    assert.equal(agent.sessions.get(principal).active.validatedCharts.size, 0);
+    await agent._handleServerRequest({ id: 80, method: "item/tool/call", params: { threadId: "child-chart", turnId: "child-turn", tool: "validate_xbb_chart", arguments: { spec: reviewedSpec } } });
+    const reviewed = fakeClient.responses.find((response) => response.id === 80).result;
+    assert.equal(reviewed.success, true);
+    assert.equal(reviewed.contentItems[1].type, "inputImage", "子 Agent 必须拿到实际手机图片预览");
+    const reviewedReference = JSON.parse(reviewed.contentItems[0].text).chart;
+    assert.equal(reviewedReference.type, "validated");
+    chartActivity("completed");
+    assert.ok(agent.sessions.get(principal).active.timeout);
     fakeClient.complete("thread-1", "turn-3", JSON.stringify({
       answer: "9月集团业绩排名结论（MTD）。",
-      chart: { type: "bar", title: "公司排名 13800138000", subtitle: "MTD", insight: "公司A业绩高于公司B", note: "", valueFormat: "money", unit: "", categories: ["公司A", "公司B"], series: [{ name: "业绩", values: [123, 80] }] }
+      chart: reviewedReference
     }));
     const businessResult = await businessPromise;
     assert.match(businessResult.answer, /MTD/);
@@ -768,6 +816,7 @@ class FakeAppServerClient extends EventEmitter {
     const databaseStart = contextAgent.answer({ question: databaseSource, access, principalKey: contextPrincipal });
     await nextImmediate();
     const databaseParams = contextClient.startTurnCalls.at(-1).params;
+    assert.deepEqual(contextClient.startThreadCalls[0].config, { ...modelContextConfig(), ...CHART_AGENT_CONFIG });
     assert.equal(databaseParams.effort, "medium", "复杂通用任务必须保留配置推理强度");
     assert.equal(databaseParams.approvalPolicy, "never");
     assert.deepEqual(databaseParams.sandboxPolicy, { type: "readOnly", networkAccess: true });
@@ -779,6 +828,13 @@ class FakeAppServerClient extends EventEmitter {
     contextClient.complete("thread-1", "turn-1", JSON.stringify({ answer: "已完成迁移草案；模型输出标记不应进入续接摘要。", chart: null }));
     await databaseCorrection;
     const contextSession = contextAgent.sessions.get(contextPrincipal);
+    const largeSession = { ...contextSession, turnCount: 30, estimatedInputBytes: 1024 * 1024,
+      tokenUsage: { modelContextWindow: 828400, last: { totalTokens: 400000 } } };
+    assert.equal(contextAgent._shouldRotateThread(largeSession, 10000), false, "有效 token 计量充足时，不被旧字节和轮次阈值提前切断大上下文");
+    largeSession.tokenUsage.last.totalTokens = 744000;
+    assert.equal(contextAgent._shouldRotateThread(largeSession, 10000), true, "接近有效窗口时预留生成空间");
+    largeSession.tokenUsage = { modelContextWindow: 1000, last: { totalTokens: 950 } };
+    assert.equal(contextAgent._shouldRotateThread(largeSession, 10), true, "按运行时实际小窗口判断，不能盲信配置值");
     assert.match(contextSession.taskContext.goal, /优化数据库 notes/u, "steer 不能覆盖初始目标");
     assert.match(contextSession.taskContext.corrections.at(-1), /不要删除 notes 表/u);
     assert.doesNotMatch(JSON.stringify(contextSession.taskContext), /CREATE TABLE|模型输出标记/u);
@@ -937,6 +993,7 @@ class FakeAppServerClient extends EventEmitter {
     await nextImmediate();
     assert.equal(resumedClient.resumeThreadCalls.length, 1);
     assert.equal(resumedClient.resumeThreadCalls[0].params.excludeTurns, true);
+    assert.deepEqual(resumedClient.resumeThreadCalls[0].params.config, { ...modelContextConfig(), ...CHART_AGENT_CONFIG }, "恢复 Thread 必须重新应用扩容和压缩配置");
     assert.equal(resumedClient.startThreadCalls.length, 0);
     resumedClient.complete("thread-3", "turn-1", JSON.stringify({ answer: "懒恢复成功。", chart: null }));
     assert.match((await lazyResumePromise).answer, /懒恢复成功/);
@@ -1780,7 +1837,85 @@ class FakeAppServerClient extends EventEmitter {
     assert.match((await overSteerBudget).answer, /新 Turn/);
     await boundsAgent.close();
 
-    process.stdout.write(`${JSON.stringify({ success: true, checks: 221, runtime: "persistent-steerable-general-codex-with-xbb-skill" })}\n`);
+    const preciseClient = new FakeAppServerClient();
+    const preciseCalls = [];
+    const preciseAgent = isolatedAgent("precise-gpt6", preciseClient, {
+      config: { strictDataDemand: true, codexModel: "gpt-6-astra", codexReasoningEffort: "xhigh" },
+      queryXbb: async (args) => {
+        preciseCalls.push(args);
+        return { ...readyPerformancePack(), scope: { month: args.months[0], domains: args.domains },
+          facts: { opportunities: { summary: { createdCount: 2, expectedAmount: 999, followCount: 7 }, opportunities: [{ name: "unasked-secret-sentinel" }] } } };
+      }
+    });
+    await preciseAgent.start();
+    const precisePrincipal = principalKeyFromUserId("precise-synthetic", access);
+    const preciseAnswer = preciseAgent.answer({ question: "2026年9月集团创建多少商机", access, principalKey: precisePrincipal, messageId: "precise-1" });
+    await waitUntil(() => preciseClient.startTurnCalls.length === 1, "精确查询应先启动模型规划");
+    assert.equal(preciseCalls.length, 0, "生产禁止粗数据域预取");
+    assert.equal(preciseClient.startTurnCalls[0].params.model, "gpt-6-astra");
+    assert.equal(preciseClient.startTurnCalls[0].params.effort, "xhigh");
+    const preciseCall = async (id, arguments_) => {
+      preciseClient.emit("serverRequest", { id, method: "item/tool/call", params: { threadId: "thread-1", turnId: "turn-1", tool: "query_xbb", arguments: arguments_ } });
+      await waitUntil(() => preciseClient.responses.some((response) => response.id === id), "查询响应未完成");
+      return preciseClient.responses.find((response) => response.id === id).result;
+    };
+    const extra = await preciseCall(1001, { months: ["2026-09"], domains: ["opportunities"], metrics: ["opportunities.quality"] });
+    assert.equal(extra.success, false);
+    assert.equal(preciseCalls.length, 0, "拒绝读取未问的跟进质量数据");
+    const exact = await preciseCall(1002, { months: ["2026-09"], domains: ["opportunities"], metrics: ["opportunities.count"] });
+    assert.equal(exact.success, true);
+    assert.equal(preciseCalls.length, 1);
+    assert.doesNotMatch(JSON.stringify(exact), /unasked-secret-sentinel|expectedAmount|followCount/);
+    preciseClient.complete("thread-1", "turn-1", JSON.stringify({ answer: "合成验证数据：创建商机 2 个。", chart: null }));
+    await preciseAnswer;
+    const preciseFollowup = preciseAgent.answer({ question: "图表呈现出来", access, principalKey: precisePrincipal, messageId: "precise-2" });
+    await waitUntil(() => preciseClient.startTurnCalls.length === 2, "追问应继续原问题");
+    assert.equal(preciseClient.startTurnCalls[1].params.threadId, "thread-2", "只继承意图，不携带旧业务事实");
+    assert.match(preciseClient.startTurnCalls[1].params.input[0].text, /创建多少商机/);
+    assert.doesNotMatch(preciseClient.startTurnCalls[1].params.input[0].text, /unasked-secret-sentinel|createdCount/);
+    preciseClient.complete("thread-2", "turn-2", JSON.stringify({ answer: "仅有一个数量指标，不适合比较图。", chart: null }));
+    await preciseFollowup;
+    await preciseAgent.close();
+
+    const intentClient = new FakeAppServerClient();
+    const intentAgent = isolatedAgent("multidimensional-intent", intentClient, {
+      config: { strictDataDemand: true, codexModel: "gpt-6-astra", codexReasoningEffort: "xhigh" },
+      queryXbb: async () => readyPerformancePack()
+    });
+    await intentAgent.start();
+    const intentPrincipal = principalKeyFromUserId("intent-synthetic", access);
+    const intentTurn = async (question, check) => {
+      const count = intentClient.startTurnCalls.length;
+      const pending = intentAgent.answer({ question, access, principalKey: intentPrincipal });
+      await waitUntil(() => intentClient.startTurnCalls.length > count, "经营追问未启动");
+      const call = intentClient.startTurnCalls.at(-1);
+      check(intentAgent.sessions.get(intentPrincipal).active, call.params.input[0].text);
+      intentClient.complete(call.params.threadId, call.id, JSON.stringify({ answer: "仅验证意图续接的合成轮次。", chart: null }));
+      await pending;
+    };
+    await intentTurn("2026年8月集团业绩怎么样？", (active) => assert.deepEqual(active.demandPlan.months, ["2026-08"]));
+    await intentTurn("趋势是什么？", (active, text) => {
+      assert.deepEqual(active.demandPlan.months, ["2026-08"]);
+      assert.match(text, /2026年8月集团业绩/);
+    });
+    await intentTurn("其次哪个分公司业绩好？", (active, text) => {
+      assert.deepEqual(active.demandPlan.domains, ["performance"]);
+      assert.match(text, /趋势是什么/);
+      assert.match(text, /2026年8月集团业绩/);
+    });
+    await intentTurn("另外开了多少课？", (active) => assert.deepEqual([...active.demandPlan.domains].sort(), ["courses", "performance"], "新增业务维度保留此前业绩维度"));
+    await intentTurn("只看今天集团业绩多少", (active) => {
+      assert.deepEqual(active.demandPlan.domains, ["performance"]);
+      assert.match(active.demandPlan.date, /^\d{4}-\d{2}-\d{2}$/);
+      assert.deepEqual(active.demandPlan.months, [active.demandPlan.date.slice(0, 7)]);
+    });
+    await intentTurn("改为2026年8月", (active) => {
+      assert.equal(active.demandPlan.date, undefined, "从今日改为整月必须清除旧单日范围");
+      assert.deepEqual(active.demandPlan.months, ["2026-08"]);
+    });
+    await intentAgent.close();
+
+    process.stdout.write(`${JSON.stringify({ success: true, checks: 235, runtime: "persistent-steerable-general-codex-with-xbb-skill" })}\n`);
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }

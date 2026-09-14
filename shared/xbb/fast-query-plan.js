@@ -25,6 +25,64 @@ function shanghaiMonth(now = new Date()) {
   return new Date(Date.UTC(year, month - 1, 1));
 }
 
+function shanghaiDate(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit"
+  }).formatToParts(now);
+  return ["year", "month", "day"].map((type) => parts.find((part) => part.type === type).value).join("-");
+}
+
+function validateRequestedDate(value, now = new Date()) {
+  if (typeof value !== "string" || !/^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/.test(value)) {
+    throw new Error("单日日期必须使用 YYYY-MM-DD 格式。");
+  }
+  const parsed = new Date(`${value}T00:00:00Z`);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value || Number(value.slice(0, 4)) < MIN_QUERY_YEAR) {
+    throw new Error("单日日期不是有效的自然日。");
+  }
+  if (value > shanghaiDate(now)) throw new Error(`不能查询晚于当前上海日期 ${shanghaiDate(now)} 的日期。`);
+  return value;
+}
+
+function validateDateScope(date, months, domains, now = new Date()) {
+  if (date === undefined) return undefined;
+  const value = validateRequestedDate(date, now);
+  if (domains.length !== 1 || domains[0] !== "performance") throw new Error("单日查询当前仅支持业绩，不能改查整月或其他数据域。");
+  if (months.length !== 1 || months[0] !== value.slice(0, 7)) throw new Error("单日查询的月份必须且只能是该日期所属月份。");
+  if (value.slice(0, 7) < PERFORMANCE_DATA_START_MONTH) throw new Error(`业绩已确认数据范围从 ${PERFORMANCE_DATA_START_MONTH} 开始。`);
+  return value;
+}
+
+function parseDate(question, now = new Date()) {
+  const today = shanghaiDate(now);
+  const currentYear = Number(today.slice(0, 4));
+  const dates = [];
+  let text = String(question || "").replace(/\s+/g, "")
+    .replace(/(去年|今年|本年|明年)(?=\d{1,2}月\d{1,2}[日号])/gu, (_match, label) =>
+      `${currentYear + (label === "去年" ? -1 : label === "明年" ? 1 : 0)}年`);
+  text = text.replace(/今天|今日|昨天|昨日/gu, (label) => {
+    dates.push(label === "今天" || label === "今日" ? today : new Date(Date.parse(`${today}T00:00:00Z`) - 86400000).toISOString().slice(0, 10));
+    return "";
+  });
+  text = text.replace(/(?<!\d)(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)/gu, (_match, year, month, day) => {
+    dates.push(`${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`);
+    return "";
+  });
+  text = text.replace(/(?<!\d)(?:(\d{4})年)?(\d{1,2})月(\d{1,2})[日号]/gu, (_match, year, month, day) => {
+    dates.push(`${year || currentYear}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`);
+    return "";
+  });
+  if (/\d+[日号]|(?:近|最近|过去)\d+天|本周|这周|上周|当日|当天|明天|明日|前天/gu.test(text)) {
+    throw new Error("当前日期范围不能安全识别，请使用明确的单日 YYYY-MM-DD；未改查本月。");
+  }
+  if (!dates.length) return null;
+  const unique = [...new Set(dates.map((date) => validateRequestedDate(date, now)))];
+  if (unique.length !== 1 || hasExplicitPeriod(text) || /\d+月|以来|至今|之后|以后/u.test(text)) {
+    throw new Error("单日查询只接受一个明确日期，不能混合日期或月份范围。");
+  }
+  return unique[0];
+}
+
 function parseCanonicalMonth(value) {
   const match = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(String(value));
   if (!match) throw new Error("月份必须使用 YYYY-MM 格式。");
@@ -66,6 +124,7 @@ function monthsBetween(startMonth, endMonth) {
 
 function hasExplicitPeriod(question) {
   const text = String(question || "");
+  if (/今天|今日|昨天|昨日|\d{1,2}\s*月\s*\d{1,2}\s*[日号]/u.test(text)) return true;
   if (/(?<!\d)\d{1,2}\s*月\s*(?:和|与|及|、|,|，)\s*\d{1,2}\s*月/u.test(text)) return true;
   return /(?<!\d)\d{4}\s*(?:年|[-/.])\s*\d{1,2}\s*月?|(?<!\d)\d{4}\s*年(?:度|全年)?|(?:近|最近|过去)\s*\d+\s*个?(?:自然)?月|(?<!\d)\d{1,2}\s*月?\s*(?:-|—|~|～|至|到)\s*\d{1,2}\s*月|(?:去年|明年)\s*\d{1,2}\s*月|本月|这个月|当月|当前月|上(?:个)?月|今年|本年|全年|整年|一整年|年度/.test(text);
 }
@@ -94,6 +153,8 @@ function restrictPerformanceMonths(months, domains) {
 }
 
 function parseMonths(question, now = new Date()) {
+  const date = parseDate(question, now);
+  if (date) return [date.slice(0, 7)];
   const current = shanghaiMonth(now);
   // Normalize only a relative year immediately qualifying a numeric month/range;
   // reuse the existing explicit-date parser and its future / coverage checks.
@@ -304,19 +365,21 @@ function planFastQuery(question, now = new Date()) {
   if (isSchemaOnlyQuestion(question)) return null;
   const domains = routeDomains(question);
   if (!domains.length) return null;
+  const date = parseDate(question, now);
   const currentMonth = monthLabel(shanghaiMonth(now));
   const requestedMonths = isDefaultGroupPerformanceRanking(question, domains)
     ? monthsBetween(PERFORMANCE_DATA_START_MONTH, currentMonth)
     : parseMonths(question, now);
   const months = restrictPerformanceMonths(requestedMonths, domains);
-  return Object.freeze({ months: Object.freeze(months), domains: Object.freeze(domains) });
+  if (date) validateDateScope(date, months, domains, now);
+  return Object.freeze({ months: Object.freeze(months), domains: Object.freeze(domains), ...(date ? { date } : {}) });
 }
 
 function chooseTurnEffort(question, defaultEffort = "medium") {
   const text = String(question || "").replace(/\s+/g, "");
   const domains = routeDomains(text);
   const needsDeepAnalysis = domains.includes("opportunities")
-    || /原因|为什么|归因|风险|预测|质量|异常|诊断|建议|重新激活|遗忘/.test(text);
+    || /原因|为什么|归因|风险|预测|质量|异常|诊断|建议|重新激活|遗忘|怎么样|趋势是什么|综合|全面|业绩好/.test(text);
   if (needsDeepAnalysis) return defaultEffort;
   if (domains.length || /^(你好|您好|在吗|你是谁|能做什么)[？?！!。.]?$/.test(text)) return "none";
   return defaultEffort;
@@ -332,11 +395,15 @@ module.exports = {
   isDefaultGroupPerformanceRanking,
   monthLabel,
   monthsBetween,
+  parseDate,
   parseMonths,
   planFastQuery,
   restrictPerformanceMonths,
   routeDomains,
   shanghaiMonth,
+  shanghaiDate,
   shiftMonth,
-  validateRequestedMonths
+  validateRequestedMonths,
+  validateRequestedDate,
+  validateDateScope
 };

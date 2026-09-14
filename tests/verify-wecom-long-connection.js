@@ -189,8 +189,8 @@ function frame(messageId, userId, msgtype, body) {
     retryWait: async () => {}
   });
   await summaryHandler.handleMessage(frame("msg-summary", "boss", "text", { text: { content: "为什么" } }), summaryClient);
-  assert.equal(summaryRenders, 1, "经营追问即使 chart:null 也必须生成结论速览图");
-  assert.equal(summaryClient.mediaMessages.length, 1);
+  assert.equal(summaryRenders, 0, "无图表时不能生成文字图片");
+  assert.equal(summaryClient.mediaMessages.length, 0);
   assert.equal(summaryClient.replies.at(-1).content, "事实不足以形成比较，已保留范围说明。");
 
   const schemaClient = new FakeClient();
@@ -210,8 +210,8 @@ function frame(messageId, userId, msgtype, body) {
     }
   });
   await schemaHandler.handleMessage(frame("msg-schema", "boss", "text", { text: { content: "text_63 是什么字段？" } }), schemaClient);
-  assert.equal(schemaSummaryRenders, 1, "纯字段说明也应沿 XBB 路由生成结论图");
-  assert.equal(schemaClient.mediaMessages.length, 1);
+  assert.equal(schemaSummaryRenders, 0, "纯字段说明不生成文字图片");
+  assert.equal(schemaClient.mediaMessages.length, 0);
   assert.equal(schemaClient.replies.at(-1).content, "字段说明已生成。");
 
   const generalClient = new FakeClient();
@@ -258,23 +258,23 @@ function frame(messageId, userId, msgtype, body) {
   });
   await degradedHandler.handleMessage(frame("msg-degraded", "boss", "text", { text: { content: "集团业绩排名" } }), degradedClient);
   assert.equal(chartRenderAttempts, 2);
-  assert.equal(answerRenderAttempts, 2);
-  assert.equal(uploadAttempts, 3);
-  assert.deepEqual(degradedClient.replies.at(-1).msgItem, [emergencyItem]);
-  assert.match(degradedClient.replies.at(-1).content, /改用结论速览图/);
-  assert.match(degradedClient.replies.at(-1).content, /已附安全占位图/);
+  assert.equal(answerRenderAttempts, 0);
+  assert.equal(uploadAttempts, 0);
+  assert.deepEqual(degradedClient.replies.at(-1).msgItem, []);
+  assert.match(degradedClient.replies.at(-1).content, /图表暂未生成/);
+  assert.doesNotMatch(degradedClient.replies.at(-1).content, /速览|占位/);
   assert.equal(degradedClient.replies.at(-1).finish, true, "状态写入失败不能阻断图片和文字最终答复");
 
   const denied = frame("msg-2", "unknown", "text", { text: { content: "集团业绩" } });
   await handler.handleMessage(denied, client);
   assert.equal(client.replies.at(-1).finish, true);
   assert.match(client.replies.at(-1).content, /尚未获准/);
-  assert.equal(client.replies.at(-1).msgItem?.[0]?.msgtype, "image", "未授权 XBB 拒绝也必须带应急图");
+  assert.deepEqual(client.replies.at(-1).msgItem, [], "未授权拒绝仅回复文字");
   const deniedContinue = frame("msg-2-continue", "unknown", "text", { text: { content: "继续" } });
   await handler.handleMessage(deniedContinue, client);
   assert.equal(client.replies.at(-1).finish, true);
   assert.match(client.replies.at(-1).content, /尚未获准/);
-  assert.equal(client.replies.at(-1).msgItem?.[0]?.msgtype, "image", "拒绝后的省略追问必须继承 XBB 路由并带图");
+  assert.deepEqual(client.replies.at(-1).msgItem, [], "拒绝后的省略追问不能生成状态图片");
   assert.equal(agentCalls, 1);
 
   const openClient = new FakeClient();
@@ -336,8 +336,9 @@ function frame(messageId, userId, msgtype, body) {
     XBB_ACCESS_POLICY_PATH: "D:\\policy.json"
   } });
   assert.equal(config.modelProvider, "codex-app-server");
-  assert.equal(config.codexModel, "gpt-5.6-sol");
-  assert.equal(config.codexReasoningEffort, "medium");
+  assert.equal(config.codexModel, "gpt-6-astra");
+  assert.equal(config.codexReasoningEffort, "xhigh");
+  assert.equal(config.strictDataDemand, true);
   assert.equal(config.agentTurnTimeoutMs, 300000);
   assert.equal(config.generalTurnTimeoutMs, 900000);
   assert.equal(config.wecomWsUrl, "wss://openws.work.weixin.qq.com/");
@@ -346,6 +347,11 @@ function frame(messageId, userId, msgtype, body) {
   assert.match(config.statusLogPath, /status\.jsonl$/);
   assert.match(config.serviceLeasePath, /service-lease\.json$/);
   assert.equal(Object.hasOwn(config, "callbackPath"), false);
+  const proxyConfig = loadConfig({ env: {
+    XBB_WECOM_BOT_ID: "aibot_proxy_test", XBB_WECOM_BOT_SECRET: "secret-test",
+    XBB_CODEX_PROXY_URL: "http://127.0.0.1:18080"
+  } });
+  assert.equal(proxyConfig.codexProxyUrl, "http://127.0.0.1:18080");
   const managedOptions = managedConfigOptions(["--managed-config", path.join(os.tmpdir(), "managed-bot-config.json")], {
     PATH: "managed-test-path",
     XBB_SERVICE_LEASE_PATH: "must-not-leak",

@@ -4,6 +4,8 @@
 
 调研日期：2026-09-03。这里记录设计依据，避免以后把不适合本项目边界的通用图表运行时直接搬入生产。
 
+2026-09-14再次检索并打开OpenAI与Anthropic官方可视化Skill及Datawrapper图表文字指南。采用“问题与证据先于选图、关系决定图型、注释解释发现、最终尺寸实际QA”的原则，改为原生ultra图表子Agent先逐项分析，程序验证多条关系，再形成有编号和阅读顺序的综合图。没有安装通用Skill依赖或复制上游代码。新增 `node scripts/preview-chart-analysis.js`，在 `test-results/chart-analysis-review` 同时检查完整与390px图片；预览均醒目标明离线虚构验收，运行时仍只使用当前真实事实。
+
 ## 采用的原则
 
 - [OpenAI role-specific-plugins / visualize-data](https://github.com/openai/role-specific-plugins/blob/fe5608d2512a7d6a7b9821ce8a88c48464ecd6e4/plugins/data-analytics/skills/visualize-data/SKILL.md)（MIT）：先定义分析问题和一句话发现，再写紧凑 chart contract；按图形、结构、颜色、最终场景 QA 的顺序构建；图表选择服从比较关系和数据充足性。

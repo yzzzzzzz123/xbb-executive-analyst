@@ -9,8 +9,9 @@
 - 凭据加载与实时导出：项目公共实现 `shared/xbb/export-live-data.ps1` → `shared/xbb/export-live-data.js`
 - 确定性事实编译：项目公共实现 `shared/xbb/build-fact-pack.js`
 - 按需图表：`scripts/render-chart.ps1` → 项目公共实现 `shared/xbb/render-chart.js`
+- 企业微信图表预检：`validate_xbb_chart` 只校验已有规格、计算关系并返回手机PNG预览，不取新事实；对本轮主 Agent 及绑定的当前ultra子 Agent 开放，最多8次有界校验。成功引用仅在当前主体、事实版本和追问版本有效，最终直接解析为已验证规格，避免模型重复抄写出错。
 
-不存在网页服务、HTML、驾驶舱、工作台、静态发布器、局域网代理或嵌套模型调用。企业微信服务中的本机 Codex App Server 是顶层分析 Agent；Codex 对话模式仍禁止启动第二个 Codex。
+不存在网页服务、HTML、驾驶舱、工作台、静态发布器或局域网代理。本机 Codex App Server 承载主 Agent（gpt-6-astra/xhigh）；需要经营图时由主 Agent 原生委派 xbb_chart（gpt-6-astra/ultra，fork_turns=none），仅使用本轮已授权事实。两种模式均不另起 codex exec 或外部模型 API。
 
 ## Runner
 
@@ -18,22 +19,24 @@
 & .\scripts\query-xbb.ps1 `
   -Month 2026-09 `
   -Domains opportunities `
+  -Metrics opportunities.count `
   -Person "销售姓名" `
   -OutputPath "$env:TEMP\xbb-facts.json"
 ```
 
 - `Month` 可传一个或最多 120 个 `YYYY-MM`；省略时使用当前上海自然月。
+- `Date` 可选，上海 `YYYY-MM-DD`，仅限业绩域，且 `Month` 必须只有该日所属月。今天、昨日或明确单日查询必须传入，不允许改查月累计。源端与详情同时校验日期；日期参与缓存摘要、网关参数及事实包范围绑定。
 - `Domains` 支持 `performance`、`product-sales`、`courses`、`delivery`、`opportunities` 和 `all`。
-- `Company`、`Person` 为可选确定性过滤。多个相似候选返回 `needs_disambiguation`，不能自行选一个。
+- 正式动态工具必须指定 `metrics`，与 domains 完全对应。`Company`、`Person` 在源端加过滤条件；仅依靠必要元数据识别实体，无法唯一识别就停止，不读取集团业务记录。
 - `ForceRefresh` 仅在用户要求立即刷新或缓存验证时使用。
-- 单月事实包可能很大，应写入 run-scoped 路径并在当前回答前删除，不要把完整 JSON 粘贴进答案。企业微信桥接会在完整性与隐私校验后生成严格不超过 96 KiB 的 `xbb-live-readonly-model-fact-view`，保留汇总、趋势、核心榜单和覆盖量；完整单月包不进入 Thread。2 至 120 个月的 runner 输出不是单月包拼接，而是 `xbb-live-readonly-multi-period-aggregate`：完整管理汇总与月度趋势在本机确定性生成。
+- 单月事实包可能很大，应写入 run-scoped 路径并在当前回答前删除，不要把完整 JSON 粘贴进答案。企业微信桥接会在完整性与隐私校验后生成严格不超过 96 KiB 的 `xbb-live-readonly-model-fact-view`，只保留所请求指标及必要覆盖量；完整单月包不进入 Thread。2 至 120 个月的 runner 输出不是单月包拼接，而是 `xbb-live-readonly-multi-period-aggregate`：完整管理汇总与月度趋势在本机确定性生成。
 - 企业微信工具网关可为 runner 传入 run-scoped `ProgressPath`。runner 只写 JSONL 阶段事件，包括启动、当前月份、来源就绪、月份事实完成、跨月聚合和输出就绪；事件不得包含公司/人员、业务数字、事实内容、路径、凭证或用户标识。工具网关轮询并校验事件后才映射为企微进度，结束时随单次请求目录一并清理。
 
 ## 五分钟加密缓存
 
 - 缓存位于 `%LOCALAPPDATA%\Codex\xbb-executive-analyst\cache`。
 - 来源包使用 Windows DPAPI CurrentUser 加密；磁盘缓存没有明文业务 JSON。
-- 缓存键包含来源 schema、最少数据域依赖和月份；相同依赖组合及月份在五分钟内复用，五分钟后重新实时导出。缓存损坏、无法解密或 schema 变化时删除并重新取数。
+- 缓存键包含 source-v7、租户、月份/单日日期以及数据域/指标/公司/人员的摘要；只有完全相同范围在五分钟内复用，五分钟后重新实时导出。缓存损坏、无法解密或 schema 变化时删除并重新取数。
 - 每次调用清除超过 24 小时的遗留加密缓存。
 - 解密后的来源包只存在于 `%TEMP%\Codex\xbb-executive-analyst\runs\run-*`，runner 的 `finally` 必须删除整个 run 目录。
 
@@ -55,7 +58,7 @@
 
 生成器只接受受控字段并输出自包含 SVG，不允许模型提供颜色、样式、脚本、外链、远程字体或网络资源。最终 SVG 位于 `%TEMP%\Codex\xbb-executive-analyst\charts`，保留最多 24 小时；规格文件生成后立即删除。
 
-企业微信 Agent 模式不得在模型沙箱中运行图表脚本。模型按结构化输出合同返回一张可选经营图规范；桥接层使用同一确定性 SVG 渲染器并在内存中转成 PNG。所有销帮帮答复必须带图：`chart: null` 时把已经脱敏的同条文字答复排成结论速览 PNG，渲染器整体异常时使用本地纯代码生成且不含经营数字的安全占位 PNG。桥接层对渲染、上传和主动图片发送做有界重试，优先通过官方 `uploadMedia` 与 `sendMediaMessage` 发送独立图片，失败时以最终 `replyStream(..., finish=true, msg_item)` 回退。不得把 Base64、SVG、临时路径或图表规范正文作为文字发给用户或写入状态日志。
+企业微信 Agent 模式不得在模型沙箱中运行图表脚本。模型按结构化输出合同返回一张可选经营图规范；桥接层使用同一确定性 SVG 渲染器并在内存中转成 PNG。`chart` 可为单图或含2—8个不同子图的 composite；图片展示图形、精确读数与通过 findings 验证的主发现和证据注释。`chart: null` 或图表渲染失败时只保留文字，不生成结论速览、状态卡或占位 PNG。桥接层对渲染、上传和主动图片发送做有界重试，优先通过官方 `uploadMedia` 与 `sendMediaMessage` 发送独立图片，失败时以最终 `replyStream(..., finish=true, msg_item)` 回退。不得把 Base64、SVG、临时路径或图表规范正文作为文字发给用户或写入状态日志。
 
 ## 安全与失败
 
@@ -66,13 +69,13 @@
 - 企业微信桥接拥有唯一一个本机 Codex App Server 子进程，必须只监听动态分配的 `127.0.0.1` WebSocket 端口，使用内存中的随机 capability token 连接；进程参数只允许出现 token 的 SHA-256 校验值，原始 token 不得进入命令行、状态文件或日志。
 - App Server 只继承启动和 ChatGPT 登录所需的环境变量白名单，不得继承企微 Secret、销帮帮凭证、模型 API Key 或其他业务 Secret。每轮固定 `approvalPolicy=never` 并使用只读沙箱；通用 Turn 可启用网络以支持正常知识检索，经营 Turn 必须关闭网络，且经营事实只能来自受控 `query_xbb`。
 - 每个已授权 USERID 与授权范围组合只能映射到自己的不可逆 principal 摘要和隔离 Thread；状态保存在仓库外。进程启动只登记历史 Thread，对应用户首条消息才以 `excludeTurns=true` 懒恢复；合约变化或授权范围变化时必须新建，不同用户上下文不得合并。
-- 桥接必须监听 `thread/tokenUsage/updated`。预计下一轮达到模型上下文 70%、累计输入超过 256 KiB 或 Thread 已完成 24 轮时，在用户 Turn 前换新 Thread；服务重启后首个携带事实的大经营问题也换新，以免未知历史占满窗口。轮换只可携带有界最近意图帮助理解指代，旧经营数字必须重新查询。
+- 桥接创建和恢复 Thread 时均显式传入 `model_context_window=872000` 与 `model_auto_compact_token_limit=750000`，模型上下文、原生子 Agent 默认模型/ultra强度及专职角色文件均参与合同哈希。当前部署实测有效窗口为 828,400 tokens，必须监听 `thread/tokenUsage/updated` 并以实际回报为准。预计下一轮达到实际窗口 90% 或压缩阈值的较小值时，在用户 Turn 前换新 Thread；已有可靠 token 计量时不再额外套用旧字节/轮次阈值。缺少有效计量时才回退到累计输入 256 KiB 或 24 轮。经营新问题仍强制只继承意图，不携带旧事实；服务重启后首个携带事实的大经营问题也换新。轮换只可携带有界最近意图帮助理解指代，旧经营数字必须重新查询。
 - Codex 本地历史保存用户问题与经过预算投影的模型事实视图，不保存完整事实包。不得声称这些内容完全不落盘。仓库外 Agent 状态只保存 principal 摘要、Thread ID、合约摘要和上下文预算计数，不保存问题、答案或经营事实。
 - 企业微信问题通过 `turn/start` 进入空闲 Thread。同一用户已有问题仍在处理且新消息能力路由一致时，桥接层必须通过 `turn/steer` 和匹配的 `expectedTurnId` 把它追加为当前 Turn 的用户追问/修正；桥接层在 steer 请求确认期间暂存可能同时到达的 `turn/completed`，避免最新消息错过最终答复。若实时预取仍在进行且尚未启动 Turn，改变查询范围的新消息必须立即撤销旧订阅并接管最新答复所有权，不等待旧 runner；短句修正可携带有界且不含旧经营事实的原问题语义用于消歧，但旧月份、旧公司或旧域事实不得进入模型。成功后旧消息只收到交接说明，最新消息成为唯一最终答复接收者；多次追问继续向最新消息移交。能力路由不同的消息等待当前 Turn 完成后自动以新 Turn 处理，因为 `turn/steer` 不能改变本轮 Skill、沙箱或输出 Schema。桥接进程重启时若持久标记显示旧 Turn 未完成，必须直接作废该 Thread 并新建，不依赖恢复结果继续无调用方的旧任务。
-- App Server Thread 注册且只注册 `query_xbb` 这一项业务动态工具。通用 Turn 不附带经营 Skill/RAG，服务端拒绝该工具；经营 Turn 显式附带 `xbb-executive-analyst` Skill，且可确定月份与数据域时，桥接服务允许在 `turn/start` 前通过同一工具网关预取当前问题的实时事实包，从而避免模型先花时间规划基础查询；不确定或需要实体消歧时保留动态工具调用。Codex 不得用内置 shell、文件、网络、MCP 或其他 Skill 直接读取业务数据；授权与 bundled runner 调用必须留在桥接服务层。这一业务数据边界不禁止通用 Turn 使用系统实际提供的通用只读能力。
-- Codex 0.151.x 的 `dynamicTools` 协议要求客户端声明 `experimentalApi=true`；该声明只用于注册受控 `query_xbb`，不能借此增加其他业务工具、运行时工作区或未验收的实验能力。
+- App Server Thread 只注册 `query_xbb`。生产经营轮次不自动预取；模型先提交明确指标与实体，桥接层根据当前用户意图校验月份、域和指标，然后源端按日期、公司、人员和关联 ID 查询。数量问题不附带质量记录，门票不附带业绩订单。上游列表接口若返回完整记录，不猜造字段选择参数；在导出边界立即按指标白名单裁剪，不写入或注入未问字段。无可靠过滤能力时说明限制，不静默扩大范围。模型不得用 shell、文件、网络或其他 Skill 直接获取业务数据。
+- 已验证 Codex 0.154.0 的 `dynamicTools` 协议要求客户端声明 `experimentalApi=true`；该声明只用于注册受控 `query_xbb`，不能借此增加其他业务工具、运行时工作区或未验收的实验能力。
 - 工具网关最多接受四轮调用，逐次校验参数、USERID 授权范围、事实包实时只读来源、隐私标志与 SHA-256 完整性，并在 `finally` 删除明文事实包。
 - 进度回调失败不得中断真实 runner，也不得写入状态日志；事实包读取完成后必须额外产生“隐私与完整性校验中”和“数据已就绪”两个真实阶段。缓存命中导致事件密集时，企微层只保留尚未发送的最新阶段。
-- 当前 Turn 已由桥接层按相同月份、数据域、公司、人员和刷新参数完成预取时，动态 `query_xbb` 只返回小型复用标记；不得重复运行或再次注入同一事实视图。动态补查也必须先投影到剩余事实预算，本轮全部事实视图累计不得超过 128 KiB。新动态查询的范围与当前可恢复事实不同时，必须在查询开始前撤销旧事实恢复资格；查询期间收到改变范围的 `turn/steer` 后，旧查询即使迟到完成也只能返回无事实的 `superseded` 标记，不能把旧月份、旧公司或旧数据域注入最新问题。年度关键词必须在预取路由中展开成截至当前上海月份的月份数组，避免只预取当前月再补查全年。
+- 当前 Turn 已按相同月份、数据域、指标、公司、人员和刷新参数完成查询时，动态 `query_xbb` 只返回小型复用标记；不得重复运行或再次注入同一事实视图。动态补查也必须先投影到剩余事实预算，本轮全部事实视图累计不得超过 128 KiB。新动态查询的范围与当前可恢复事实不同时，必须在查询开始前撤销旧事实恢复资格；查询期间收到改变范围的 `turn/steer` 后，旧查询即使迟到完成也只能返回无事实的 `superseded` 标记，不能把旧月份、旧公司或旧数据域注入最新问题。年度范围在查询前展开；后续期间修正覆盖旧期间，不能把原问题与修正中的月份求并集。
 - Codex Turn 的模型生成超时不得累计 bundled runner 的实时取数耗时。动态工具开始时暂停 5 分钟经营生成计时，取数完成后重新获得完整生成窗口；runner 按月份数量获得 5—15 分钟的有界执行窗口。同时每个经营请求从进入 active 起受不滑动的 20 分钟端到端绝对截止约束，通用请求默认 15 分钟；绝对截止覆盖预取、排队、动态工具和模型生成，并主动撤销真实查询订阅。
 - 当事实视图为 `ready` 时，桥接层必须拦截“上下文/大小限制所以不能分析”“请拆主题或重发”等技术性拒答。模型结构无效、生成超时或上述拒答时，直接从同一已校验视图生成最小管理答案并丢弃失效 Thread；不能要求用户重新查询已取得的事实。

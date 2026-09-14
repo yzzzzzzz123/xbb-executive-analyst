@@ -116,8 +116,9 @@ assert.ok(performance.domains.includes("performance"));
 assert.match(performance.text, /业绩与收入结构/);
 assert.match(performance.text, /课程、咨询、其他金额和占比/);
 assert.match(performance.text, /图片与经营图/);
-assert.match(performance.text, /结构化 `finding`/);
-assert.match(performance.text, /确定性程序从这些位置计算并生成 `insight`/);
+assert.match(performance.text, /`findings`.*互补关系/);
+assert.match(performance.text, /确定性程序计算并显示证据注释/);
+assert.match(performance.text, /两个及以上维度必须出综合图/);
 assert.match(performance.text, /不能证明.*数字已绑定完整事实源/);
 assert.match(performance.text, /xbb-executive-chart/);
 assert.match(performance.text, /不可突破的边界/);
@@ -181,7 +182,7 @@ assert.equal(hugeQuestionResult.bytes, Buffer.byteLength(hugeQuestionResult.text
 
 const annualSizeBoundary = knowledgeBase.retrieve("跨月汇总超过安全大小限制，还能继续完成年度分析吗");
 assert.match(annualSizeBoundary.text, /aggregationComplete=true/);
-assert.match(annualSizeBoundary.text, /超过大小限制无法分析/);
+assert.match(annualSizeBoundary.text, /不让用户拆主题重查/);
 assert.match(annualSizeBoundary.text, /逐月.*provenance.*审计明细/);
 
 const chartContract = knowledgeBase.retrieve("辅助图规格的 items series 百分比和 centerLabel 怎么填写");
@@ -270,5 +271,6 @@ assert.equal(chooseTurnEffort("集团业绩排名，区分课程和咨询占比"
 assert.equal(chooseTurnEffort("本月课程成交率", "medium"), "none");
 assert.equal(chooseTurnEffort("分析商机跟进质量并给重新激活建议", "medium"), "medium");
 assert.equal(chooseTurnEffort("为什么本月业绩下降", "medium"), "medium");
+assert.equal(chooseTurnEffort("今年公司的业绩怎么样，趋势是什么，其次哪个分公司业绩好", "medium"), "medium");
 
 process.stdout.write(`${JSON.stringify({ success: true, sources: stats.sources, chunks: stats.chunks, maxRetrievedBytes: Math.max(performance.bytes, opportunity.bytes) })}\n`);

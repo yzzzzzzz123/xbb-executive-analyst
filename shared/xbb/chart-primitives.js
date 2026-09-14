@@ -1,5 +1,7 @@
 "use strict";
 
+const { normalizeFinding } = require("../../skills/xbb-executive-chart/scripts/chart-findings.js");
+
 const WIDTH = 900;
 const LEFT = 48;
 const RIGHT = 852;
@@ -23,16 +25,20 @@ function visualWidth(value) {
 function wrap(value, pixels, size) {
   const result = [];
   for (const paragraph of String(value ?? "").split(/\r?\n/)) {
-    let row = "";
-    for (const c of paragraph) {
-      if (row && visualWidth(row + c) * size / 2 > pixels) {
-        if (/[，。；：！？、）》】」』%]/u.test(c) && [...row].length > 1) {
-          const characters = [...row]; row = characters.pop(); result.push(characters.join(""));
-        } else { result.push(row); row = ""; }
+    let row = [];
+    // Keep evidence identities and numeric values with their signs, decimals
+    // and units intact. A percentage split over lines is easy to misread.
+    const tokens = paragraph.match(/「[^」]+」|约?[+-]?\d[\d,]*(?:\.\d+)?(?:e[+-]?\d+)?(?:[%％]|[万亿元人天单条]+)?|[A-Za-z]+|./gu) || [];
+    const pieces = tokens.flatMap((token) => visualWidth(token) * size / 2 > pixels ? [...token] : [token]);
+    for (const token of pieces) {
+      if (row.length && visualWidth(row.join("") + token) * size / 2 > pixels) {
+        if (/^[，。；：！？、）》】」』%]$/u.test(token) && row.length > 1) {
+          const last = row.pop(); result.push(row.join("")); row = [last];
+        } else { result.push(row.join("")); row = []; }
       }
-      row += c;
+      row.push(token);
     }
-    result.push(row);
+    result.push(row.join(""));
   }
   return result;
 }
@@ -73,38 +79,54 @@ function contrastText(hex) {
   const [r, g, b] = hex.slice(1).match(/../g).map((v) => parseInt(v, 16) / 255).map((v) => v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
   return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.179 ? "#000000" : "#FFFFFF";
 }
-function headerLayout(spec) {
+function headerLayout(spec, options = {}) {
   const titleRows = wrap(spec.title, RIGHT - LEFT, 36);
-  const subtitleRows = spec.subtitle ? wrap(spec.subtitle, RIGHT - LEFT, 19) : [];
-  const titleY = 106;
+  const subtitleRows = spec.subtitle ? wrap(spec.subtitle, RIGHT - LEFT, 24) : [];
+  const titleY = options.section ? 100 : 106;
   const subtitleY = titleY + (titleRows.length - 1) * 48 + 34;
-  const insightY = subtitleY + subtitleRows.length * 28 + 50;
-  const insightRows = wrap(spec.insight, RIGHT - LEFT - 32, 30);
-  const bottom = insightY + (insightRows.length - 1) * 44 + 44;
-  return { titleRows, subtitleRows, titleY, subtitleY, insightY, insightRows, bottom };
+  const bottom = subtitleY + subtitleRows.length * 33 + 24;
+  return { titleRows, subtitleRows, titleY, subtitleY, bottom, ...options };
+}
+function findingAnnotations(spec, top) {
+  const findings = spec.findings || (spec.finding ? [spec.finding] : []);
+  if (!findings.length) return { markup: "", bottom: top };
+  const markup = [line(LEFT, top, RIGHT, top, { color: "#C8D8D7" })];
+  let y = top + 42;
+  findings.forEach((finding, index) => {
+    // Only recomputed evidence references may become visible prose. Never read
+    // insight, and do not publish a compatibility overview as a discovery.
+    const fact = normalizeFinding(finding, spec).insight;
+    const rows = wrap(fact, RIGHT - LEFT - 50, 28);
+    const label = String.fromCharCode(65 + index);
+    markup.push(`<g data-finding="${index + 1}" aria-label="${escapeXml(fact)}">`,
+      rect(LEFT, y - 23, 30, 30, index === 0 ? ACCENT : "#E2EEEB", 4),
+      text(LEFT + 15, y, label, { size: 22, anchor: "middle", weight: 700, fill: index === 0 ? "#FFFFFF" : ACCENT }),
+      lines(LEFT + 48, y, rows, { size: 28, weight: index === 0 ? 600 : 400, leading: 40 }), "</g>");
+    y += rows.length * 40 + 18;
+  });
+  return { markup: markup.join(""), bottom: y - 12 };
 }
 function chartFrame(spec, marks, header, bodyBottom, detail = "") {
-  const noteRows = spec.note ? wrap(spec.note, RIGHT - LEFT, 19) : [];
-  const footerY = Math.max(700, bodyBottom + 36);
-  const height = footerY + 76 + noteRows.length * 28;
+  const annotations = findingAnnotations(spec, bodyBottom + 34);
+  const noteRows = spec.note ? wrap(`口径：${spec.note}`, RIGHT - LEFT, 24) : [];
+  const footerY = annotations.bottom + 22;
+  const noteY = footerY + (header.section ? 12 : 70);
+  const height = noteY + noteRows.length * 34 + 24;
   const kinds = { bar: "类别比较", "stacked-bar": "结构比较", line: "时间趋势", donut: "整体构成", scatter: "指标关系", funnel: "阶段转化" };
-  const desc = [spec.title, spec.subtitle, spec.insight, spec.note, detail].filter(Boolean).join("；");
+  const desc = [spec.title, spec.subtitle, ...(spec.findings || []).map((finding) => normalizeFinding(finding, spec).insight), spec.note, detail].filter(Boolean).join("；");
   return `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${height}" viewBox="0 0 ${WIDTH} ${height}" role="img" aria-labelledby="chart-title chart-desc" data-renderer="executive-v3">
+<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${height}" viewBox="0 0 ${WIDTH} ${height}" role="img" aria-labelledby="chart-title chart-desc" data-renderer="executive-v4">
 <title id="chart-title">${escapeXml(spec.title)}</title><desc id="chart-desc">${escapeXml(desc)}</desc>
-${rect(0, 0, WIDTH, height, "#FAFCFA")}${rect(LEFT, 0, 62, 7, ACCENT)}
+${rect(0, 0, WIDTH, height, "#FAFCFA")}${header.section ? line(LEFT, 0, RIGHT, 0, { color: "#B9D1CF", width: 2 }) : rect(LEFT, 0, 62, 7, ACCENT)}
 <g font-family="${FONT}" style="font-variant-numeric:tabular-nums">
-${text(LEFT, 48, "XBB / 经营洞察", { size: 18, weight: 700, fill: ACCENT })}
-${text(RIGHT, 48, kinds[spec.type] || "经营分析", { size: 17, fill: MUTED, anchor: "end" })}
+${text(LEFT, 46, header.section ? `${String(header.section).padStart(2, "0")} / ${kinds[spec.type]}` : "XBB / 经营洞察", { size: 24, weight: 700, fill: ACCENT })}
+${header.section ? "" : text(RIGHT, 46, kinds[spec.type] || "经营分析", { size: 22, fill: MUTED, anchor: "end" })}
 ${lines(LEFT, header.titleY, header.titleRows, { size: 36, weight: 700, leading: 48 })}
-${lines(LEFT, header.subtitleY, header.subtitleRows, { size: 19, fill: MUTED, leading: 28 })}
-${text(LEFT, header.insightY - 42, "关键发现", { size: 17, fill: ACCENT, weight: 700 })}
-${rect(LEFT, header.insightY - 25, 4, header.insightRows.length * 44 - 6, ACCENT, 2)}
-${lines(LEFT + 20, header.insightY, header.insightRows, { size: 30, weight: 650, leading: 44 })}
+${lines(LEFT, header.subtitleY, header.subtitleRows, { size: 24, fill: MUTED, leading: 33 })}
 ${marks}
-${line(LEFT, footerY, RIGHT, footerY)}
-${text(LEFT, footerY + 34, "数据来源 / 销帮帮实时只读数据", { size: 18, fill: MUTED })}
-${lines(LEFT, footerY + 65, noteRows, { size: 19, fill: MUTED, leading: 28 })}
+${annotations.markup}
+${header.section ? "" : line(LEFT, footerY, RIGHT, footerY) + text(LEFT, footerY + 35, "数据来源 / 销帮帮实时只读数据", { size: 22, fill: MUTED })}
+${lines(LEFT, noteY, noteRows, { size: 24, fill: MUTED, leading: 34 })}
 </g></svg>`;
 }
 module.exports = { WIDTH, LEFT, RIGHT, INK, MUTED, ACCENT, PALETTE, FONT, escapeXml, round, visualWidth, wrap, text, lines, rect, line, number, formatValue, percentage, sum, contrastText, headerLayout, chartFrame };

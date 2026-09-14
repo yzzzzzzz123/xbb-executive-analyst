@@ -77,13 +77,13 @@ function frame(index, userId = "unknown") {
   const replies = [];
   const client = { replyStream: async (_frame, _stream, content, finish, items) => { replies.push({ content, finish, items }); } };
   await Promise.all(Array.from({ length: 500 }, (_, index) => handler.handleMessage(frame(index), client)));
-  assert.equal(emergencyBuilds, 1, "safe emergency image must be prebuilt once");
+  assert.equal(emergencyBuilds, 0, "no placeholder image may be built");
   assert.equal(answerRenders, 0, "denied flood must not invoke the answer renderer");
   assert.equal(agentCalls, 0);
   assert.ok(deniedStore.messages.size <= deniedStore.maxEntries);
   assert.ok(deniedStore.totalBytes <= deniedStore.maxBytes);
   assert.equal(replies.length, 500);
-  assert.equal(replies.every((reply) => reply.finish === true && reply.items?.[0] === emergencyItem), true);
+  assert.equal(replies.every((reply) => reply.finish === true && reply.items?.length === 0), true);
 
   const handoffStore = new MessageStore({ maxEntries: 256, maxBytes: 2 * 1024 * 1024 });
   let handoffEmergencyBuilds = 0;
@@ -123,11 +123,11 @@ function frame(index, userId = "unknown") {
   const handoffCount = 200;
   await Promise.all(Array.from({ length: handoffCount }, (_, index) => handoffHandler.handleMessage(frame(`handoff-${index}`, "boss"), handoffClient)));
   const handoffFinals = handoffReplies.filter((reply) => reply.finish);
-  assert.equal(handoffEmergencyBuilds, 1);
+  assert.equal(handoffEmergencyBuilds, 0);
   assert.equal(handoffAnswerRenders, 0, "authorized handoff flood must not invoke Sharp summary rendering");
   assert.equal(handoffChartRenders, 0);
   assert.equal(handoffFinals.length, handoffCount);
-  assert.equal(handoffFinals.every((reply) => reply.items?.[0] === emergencyItem), true);
+  assert.equal(handoffFinals.every((reply) => reply.items?.length === 0), true);
 
   const routeReplies = [];
   const routeMemoryHandler = createLongConnectionHandler({
@@ -151,15 +151,11 @@ function frame(index, userId = "unknown") {
   const retainedCContinue = frame("route-c-continue", "route-c");
   retainedCContinue.body.text.content = "继续";
   await routeMemoryHandler.handleMessage(retainedCContinue, routeClient);
-  assert.equal(routeReplies[2].items?.[0], emergencyItem, "拒绝后的追问应继承最近的 XBB 路由");
+  assert.deepEqual(routeReplies[2].items, [], "拒绝追问只发送文字");
   assert.deepEqual(routeReplies[4].items, [], "路由记忆达到上限后应按 LRU 淘汰");
-  assert.equal(routeReplies[5].items?.[0], emergencyItem, "未被淘汰的拒绝路由仍应附应急图");
+  assert.deepEqual(routeReplies[5].items, [], "仍在路由记忆中的拒绝追问也不能生成状态图片");
 
-  assert.throws(() => createLongConnectionHandler({
-    policy: { schemaVersion: "1.0", users: {} },
-    agent: { answer: async () => "unused" },
-    emergencyImageFactory: () => ({ item: { msgtype: "image", image: {} } })
-  }), /有效的企业微信图片项/);
+
   assert.throws(() => createLongConnectionHandler({
     policy: { schemaVersion: "1.0", users: {} },
     agent: { answer: async () => "unused" },
@@ -181,8 +177,8 @@ function frame(index, userId = "unknown") {
   const groupMedia = [];
   const groupHandler = createLongConnectionHandler({
     policy: { schemaVersion: "1.0", users: { boss: { scope: "all" } } },
-    agent: { answer: async () => ({ answer: "集团本月经营结论。", chart: null, routeMode: "xbb" }) },
-    answerRenderer: async () => ({ buffer: Buffer.from("summary"), item: emergencyItem }),
+    agent: { answer: async () => ({ answer: "集团本月经营结论。", chart: { type: "bar" }, routeMode: "xbb" }) },
+    chartRenderer: async () => ({ buffer: Buffer.from("summary"), item: emergencyItem }),
     emergencyImageFactory: () => ({ buffer: Buffer.from("safe"), item: emergencyItem })
   });
   const groupClient = {

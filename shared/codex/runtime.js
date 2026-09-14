@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-function sanitizeCodexEnvironment(source = process.env) {
+function sanitizeCodexEnvironment(source = process.env, config = {}) {
   const allowed = [
     "APPDATA", "CODEX_HOME", "ComSpec", "HOMEDRIVE", "HOMEPATH", "LANG", "LC_ALL",
     "LOCALAPPDATA", "NUMBER_OF_PROCESSORS", "OS", "Path", "PATH", "PATHEXT",
@@ -20,6 +20,19 @@ function sanitizeCodexEnvironment(source = process.env) {
   const result = {};
   for (const key of allowed) {
     if (typeof source[key] === "string" && source[key] !== "") result[key] = source[key];
+  }
+  if (config.codexProxyUrl) {
+    let proxy;
+    try { proxy = new URL(config.codexProxyUrl); } catch { throw new Error("Codex 独立代理必须是本机 HTTP/HTTPS 代理地址。"); }
+    if (!["http:", "https:"].includes(proxy.protocol) ||
+        !["localhost", "127.0.0.1", "[::1]"].includes(proxy.hostname) ||
+        proxy.username || proxy.password || proxy.pathname !== "/" || proxy.search || proxy.hash) {
+      throw new Error("Codex 独立代理必须是无凭据、无路径的本机 HTTP/HTTPS 代理地址。");
+    }
+    // 计划任务可能继承旧代理；显式配置必须同时覆盖大小写变量，且仅作用于模型子进程。
+    for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
+      result[key] = proxy.origin;
+    }
   }
   return result;
 }
@@ -52,7 +65,7 @@ function resolveCodexInvocation(config = {}, options = {}) {
 function runCodexMetadataCommand(invocation, args, options = {}) {
   const result = (options.spawnSync || childProcess.spawnSync)(invocation.command, [...invocation.argsPrefix, ...args], {
     encoding: "utf8",
-    env: sanitizeCodexEnvironment(options.env || process.env),
+    env: sanitizeCodexEnvironment(options.env || process.env, options),
     windowsHide: true,
     timeout: 15000
   });
@@ -62,7 +75,7 @@ function runCodexMetadataCommand(invocation, args, options = {}) {
 
 function verifyCodexChatGptLogin(config = {}, options = {}) {
   const invocation = options.invocation || resolveCodexInvocation(config, options);
-  const statusText = runCodexMetadataCommand(invocation, ["login", "status"], options);
+  const statusText = runCodexMetadataCommand(invocation, ["login", "status"], { ...options, codexProxyUrl: config.codexProxyUrl });
   if (!/Logged in using ChatGPT/i.test(statusText)) {
     throw new Error("本机 Codex 当前不是 ChatGPT 登录模式；本机器人不读取独立模型 API Key。");
   }
@@ -71,7 +84,7 @@ function verifyCodexChatGptLogin(config = {}, options = {}) {
 
 function readCodexVersion(config = {}, options = {}) {
   const invocation = options.invocation || resolveCodexInvocation(config, options);
-  const text = runCodexMetadataCommand(invocation, ["--version"], options);
+  const text = runCodexMetadataCommand(invocation, ["--version"], { ...options, codexProxyUrl: config.codexProxyUrl });
   const match = text.match(/codex-cli\s+([^\s]+)/i);
   if (!match) throw new Error("无法识别本机 Codex 版本。");
   return match[1];

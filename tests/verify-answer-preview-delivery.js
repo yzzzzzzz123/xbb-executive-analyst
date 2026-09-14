@@ -9,7 +9,6 @@ const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const pending = () => { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; };
 const keepAlive = setInterval(() => {}, 1000);
-const syntheticImage = { msgtype: "image", image: { base64: "synthetic-preview-only", md5: "synthetic-preview-only" } };
 function fixture(id, answer, options = {}) {
   const replies = [];
   const statuses = [];
@@ -17,7 +16,6 @@ function fixture(id, answer, options = {}) {
   const handler = createLongConnectionHandler({
     policy: { schemaVersion: "1.0", users: { "synthetic-preview-user": { scope: "all" } } },
     agent: { answer }, messageStore: store, statusWriter: (event) => statuses.push(safeStatus(event)),
-    emergencyImageFactory: () => syntheticImage, answerRenderer: async () => syntheticImage,
     heartbeatMs: 8, answerPreviewIntervalMs: 5, replyBudgetMs: 200, progressDrainBudgetMs: 20,
     ...options
   });
@@ -161,7 +159,7 @@ function previews(replies) { return replies.filter((reply) => reply.content.star
   business.frame.body.text.content = "集团2026年8月业绩";
   await business.handler.handleMessage(business.frame, business.client);
   assert.equal(previews(business.replies).length, 0);
-  assert.equal(business.replies.at(-1).items.length, 1);
+  assert.equal(business.replies.at(-1).items.length, 0, "无合格图表时仅回复文字，不能补发摘要图片");
 
   const capped = fixture("cap", async ({ onAnswerPreview }) => {
     for (let index = 0; index < 20; index += 1) {
@@ -193,5 +191,53 @@ function previews(replies) { return replies.filter((reply) => reply.content.star
   await invalid.handler.handleMessage(invalid.frame, invalid.client);
   assert.equal(previews(invalid.replies).length, 0);
   assert.equal(Object.hasOwn(invalid.statuses.at(-1).timings, "answerPreviewVisibleMs"), false);
-  console.log(JSON.stringify({ success: true, synthetic: true, scenarios: 11, realMessagesSent: 0 }));
+  // Long synthetic analysis exercises transport preservation, not model quality.
+  const fullAnswer = [
+    "离线虚构验收。总体：公司甲100元、公司乙80元，合计180元。",
+    "趋势：缺少连续时间点，无法确认增减。",
+    "排名：公司甲领先20元；缺少目标，不能判断目标达成。",
+    "口径：上述均为离线测试数字。".repeat(180)
+  ].join("\n\n");
+  const chartItem = { msgtype: "image", image: { base64: "c3ludGhldGlj", md5: "test-only" } };
+  for (const mode of ["text", "standalone", "inline", "render-failed"]) {
+    const events = [];
+    const result = fixture(`required-text-${mode}`, async () => ({
+      answer: fullAnswer, chart: mode === "text" ? null : { type: "bar" }, routeMode: mode === "text" ? "general" : "xbb"
+    }), { chartRenderer: async () => {
+      events.push("render");
+      assert.ok(result.replies.some((reply) => reply.content.startsWith(fullAnswer) && !reply.finish),
+        "完整文字必须在制作图片前发送");
+      if (mode === "render-failed") throw new Error("synthetic rendering failure");
+      return { item: chartItem, buffer: Buffer.from("synthetic image") };
+    }, retryWait: async () => {} });
+    if (mode !== "text") result.frame.body.text.content = "总体业绩、趋势与公司排名";
+    if (mode === "standalone") {
+      result.client.uploadMedia = async () => ({ media_id: "synthetic-image" });
+      result.client.sendMediaMessage = async () => { events.push("media"); };
+    }
+    await result.handler.handleMessage(result.frame, result.client);
+    const finalReply = result.replies.at(-1);
+    assert.equal(finalReply.finish, true);
+    if (mode === "render-failed") {
+      assert.ok(finalReply.content.startsWith(fullAnswer));
+      assert.match(finalReply.content, /图表暂未生成/);
+    } else assert.equal(finalReply.content, fullAnswer, `${mode} 必须保留完整多段正文`);
+    assert.deepEqual(finalReply.items, mode === "inline" ? [chartItem] : []);
+    if (mode === "standalone") assert.deepEqual(events, ["render", "media"]);
+    if (mode === "text") assert.deepEqual(events, []);
+    await result.handler.handleMessage(result.frame, result.client);
+    assert.equal(result.replies.at(-1).content, finalReply.content, "重复投递仍保留完整正文");
+    assert.deepEqual(result.replies.at(-1).items, ["inline", "standalone"].includes(mode) ? [chartItem] : []);
+  }
+  for (const answer of [undefined, " \n", { invalid: true }]) {
+    const missing = fixture("missing-text", async () => ({ answer, chart: { type: "bar" } }), {
+      chartRenderer: async () => { throw new Error("空正文不得进入制图发送流程"); }
+    });
+    await missing.handler.handleMessage(missing.frame, missing.client);
+    assert.equal(missing.replies.at(-1).finish, true);
+    assert.ok(missing.replies.at(-1).content.trim(), "异常也必须给出文字状态");
+    assert.deepEqual(missing.replies.at(-1).items, []);
+    assert.equal(missing.statuses.at(-1).outcome, "failed", "不能把只有图片的结果标为成功");
+  }
+  console.log(JSON.stringify({ success: true, synthetic: true, scenarios: 18, realMessagesSent: 0 }));
 })().catch((error) => { console.error(error); process.exitCode = 1; }).finally(() => clearInterval(keepAlive));

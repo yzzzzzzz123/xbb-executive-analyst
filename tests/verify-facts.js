@@ -725,7 +725,7 @@ async function main() {
   assert.equal(QUERY_XBB_INPUT_SCHEMA.properties.months.maxItems, 120);
   assert.throws(() => buildMultiPeriodFactPack(Array.from({ length: 121 }, () => pack)), /120/);
   const runnerSource = fs.readFileSync(path.join(__dirname, "..", "skills", "xbb-executive-analyst", "scripts", "query-xbb.ps1"), "utf8");
-  assert.match(runnerSource, /source-v6-\$tenantFingerprint-/);
+  assert.match(runnerSource, /source-v7-\$tenantFingerprint-\$demandKey-/);
   assert.match(runnerSource, /baseUrl[\s\S]+corpid[\s\S]+tenantFingerprint/);
   assert.match(runnerSource, /\[string\]\$IsolationToken/);
   assert.match(runnerSource, /run-\$IsolationToken/);

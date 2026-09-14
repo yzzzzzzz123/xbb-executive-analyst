@@ -14,6 +14,8 @@ const SUITES = Object.freeze({
     "verify-task-checkpoint.js",
     "verify-answer-preview.js",
     "verify-chart-findings.js",
+    "verify-chart-agent.js",
+    "verify-data-demand.js",
     "verify-delivery-deadline.js",
     "verify-live-benchmark-contract.js",
     "verify-runtime-observation.js",

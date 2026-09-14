@@ -7,7 +7,7 @@ const { CHART_SCHEMA, validateSpec } = require("../skills/xbb-executive-chart/sc
 const { GENERAL_RESPONSE_SCHEMA, WECOM_RESPONSE_SCHEMA, parseAgentResponse } = require("../shared/codex/response-contract.js");
 const { render } = require("../shared/xbb/render-chart.js");
 const { createWecomAnswerImage, createWecomChartItem, createWecomEmergencyImage, renderAnswerSvg } = require("../shared/wecom/chart-image.js");
-const { PALETTE, contrastText, formatValue } = require("../shared/xbb/chart-primitives.js");
+const { PALETTE, contrastText, formatValue, wrap } = require("../shared/xbb/chart-primitives.js");
 
 const common = (type, title, insight) => ({ type, title, subtitle: "2026年9月｜集团｜截至实时刷新时间", insight, note: "" });
 const specs = [
@@ -83,7 +83,7 @@ function assertSupportedOutputSchema(schema, path = "$") {
 (async () => {
   assertSupportedOutputSchema(WECOM_RESPONSE_SCHEMA);
   assertSupportedOutputSchema(GENERAL_RESPONSE_SCHEMA);
-  assert.equal(CHART_SCHEMA.anyOf.length, 6);
+  assert.equal(CHART_SCHEMA.anyOf.length, 7);
   for (const variant of CHART_SCHEMA.anyOf) {
     assert.equal(variant.type, "object");
     assert.equal(variant.additionalProperties, false);
@@ -101,10 +101,10 @@ function assertSupportedOutputSchema(schema, path = "$") {
     assert.match(svg, /^<\?xml version="1\.0" encoding="UTF-8"\?>/);
     assert.match(svg, /<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
     assert.match(svg, new RegExp(spec.title));
-    assert.match(svg, /兼容概述/);
+    assert.doesNotMatch(svg, /兼容概述/);
     assert.equal(normalized.finding, null);
     assert.notEqual(normalized.insight, spec.insight, "历史自由洞察不能未经计算原样发布");
-    assert.match(svg, /关键发现/);
+    assert.doesNotMatch(svg, /关键发现/);
     assert.doesNotMatch(svg, /<(?:script|foreignObject)\b|\b(?:href|xlink:href)\s*=/i);
     assert.doesNotMatch(svg.replace('xmlns="http://www.w3.org/2000/svg"', ""), /https?:\/\//i);
     assert.ok(Buffer.byteLength(svg, "utf8") > 1500);
@@ -118,6 +118,16 @@ function assertSupportedOutputSchema(schema, path = "$") {
   const parsed = parseAgentResponse(JSON.stringify({ answer: " 真实结论。 ", chart: specs[0] }));
   assert.equal(parsed.chart.insight, validateSpec(specs[0]).insight);
   assert.ok(Object.isFrozen(parsed.chart));
+  assert.equal(parsed.answer, "真实结论。");
+  for (const chart of [null, specs[0]]) {
+    for (const answer of [undefined, null, "", "  \n\t", 42, {}, ["文字"], "<think>仅有内部思考</think>"]) {
+      assert.throws(() => parseAgentResponse(JSON.stringify({ answer, chart })), /缺少/,
+        "有图和无图都必须拒绝缺失、空白或非文字正文");
+    }
+    const fullAnswer = ["总体：本轮确认的结果与范围。", "趋势：按同一口径比较期间变化。", "排名：说明领先对象、差距与判断依据。", "限制：未取得目标，不判断目标达成。"].join("\n\n");
+    assert.equal(parseAgentResponse(JSON.stringify({ answer: fullAnswer, chart })).answer, fullAnswer,
+      "解析有图答复时不得缩短或丢弃任何文字分析维度");
+  }
 
   const longTextChart = {
     ...specs[0],
@@ -125,7 +135,7 @@ function assertSupportedOutputSchema(schema, path = "$") {
     note: "口".repeat(170)
   };
   const longTextParsed = parseAgentResponse(JSON.stringify({ answer: "长字段仍保留文字结论。", chart: longTextChart }));
-  assert.match(longTextParsed.chart.insight, /^兼容概述/u);
+  assert.doesNotMatch(longTextParsed.chart.insight, /兼容概述|图内计算/u);
   assert.doesNotMatch(longTextParsed.chart.insight, /🔎/u);
   assert.equal(Array.from(longTextParsed.chart.note).length, 170);
 
@@ -174,7 +184,7 @@ function assertSupportedOutputSchema(schema, path = "$") {
     centerLabel: "收入占比"
   };
   const percentSvg = render(percentDonut);
-  assert.equal((percentSvg.match(/<text\b[^>]*>[^<]*70%/g) || []).length, 3, "洞察、重点数值、明细各一份；不得重复拼接百分比");
+  assert.equal((percentSvg.match(/<text\b[^>]*>[^<]*70%/g) || []).length, 1, "数值仅在图例中一份，不增加概括文字");
   assert.doesNotMatch(percentSvg, /70% · 70%/);
 
   const percentStack = {
@@ -254,7 +264,9 @@ function assertSupportedOutputSchema(schema, path = "$") {
     .map((match) => ({ x: Number(match[1]), y: Number(match[2]), radius: Number(match[3]) }));
   assert.equal(bubbles.length, 2);
   assert.ok(bubbles.every((bubble) => bubble.x - bubble.radius >= 137 && bubble.x + bubble.radius <= 814));
-  assert.ok(bubbles.every((bubble) => bubble.y - bubble.radius >= 300 && bubble.y + bubble.radius <= 760));
+  const verticalGrid = [...boundaryScatter.matchAll(/<line x1="([\d.]+)" y1="([\d.]+)" x2="\1" y2="([\d.]+)"/g)].filter((m) => Number(m[3]) > Number(m[2]) + 300);
+  assert.ok(verticalGrid.length > 0);
+  assert.ok(bubbles.every((bubble) => bubble.y - bubble.radius >= Number(verticalGrid[0][2]) && bubble.y + bubble.radius <= Number(verticalGrid[0][3])));
 
   for (const spec of specs) {
     assert.equal(validateSpec(spec).focus, null, "旧规格仍可用");
@@ -273,11 +285,11 @@ function assertSupportedOutputSchema(schema, path = "$") {
   }
   const focusedBar = render({ ...specs[0], focus: null, finding: { relation: "difference",
     subject: { series: "回款", category: specs[0].categories[3], axis: "value" }, baseline: { series: "回款", category: specs[0].categories[0], axis: "value" } } });
-  assert.match(focusedBar, /距最高差 ¥77万/);
+  assert.doesNotMatch(focusedBar, /距最高差/);
   assert.match(focusedBar, /fill="#087F8C" data-value="510000" data-baseline="0"/);
   const percentLine = render({ ...specs[2], categories: ["一月", "二月", "三月", "四月"], series: [{ name: "完成率", values: [40, 50, 55, 70] }], valueFormat: "percent", unit: "", focus: null,
     finding: { relation: "period-change", subject: { series: "完成率", category: "三月", axis: "value" }, baseline: { series: "完成率", category: "二月", axis: "value" } } });
-  assert.match(percentLine, /\+5 个百分点/);
+  assert.doesNotMatch(percentLine, /较 二月|关键发现/);
   assert.match(percentLine, /峰值 70%/);
 
   const preciseMoneyLine = render({ ...specs[2], categories: ["一月", "二月", "三月", "四月"], series: [{ name: "回款", values: [100000000, 100000020, 100000050, 100000100] }], valueFormat: "money", unit: "" });
@@ -300,6 +312,12 @@ function assertSupportedOutputSchema(schema, path = "$") {
   assert.doesNotMatch(longCenter, />收入构成<\/text>/);
   assert.match(longCenter, />合计<\/text>/);
   assert.ok(formatValue(0.0001, "money").includes("1.0e-4"), "真实小数不能被写成零");
+  const wrappedEvidence = wrap("从「回款·7月」到「回款·8月」减少11万元，变化率约-7.746%。", 756, 28);
+  assert.ok(wrappedEvidence.some((row) => row.includes("约-7.746%")), "带符号百分数不得跨行拆分");
+  assert.ok(wrappedEvidence.some((row) => row.includes("「回款·8月」")), "数据引用标签不得拆成不完整身份");
+  const mtdLine = render({ ...specs[2], categories: ["7月", "8月", "9月MTD"], series: [{ name: "业绩", values: [142, 131, 56] }] });
+  assert.match(mtdLine, /stroke-dasharray="8 7" data-partial-period="true"/u);
+  assert.match(mtdLine, /MTD 56万/u);
 
   const longSummary = renderAnswerSvg(Array.from({ length: 30 }, (_, i) => `第${i + 1}项：已核对文字答复中的内容。`).join("\n"));
   const summaryHeight = Number(longSummary.match(/<svg[^>]*height="(\d+)"/)[1]);
@@ -326,7 +344,35 @@ function assertSupportedOutputSchema(schema, path = "$") {
   assert.doesNotMatch(escapedSvg, /<script>/i);
   assert.match(escapedSvg, /&lt;script&gt;/);
 
-  process.stdout.write(`${JSON.stringify({ success: true, chartTypes: specs.map((spec) => spec.type), schemaVariants: CHART_SCHEMA.anyOf.length, wecomPng: true, png: { width: metadata.width, height: metadata.height } })}\n`);
+  const composite = { type: "composite", title: "综合经营分析（离线虚构验收）", subtitle: "同范围的总体构成、趋势与公司比较", note: "虚构数据仅用于渲染验收", panels: [specs[3], specs[2], specs[0]] };
+  const normalizedComposite = validateSpec(composite);
+  assert.deepEqual(validateSpec(normalizedComposite), normalizedComposite);
+  assert.equal(parseAgentResponse(JSON.stringify({ answer: "多个维度的结论在文字中。", chart: composite })).chart.panels.length, 3);
+  const compositeSvg = render(composite);
+  for (const panel of composite.panels) assert.ok(compositeSvg.includes(panel.title));
+  assert.doesNotMatch(compositeSvg, /关键发现|兼容概述|图内计算|结论速览/);
+  const ids = [...compositeSvg.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]);
+  assert.equal(new Set(ids).size, ids.length, "子图可访问性 ID 必须唯一");
+  const compositeItem = await createWecomChartItem(composite);
+  const compositePng = Buffer.from(compositeItem.image.base64, "base64");
+  const compositeMetadata = await sharp(compositePng).metadata();
+  assert.ok(compositeMetadata.height > metadata.height * 2);
+  assert.ok(compositePng.length < 10 * 1024 * 1024);
+  assert.throws(() => validateSpec({ ...composite, panels: [specs[0]] }), /2–8/);
+  assert.throws(() => validateSpec({ ...composite, panels: Array(9).fill(specs[0]) }), /2–8/);
+  assert.throws(() => validateSpec({ ...composite, panels: [composite, specs[0]] }), /嵌套/);
+  assert.throws(() => validateSpec({ ...composite, panels: [specs[0], specs[0]] }), /不能重复/);
+  assert.throws(() => validateSpec({ ...composite, panels: [specs[0], { ...specs[0], title: "只换了标题" }] }), /不能复制/u);
+  const eightPanels = [...specs, { ...specs[0], title: "另一个月份的公司业绩", series: [{ name: "回款", values: [12, 9, 7, 5] }] },
+    { ...specs[2], title: "订单数量趋势", series: [{ name: "订单", values: [10, 20, 16, 30, 22, 34, 31, 40] }], unit: "单" }];
+  assert.equal(validateSpec({ ...composite, panels: eightPanels }).panels.length, 8);
+  const eightItem = await createWecomChartItem({ ...composite, panels: eightPanels });
+  const eightPng = Buffer.from(eightItem.image.base64, "base64");
+  assert.ok(eightPng.length < 10 * 1024 * 1024, "8个不同子图仍满足企微PNG字节限制");
+  const invalidComposite = { ...composite, panels: [specs[0], { ...specs[2], color: "red" }] };
+  assert.equal(parseAgentResponse(JSON.stringify({ answer: "保留完整文字", chart: invalidComposite })).chart, null);
+  if (process.env.XBB_CHART_PREVIEW_PATH) require("node:fs").writeFileSync(process.env.XBB_CHART_PREVIEW_PATH, compositePng);
+  process.stdout.write(`${JSON.stringify({ success: true, chartTypes: [...specs.map((spec) => spec.type), "composite"], schemaVariants: CHART_SCHEMA.anyOf.length, wecomPng: true, png: { width: metadata.width, height: metadata.height } })}\n`);
 })().catch((error) => {
   process.stderr.write(`${error.stack}\n`);
   process.exitCode = 1;

@@ -101,8 +101,8 @@ async function runDeliveryChecks() {
   await createLongConnectionHandler({ ...options, chartRenderer: () => new Promise(() => {}),
     statusWriter: (value) => renderStatuses.push(safeStatus(value))
   }).handleMessage(fixture("stalled-render"), { replyStream: async (_, __, content, finish, items) => { renderReplies.push({ content, finish, items }); } });
-  assert.match(renderReplies.at(-1).content, /改用结论速览图/);
-  assert.deepEqual(renderReplies.at(-1).items, [image.item]);
+  assert.match(renderReplies.at(-1).content, /图表暂未生成/);
+  assert.deepEqual(renderReplies.at(-1).items, [], "渲染超时只保留文字，不能用文字图片替代");
   assert.equal(renderStatuses.at(-1).outcome, "degraded");
 
   const failedStatuses = [];

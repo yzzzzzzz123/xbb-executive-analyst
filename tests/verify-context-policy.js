@@ -107,4 +107,31 @@ function verify() {
 }
 
 verify();
+const { routeSkill } = require("../shared/rag/skill-router.js");
+const multiQuestion = "今年公司的业绩怎么样？趋势是什么？其次哪个分公司业绩高？";
+const businessContext = updateTaskContext(null, multiQuestion, { mode: "xbb" });
+assert.match(businessContext.goal, /趋势是什么/);
+assert.match(businessContext.goal, /哪个分公司/);
+for (const question of ["图表呈现出来", "综合一点", "能否综合一点？"]) {
+  const route = routeSkill(question, "xbb");
+  assert.equal(route.mode, "xbb");
+  assert.equal(routeSkill(question, "general").mode, "general");
+  const continuation = isTaskContinuation(question, businessContext, "xbb", route.reason);
+  assert.equal(continuation, true);
+  assert.equal(updateTaskContext(businessContext, question, { mode: "xbb", continuation }).goal, businessContext.goal);
+}
+let chainedContext = updateTaskContext(null, "今年公司的业绩怎么样？", { mode: "xbb" });
+for (const question of ["趋势是什么？", "其次哪个分公司业绩好？"]) {
+  const route = routeSkill(question, "xbb");
+  assert.equal(route.mode, "xbb");
+  const continuation = isTaskContinuation(question, chainedContext, "xbb", route.reason);
+  assert.equal(continuation, true, "短趋势追问和其次公司问题必须承接原经营问题");
+  chainedContext = updateTaskContext(chainedContext, question, { mode: "xbb", continuation });
+}
+const chainSummary = formatTaskContext(chainedContext);
+for (const requested of ["今年公司的业绩", "趋势是什么", "哪个分公司业绩好"]) assert.ok(chainSummary.includes(requested));
+const middleCorrection = updateTaskContext(chainedContext, "另外看各公司差距。趋势要分别看完整月。还要给出头部集中度。", { mode: "xbb", continuation: true });
+assert.match(formatTaskContext(middleCorrection), /趋势要分别看完整月/u, "保留追问中间维度");
+assert.equal(routeSkill("趋势是什么？", "general").mode, "general");
+assert.equal(isTaskContinuation("新问题：今天开多少课？", chainedContext, "xbb"), false);
 process.stdout.write("context policy verification passed\n");

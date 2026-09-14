@@ -59,7 +59,7 @@ async function run() {
   assert.equal(analysisSignal.reason.code, "REQUEST_DEADLINE_EXCEEDED");
   assert.equal(replies.at(-1).finish, true);
   assert.match(replies.at(-1).content, /包含排队等待/);
-  assert.deepEqual(replies.at(-1).items, [image.item]);
+  assert.deepEqual(replies.at(-1).items, [], "超时仅发送文字，不生成状态图片");
   assert.equal(statuses.filter((status) => status.status === "request_measured").length, 1);
   const replyCount = replies.length;
   resolveLate({ answer: "不得补发的迟到结论", routeMode: "xbb", chart: { type: "bar" } });

@@ -148,7 +148,7 @@ class LocalAppServerHost {
     const command = buildAppServerCommand(invocation, endpoint, verifier);
     const child = (options.spawn || childProcess.spawn)(command.command, command.args, {
       cwd: config.projectRoot,
-      env: sanitizeCodexEnvironment(options.env || process.env),
+      env: sanitizeCodexEnvironment(options.env || process.env, config),
       windowsHide: true,
       stdio: ["ignore", "ignore", "pipe"]
     });

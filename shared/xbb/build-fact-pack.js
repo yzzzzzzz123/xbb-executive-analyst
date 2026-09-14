@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { assertNoSensitiveFactValues } = require("../security/fact-privacy.js");
+const { validateDateScope } = require("./fast-query-plan.js");
 
 const ALLOWED_DOMAINS = new Set([
   "performance",
@@ -467,7 +468,7 @@ function buildPerformance(source, products, company) {
   const other = total - course - consulting;
   return {
     definitions: {
-      amount: "仅汇总业绩订单 5614255 产品明细 array_4.num_5（售价小计），按签订日期 date_1 归月；没有产品明细的订单不使用合同金额替代",
+      amount: "仅汇总业绩订单 5614255 产品明细 array_4.num_5（售价小计），按签订日期 date_1 限定所选期间；没有产品明细的订单不使用合同金额替代",
       company: "业绩订单所属公司 text_63",
       mix: "只使用产品明细分类 array_4.text_10 区分课程、咨询和其他；分类缺失或无法归类时计入其他，不使用产品名称猜测"
     },
@@ -977,9 +978,21 @@ function normalizeDomains(value) {
 function buildFactPack(source, options = {}) {
   validateSource(source);
   const domains = normalizeDomains(options.domains || "all");
+  const date = validateDateScope(source.date, [source.month], domains, new Date(source.refreshedAt));
+  if (options.date !== undefined && options.date !== date) throw new Error("来源包日期与所请求的单日不一致，不能使用月累计代替。");
+  if (date) {
+    const start = Date.parse(`${date}T00:00:00+08:00`) / 1000;
+    const latestEnd = Math.min(start + 86400 - 1, Math.floor(Date.parse(source.refreshedAt) / 1000));
+    if (source.range?.start !== start || !Number.isInteger(source.range?.end) || source.range.end < start || source.range.end > latestEnd) {
+      throw new Error("来源包单日日期范围无效。");
+    }
+  }
   const products = productMap(source);
   const courseFacts = buildCourseFacts(source);
   const companyCandidates = collectCompanyCandidates(source, courseFacts);
+  if (source.resolvedScope?.company && !companyCandidates.some((candidate) => candidate.name === source.resolvedScope.company)) {
+    companyCandidates.push({ name: source.resolvedScope.company, recordCount: 0, domains });
+  }
   const personCandidates = collectPersonCandidates(source);
   const companyResolution = resolveEntity(options.company, companyCandidates, "company");
   const personResolution = resolveEntity(options.person, personCandidates, "person");
@@ -991,12 +1004,13 @@ function buildFactPack(source, options = {}) {
     status: needsChoice ? "needs_disambiguation" : "ready",
     scope: {
       month: source.month,
+      ...(date ? { date, currentDayPartial: source.range.end < Date.parse(`${date}T00:00:00+08:00`) / 1000 + 86400 - 1 } : {}),
       range: clone(source.range),
       refreshedAt: source.refreshedAt,
       domains,
       company: companyResolution.resolved ? companyResolution.resolved.name : null,
       person: personResolution.resolved ? clone(personResolution.resolved) : null,
-      currentMonthPartial: source.month === new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit" }).format(new Date()).slice(0, 7)
+      currentMonthPartial: !date && source.month === new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit" }).format(new Date()).slice(0, 7)
     },
     entityResolution: {
       company: companyResolution,
@@ -1016,7 +1030,7 @@ function buildFactPack(source, options = {}) {
     },
     facts: {},
     limitations: [
-      "结论仅覆盖所选月份及来源包刷新时点前的只读销帮帮记录。",
+      date ? "结论仅覆盖所选上海自然日及来源包刷新时点前的只读销帮帮记录。" : "结论仅覆盖所选月份及来源包刷新时点前的只读销帮帮记录。",
       "没有来源字段或关联主键支持的业务判断必须标记为无法确认，不能用模型推测补齐。"
     ]
   };
@@ -1067,7 +1081,7 @@ function readScopeRequestFromStdin() {
   let request;
   try { request = JSON.parse(raw.toString("utf8")); } catch (_) { throw new Error("stdin 查询范围不是有效 JSON"); }
   if (!request || typeof request !== "object" || Array.isArray(request)
-      || JSON.stringify(Object.keys(request).sort()) !== JSON.stringify(["company", "domains", "person"])) {
+      || JSON.stringify(Object.keys(request).filter((key) => key !== "date").sort()) !== JSON.stringify(["company", "domains", "person"])) {
     throw new Error("stdin 查询范围不符合精确 schema");
   }
   if (!Array.isArray(request.domains) || request.domains.some((value) => typeof value !== "string")
@@ -1077,6 +1091,7 @@ function readScopeRequestFromStdin() {
   }
   return {
     domains: request.domains.join(","),
+    ...(Object.hasOwn(request, "date") ? { date: request.date } : {}),
     company: request.company || undefined,
     person: request.person || undefined
   };

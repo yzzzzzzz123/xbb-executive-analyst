@@ -20,14 +20,14 @@ const HANDLER_BUDGETS = Object.freeze({
 });
 const SCENARIOS = Object.freeze([
   "general", "chart", "cache-replay", "denied", "agent-failure", "agent-timeout",
-  "render-upload-failure", "render-fallback-failure", "progress-upload-timeout",
+  "upload-failure", "render-failure", "progress-upload-timeout",
   "media-failure", "first-reply-timeout", "final-reply-timeout", "agent-never-settles", "cumulative-delivery-deadline"
 ]);
 const OUTCOMES = Object.freeze(["success", "degraded", "denied", "cancelled", "rejected", "failed", "timeout"]);
 const EXPECTED = Object.freeze({
   general: "success", chart: "success", "cache-replay": "success", denied: "denied",
-  "agent-failure": "failed", "agent-timeout": "timeout", "render-upload-failure": "degraded",
-  "render-fallback-failure": "degraded", "progress-upload-timeout": "degraded", "media-failure": "degraded",
+  "agent-failure": "failed", "agent-timeout": "timeout", "upload-failure": "degraded",
+  "render-failure": "degraded", "progress-upload-timeout": "degraded", "media-failure": "degraded",
   "first-reply-timeout": "timeout", "final-reply-timeout": "timeout", "agent-never-settles": "timeout", "cumulative-delivery-deadline": "degraded"
 });
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -145,15 +145,14 @@ async function runHandlerBatch(plan, config) {
         await new Promise((resolve) => setTimeout(resolve, 300));
         context().renderCompleted = true;
       }
-      if (["render-upload-failure", "render-fallback-failure"].includes(context().item.scenario)) {
+      if (context().item.scenario === "render-failure") {
         fault("chart-failure"); throw new Error("synthetic schema failure");
       }
       return image;
     },
     answerRenderer: async () => {
       context().fallbackRenders += 1;
-      if (context().item.scenario === "render-fallback-failure") { fault("fallback-failure"); throw new Error("synthetic schema failure"); }
-      return image;
+      throw new Error("text-only images must never be rendered");
     }
   });
   const client = {
@@ -171,7 +170,7 @@ async function runHandlerBatch(plan, config) {
     },
     async uploadMedia() {
       context().uploads += 1;
-      if (context().item.scenario === "render-upload-failure") { fault("upload-failure"); throw new Error("synthetic upload failure"); }
+      if (context().item.scenario === "upload-failure") { fault("upload-failure"); throw new Error("synthetic upload failure"); }
       if (["progress-upload-timeout", "cumulative-delivery-deadline"].includes(context().item.scenario)) { fault("upload-timeout"); return stall({ media_id: "synthetic-late" }); }
       return { media_id: "synthetic-media" };
     },
@@ -220,12 +219,15 @@ async function runHandlerBatch(plan, config) {
         && state.fallbackRenders === 0 && measured?.timings.uploadMs < HANDLER_BUDGETS.uploadBudgetMs
         && elapsedMs < HANDLER_BUDGETS.businessRequestBudgetMs * 2),
       replayDidNotRegenerate: !replay || (state.renders === 0 && state.fallbackRenders === 0 && state.uploads === 0 && state.mediaAttempts === 0),
-      imageContract: ["general", "first-reply-timeout", "final-reply-timeout"].includes(item.scenario)
-        || state.mediaDelivered === 1 || state.finalReplies.at(-1)?.imageCount === 1
+      noTextImageFallback: state.fallbackRenders === 0,
+      imageContract: ["first-reply-timeout", "final-reply-timeout"].includes(item.scenario)
+        || (["general", "denied", "agent-failure", "agent-timeout", "agent-never-settles", "render-failure"].includes(item.scenario)
+          ? state.mediaDelivered === 0 && state.finalReplies.at(-1)?.imageCount === 0
+          : state.mediaDelivered === 1 || state.finalReplies.at(-1)?.imageCount === 1)
     };
     const requiredFaults = {
-      "render-upload-failure": ["chart-failure", "upload-failure"],
-      "render-fallback-failure": ["chart-failure", "fallback-failure"],
+      "upload-failure": ["upload-failure"],
+      "render-failure": ["chart-failure"],
       "progress-upload-timeout": ["progress-timeout", "upload-timeout"],
       "media-failure": ["media-failure"], "agent-failure": ["agent-failure"], "agent-timeout": ["agent-timeout"],
       "first-reply-timeout": ["first-reply-timeout"], "final-reply-timeout": ["final-reply-timeout"],

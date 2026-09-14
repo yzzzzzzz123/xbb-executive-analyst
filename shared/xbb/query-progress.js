@@ -123,6 +123,7 @@ function formatGeneralAnalysisProgress() {
 
 function chartTypeLabel(type) {
   return ({
+    composite: "综合经营图",
     bar: "排名条形图",
     "stacked-bar": "结构堆叠图",
     line: "趋势折线图",

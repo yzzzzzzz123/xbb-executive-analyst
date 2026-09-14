@@ -21,6 +21,7 @@ const ALLOWED_LAYERS = {
   "chart-contract": new Set(),
 };
 const ALLOWED_PACKAGES = {
+  xbb: new Set(["sharp"]),
   codex: new Set(["ws"]),
   wecom: new Set(["@wecom/aibot-node-sdk", "sharp"]),
 };
@@ -33,6 +34,7 @@ const WECOM_XBB_MODULES = new Set([
   "shared/xbb/runner-isolation.js",
 ]);
 const CODEX_XBB_MODULES = new Set([
+  "shared/xbb/chart-preview.js",
   "shared/xbb/tool-gateway.js",
   "shared/xbb/runner-isolation.js",
   "shared/xbb/model-fact-view.js",

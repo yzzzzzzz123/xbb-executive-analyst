@@ -27,12 +27,8 @@ function legend(series, y) {
   }
   return { markup: marks.join(""), bottom: y + 36 };
 }
-function evidence(name, value, x, y, width = 350) {
-  const rows = wrap(name, width, 20);
-  return { markup: lines(x, y, rows, { size: 20, fill: MUTED, leading: 28 }) + text(x, y + rows.length * 28 + 15, value, { size: 43, weight: 700, fit: width }), bottom: y + rows.length * 28 + 38 };
-}
-function renderBar(spec) {
-  const header = headerLayout(spec);
+function renderBar(spec, options) {
+  const header = headerLayout(spec, options);
   const key = legend(spec.series, header.bottom + 12);
   const marks = [key.markup];
   const focus = focusIndices(spec);
@@ -43,8 +39,6 @@ function renderBar(spec) {
     const selected = index === focus.item;
     const labelRows = wrap(category, grouped ? RIGHT - LEFT - 30 : RIGHT - LEFT - 240, 26);
     let rowHeight = labelRows.length * 36 + (grouped ? spec.series.length * 49 + 22 : 55);
-    const showGap = selected && spec.focus && !grouped;
-    if (showGap) rowHeight += 35;
     if (selected) marks.push(rect(LEFT - 16, y - 30, RIGHT - LEFT + 32, rowHeight, "#EDF5F2", 12));
     marks.push(lines(LEFT, y, labelRows, { size: 26, weight: selected ? 700 : 500, leading: 36 }));
     if (!grouped) {
@@ -53,13 +47,7 @@ function renderBar(spec) {
       const barY = y + (labelRows.length - 1) * 36 + 21;
       marks.push(rect(LEFT, barY, RIGHT - LEFT, 15, TRACK, 3));
       marks.push(rect(LEFT, barY, (RIGHT - LEFT) * value / maximum, 15, selected ? ACCENT : CONTEXT, 3, ` data-value="${value}" data-baseline="0"`));
-      if (showGap) {
-        const sorted = [...spec.series[0].values].sort((a, b) => b - a);
-        const gap = value === sorted[0] ? value - sorted[1] : sorted[0] - value;
-        const gapValue = spec.valueFormat === "percent" ? `${formatValue(gap, "number")} 个百分点` : formatValue(gap, spec.valueFormat, spec.unit);
-        const caption = gap === 0 ? "并列最高" : value === sorted[0] ? `领先下一位 ${gapValue}` : `距最高差 ${gapValue}`;
-        marks.push(text(LEFT, barY + 47, caption, { size: 21, fill: ACCENT }));
-      }
+
     } else {
       spec.series.forEach((entry, si) => {
         const value = entry.values[index];
@@ -73,8 +61,8 @@ function renderBar(spec) {
   });
   return chartFrame(spec, marks.join(""), header, y - 20);
 }
-function renderStackedBar(spec) {
-  const header = headerLayout(spec);
+function renderStackedBar(spec, options) {
+  const header = headerLayout(spec, options);
   const key = legend(spec.series, header.bottom + 12);
   const marks = [key.markup];
   const totals = spec.categories.map((_, i) => sum(spec.series.map((s) => s.values[i])));
@@ -97,13 +85,7 @@ function renderStackedBar(spec) {
       if (spec.focus && i === focus.item && si === focus.series) marks.push(line(cursor, barY + 45, cursor + width, barY + 45, { color, width: 4 }));
       cursor += width;
     });
-    if (spec.focus && i === focus.item) {
-      const entry = spec.series[focus.series];
-      const description = `${entry.name} ${formatValue(entry.values[i], spec.valueFormat, spec.unit)}${spec.valueFormat === "percent" ? "" : ` · 占本项 ${percentage(entry.values[i], totals[i])}`}`;
-      const rows = wrap(description, RIGHT - LEFT, 21);
-      marks.push(lines(LEFT, barY + 77, rows, { size: 21, fill: ACCENT, leading: 29 }));
-      y = barY + 112 + (rows.length - 1) * 29;
-    } else y = barY + 83;
+    y = barY + 83;
   });
   return chartFrame(spec, marks.join(""), header, y - 20);
 }
@@ -163,20 +145,38 @@ function endpointLabels(entries, top, bottom) {
   if (overflow > 0) sorted.forEach((e) => { e.labelY -= overflow; });
   return sorted;
 }
-function renderLine(spec) {
-  const header = headerLayout(spec), focus = focusIndices(spec), selected = spec.series[focus.series];
-  const selectedValue = selected.values[focus.item];
-  const display = axisFormatter(spec.series.flatMap((s) => s.values), spec.valueFormat, spec.unit);
-  const metric = evidence(`${selected.name} / ${spec.categories[focus.item]}`, display(selectedValue), LEFT, header.bottom + 4);
-  const marks = [metric.markup];
-  if (focus.item > 0) {
-    const difference = selectedValue - selected.values[focus.item - 1];
-    if (!Number.isFinite(difference)) throw new Error("图表数值差额超出可渲染范围");
-    const sign = difference > 0 ? "+" : difference < 0 ? "−" : "";
-    const value = spec.valueFormat === "percent" ? `${sign}${formatValue(Math.abs(difference), "number")} 个百分点` : `${sign}${formatValue(Math.abs(difference), spec.valueFormat, spec.unit)}`;
-    const change = evidence(`较 ${spec.categories[focus.item - 1]}`, value, 493, header.bottom + 4, 359);
-    marks.push(change.markup); metric.bottom = Math.max(metric.bottom, change.bottom);
+function periodEvidence(spec, top) {
+  if (!spec.findings?.length) return { markup: "", bottom: top };
+  const marks = [text(LEFT, top + 27, "逐期数值", { size: 24, fill: MUTED, weight: 600 })];
+  const columns = spec.series.length === 1 ? 3 : 2;
+  const cellWidth = (RIGHT - LEFT) / columns;
+  let y = top + 62;
+  for (let start = 0; start < spec.categories.length; start += columns) {
+    const cells = spec.categories.slice(start, start + columns).map((category, offset) => {
+      const rows = wrap(category, cellWidth - 30, 25);
+      const entries = spec.series.flatMap((entry) => {
+        const value = entry.values[start + offset];
+        const exact = value !== 0 && Math.abs(value) < 0.000001 ? String(value) : value.toLocaleString("zh-CN", { maximumFractionDigits: 20 });
+        const label = `${spec.series.length > 1 ? `${entry.name} ` : ""}${spec.valueFormat === "money" ? "¥" : ""}${exact}${spec.valueFormat === "percent" ? "%" : spec.valueFormat === "money" ? "" : spec.unit}`;
+        return wrap(label, cellWidth - 30, 27);
+      });
+      return { x: LEFT + offset * cellWidth, rows, entries };
+    });
+    const height = Math.max(...cells.map((cell) => cell.rows.length * 34 + cell.entries.length * 36 + 24));
+    cells.forEach((cell) => {
+      marks.push(line(cell.x, y - 22, cell.x + cellWidth - 26, y - 22),
+        lines(cell.x, y + 8, cell.rows, { size: 25, fill: MUTED, leading: 34 }),
+        lines(cell.x, y + 10 + cell.rows.length * 34, cell.entries, { size: 27, weight: 650, leading: 36 }));
+    });
+    y += height;
   }
+  return { markup: marks.join(""), bottom: y - 16 };
+}
+function renderLine(spec, options) {
+  const header = headerLayout(spec, options), focus = focusIndices(spec), selected = spec.series[focus.series];
+  const display = axisFormatter(spec.series.flatMap((s) => s.values), spec.valueFormat, spec.unit);
+  const metric = { bottom: header.bottom };
+  const marks = [];
   const key = legend(spec.series, metric.bottom + 26); marks.push(key.markup);
   const top = key.bottom + 20, bottom = top + 320, left = 137, right = spec.series.length > 1 ? 642 : 806;
   const limits = domain(spec.series.flatMap((s) => s.values), spec.valueFormat);
@@ -188,8 +188,11 @@ function renderLine(spec) {
   const ends = [];
   spec.series.forEach((entry, si) => {
     const color = PALETTE[si];
-    const points = entry.values.map((v, i) => `${round(xAt(i))},${round(yAt(v))}`).join(" ");
-    marks.push(`<polyline points="${points}" fill="none" stroke="${color}" stroke-width="${si === focus.series ? 4.5 : 2.5}" stroke-linecap="round" stroke-linejoin="round"/>`);
+    const pointAt = (i) => `${round(xAt(i))},${round(yAt(entry.values[i]))}`;
+    const partial = (i) => /[Mm][Tt][Dd]|截至|未完月|月累计/u.test(spec.categories[i]);
+    if (spec.categories.some((_, i) => partial(i))) {
+      for (let i = 1; i < entry.values.length; i += 1) marks.push(`<polyline points="${pointAt(i - 1)} ${pointAt(i)}" fill="none" stroke="${color}" stroke-width="${si === focus.series ? 4.5 : 2.5}"${partial(i) || partial(i - 1) ? ' stroke-dasharray="8 7" data-partial-period="true"' : ""} stroke-linecap="round"/>`);
+    } else marks.push(`<polyline points="${entry.values.map((_, i) => pointAt(i)).join(" ")}" fill="none" stroke="${color}" stroke-width="${si === focus.series ? 4.5 : 2.5}" stroke-linecap="round" stroke-linejoin="round"/>`);
     entry.values.forEach((v, i) => {
       const active = si === focus.series && i === focus.item;
       if (active) marks.push(`<circle cx="${round(xAt(i))}" cy="${round(yAt(v))}" r="13" fill="#D5EBE7"/>`);
@@ -203,12 +206,15 @@ function renderLine(spec) {
     marks.push(text(right + 30, e.labelY + 22, display(e.value), { size: 23, weight: 700, fill: e.color, fit: RIGHT - right - 30 }));
   });
   else {
-    const peak = selected.values.indexOf(Math.max(...selected.values)), labels = [focus.item];
+    const peak = selected.values.indexOf(Math.max(...selected.values)), trough = selected.values.indexOf(Math.min(...selected.values)), labels = [focus.item];
     const hasVariation = new Set(selected.values).size > 1;
     if (hasVariation && peak !== focus.item) labels.push(peak);
+    if (hasVariation && spec.findings?.length && !/[Mm][Tt][Dd]|截至|未完月|月累计/u.test(spec.categories[trough]) && !labels.includes(trough)) labels.push(trough);
+    if (spec.findings?.length && !labels.includes(selected.values.length - 1)) labels.push(selected.values.length - 1);
     const boxes = [];
     labels.forEach((i) => {
-      const label = `${hasVariation && i === peak ? "峰值 " : ""}${display(selected.values[i])}`;
+      const partial = /[Mm][Tt][Dd]|截至|未完月|月累计/u.test(spec.categories[i]);
+      const label = `${partial ? "MTD " : hasVariation && i === peak ? "峰值 " : hasVariation && i === trough && spec.findings?.length ? "谷值 " : ""}${display(selected.values[i])}`;
       const width = visualWidth(label) * 11.5 + 24;
       const x = Math.max(left, Math.min(right - width, xAt(i) - width / 2));
       const candidates = [Math.max(top - 8, yAt(selected.values[i]) - 46), Math.min(bottom - 34, yAt(selected.values[i]) + 17), top - 8];
@@ -222,11 +228,13 @@ function renderLine(spec) {
   const ticks = tickIndices(spec.categories, right - left);
   ticks.forEach((i) => marks.push(lines(xAt(i), bottom + 33, wrap(spec.categories[i], 100, 19), { size: 19, fill: MUTED, anchor: "middle", leading: 26 })));
   const labelHeight = Math.max(...ticks.map((i) => wrap(spec.categories[i], 100, 19).length)) * 26;
-  return chartFrame(spec, marks.join(""), header, bottom + labelHeight + 20);
+  const evidence = periodEvidence(spec, bottom + labelHeight + 34);
+  marks.push(evidence.markup);
+  return chartFrame(spec, marks.join(""), header, evidence.bottom);
 }
-function renderDonut(spec) {
-  const header = headerLayout(spec), total = sum(spec.items.map((e) => e.value)), focus = focusIndices(spec), chosen = spec.items[focus.item];
-  const cy = header.bottom + 158, cx = 238, radius = 113, circumference = 2 * Math.PI * radius;
+function renderDonut(spec, options) {
+  const header = headerLayout(spec, options), total = sum(spec.items.map((e) => e.value)), focus = focusIndices(spec), chosen = spec.items[focus.item];
+  const cy = header.bottom + 158, cx = (LEFT + RIGHT) / 2, radius = 113, circumference = 2 * Math.PI * radius;
   const marks = []; let offset = 0;
   spec.items.forEach((entry, i) => {
     const length = circumference * entry.value / total;
@@ -239,11 +247,7 @@ function renderDonut(spec) {
   else {
     marks.push(text(cx, cy + 35, "合计", { size: 19, fill: MUTED, anchor: "middle" }));
   }
-  marks.push(text(443, cy - 57, spec.focus ? "关注构成" : "最大构成", { size: 19, fill: MUTED }));
-  const chosenRows = wrap(chosen.name, RIGHT - 443, 28);
-  marks.push(lines(443, cy - 15, chosenRows, { size: 28, weight: 600, leading: 38 }));
-  marks.push(text(443, cy + chosenRows.length * 38 + 22, spec.valueFormat === "percent" ? formatValue(chosen.value, "percent") : percentage(chosen.value, total), { size: 58, weight: 700, fill: PALETTE[focus.item], fit: 390 }));
-  let y = Math.max(cy + 182, cy + chosenRows.length * 38 + 77);
+  let y = cy + 182;
   if (centerRows.length > 2) {
     const outsideRows = wrap(spec.centerLabel, RIGHT - LEFT, 21);
     marks.push(lines(LEFT, y, outsideRows, { size: 21, fill: MUTED, leading: 29 }));
@@ -259,22 +263,21 @@ function renderDonut(spec) {
   });
   return chartFrame(spec, marks.join(""), header, y - 30);
 }
-function renderFunnel(spec) {
-  const header = headerLayout(spec), base = spec.items[0].value, focus = focusIndices(spec);
-  const metric = evidence("首阶段 → 末阶段保留率", percentage(spec.items.at(-1).value, base), LEFT, header.bottom + 4);
-  const marks = [metric.markup], left = 350, width = RIGHT - left; let y = metric.bottom + 42;
+function renderFunnel(spec, options) {
+  const header = headerLayout(spec, options), base = spec.items[0].value, focus = focusIndices(spec);
+  const marks = [], left = 350, width = RIGHT - left; let y = header.bottom + 42;
   spec.items.forEach((entry, i) => {
     const rows = wrap(entry.name, 264, 25), rowHeight = Math.max(108, rows.length * 35 + 60);
     marks.push(text(LEFT, y, String(i + 1).padStart(2, "0"), { size: 18, fill: MUTED }), lines(LEFT + 40, y, rows, { size: 25, weight: 600, leading: 35 }));
     marks.push(text(RIGHT, y, formatValue(entry.value, spec.valueFormat, spec.unit), { size: 30, weight: 700, anchor: "end", fit: width }));
     marks.push(rect(left, y + 18, width, 17, TRACK, 2), rect(left, y + 18, width * entry.value / base, 17, i === focus.item ? ACCENT : CONTEXT, 2, ` data-value="${entry.value}" data-baseline="0"`));
-    if (i > 0) marks.push(text(left, y + 65, `较上阶段保留 ${percentage(entry.value, spec.items[i - 1].value)}`, { size: 20, fill: MUTED, fit: width })); y += rowHeight;
+    y += rowHeight;
   });
   return chartFrame(spec, marks.join(""), header, y - 32);
 }
 function intersects(a, b) { return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y; }
-function renderScatter(spec) {
-  const header = headerLayout(spec), focus = focusIndices(spec), marks = [];
+function renderScatter(spec, options) {
+  const header = headerLayout(spec, options), focus = focusIndices(spec), marks = [];
   const xTitleRows = wrap(spec.xLabel, RIGHT - LEFT, 22), yTitleRows = wrap(spec.yLabel, RIGHT - LEFT, 22);
   marks.push(lines(LEFT, header.bottom + 5, yTitleRows, { size: 22, fill: MUTED, leading: 30 }));
   const top = header.bottom + yTitleRows.length * 30 + 40, bottom = top + 365, left = 137, right = 814;
@@ -310,7 +313,7 @@ function renderScatter(spec) {
   }
   return chartFrame(spec, marks.join(""), header, bodyBottom);
 }
-function renderDesign(spec) {
-  return { bar: renderBar, "stacked-bar": renderStackedBar, line: renderLine, donut: renderDonut, funnel: renderFunnel, scatter: renderScatter }[spec.type](spec);
+function renderDesign(spec, options = {}) {
+  return { bar: renderBar, "stacked-bar": renderStackedBar, line: renderLine, donut: renderDonut, funnel: renderFunnel, scatter: renderScatter }[spec.type](spec, options);
 }
 module.exports = { renderDesign };

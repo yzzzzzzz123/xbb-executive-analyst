@@ -1,23 +1,27 @@
 ---
 name: xbb-executive-chart
-description: Turn already-validated live XBB executive facts into at most one truthful, mobile-readable auxiliary chart specification. This bundled support skill must be used by xbb-executive-analyst whenever a chart is considered. It chooses or refuses the chart, structures the evidence, and emits only the governed chart contract; it never queries CRM, changes facts, runs independently, creates dashboards or HTML, or accepts arbitrary drawing code.
+description: Turn already-validated live XBB executive facts into one truthful, mobile-readable single or multi-panel chart specification. This bundled support skill must be used by xbb-executive-analyst whenever a chart is considered. It chooses or refuses the chart, structures the evidence, and emits only the governed chart contract; it never queries CRM, changes facts, runs independently, creates dashboards or HTML, or accepts arbitrary drawing code.
 ---
 
 # 销帮帮经营辅助图
 
-把 `xbb-executive-analyst` 已经校验的实时事实整理成一张辅助经营图。图只帮助老板更快看出比较关系，不能替代文字结论，也不能成为新的取数或推理入口。企业微信要求每条销帮帮答复都带图片，但本 Skill 仍只决定“是否能画真实经营图”；返回 `chart: null` 时，由可信桥接层从同一文字答复生成不新增经营数字的结论/状态卡。
+把 `xbb-executive-analyst` 已核验的本轮事实经过深入分析，整理成一张详细、清晰、手机可读的经营分析图。图应能单独看懂问题、主要发现、数字证据及口径；主 Agent 必须同时提供可独立阅读的文字答复，逐项保留结论、关键数字、解释与必要边界；图中已有数字也不能省略正文依据，图内文字不能替代文字答复。图片展示真实图形和经过计算验证的证据注释，不用泛泛文字卡代替分析。没有可诚实成图的事实时说明具体缺口。
 
-本 Skill 是主经营 Skill 的同轮依赖，不是第二个 Agent：不调用销帮帮、不访问网络、不读取凭证、不补造事实、不发送消息。图表规格由本 Skill 决定，SVG/PNG 仍由项目内的确定性渲染器生成。
+本 Skill 由主经营 Agent 按需委派的原生 `xbb_chart` 子 Agent 执行，固定 `gpt-6-astra/ultra`，主 Agent 保持 `xhigh`。子 Agent 只接收有效问题、当前已授权事实、日期分母边界和本 Skill 合同，`fork_turns=none`；不调用销帮帮、不访问网络或凭证、不使用旧事实、不再委派、不发送消息。先返回逐维度分析、覆盖清单及严格图规格，主 Agent 复核后统一答复；SVG/PNG 由项目确定性渲染器生成。
 
 ## 生成协议
 
 严格按以下顺序工作：
 
-核心边界：程序只验证图内引用与算术，不能证明数字已绑定完整事实源，也不能证明真实日期、完整分母或同批次对象；主经营 Skill 必须先核实这些条件。`finding` 只填关系与 `{series, category, axis}` 位置；`share` 的 `baseline` 为 `null`，其他关系指向图内基准。
+核心边界：程序只验证图内引用与算术，不能证明数字已绑定完整事实源，也不能证明真实日期、完整分母或同批次对象；主经营 Skill 必须先核实这些条件。`finding` / `findings` 只填关系与 `{series, category, axis}` 位置，不自填计算结果。
 
-1. **先过事实门槛。** 只接收当前轮 `ready` 事实包中已验证、同口径、同范围的数字。若只有一个数字、比较对象不一致、缺少分母、缺少必要时间点，或展示会暴露电话、邮箱、凭据、客户跟进原文，返回 `chart: null`。
-2. **先选要证明的关系及证据，再选图。** 明确老板要比较什么，用结构化 `finding` 选择差值、期间变化、构成占比、阶段留存或流失，并引用图内已有的数据位置；不自行填写计算结果。确定性程序从这些位置计算并生成 `insight`，同时把 `focus` 设为 `finding.subject`。重点可以是低位、回落或非最大值，不能默认最大值就是发现；不从自由文字正则猜测关系或高亮。因果解释、行动建议和预测仍放在主 Skill 的文字答复中。没有适用且可信的关系时填 `finding: null`，此时只生成明确标注“兼容概述”的可见值摘要；若这不能帮助理解，就返回 `chart: null`。
-3. **选最简单且诚实的图形。** 使用下表；不能满足门槛时退回更简单的图或 `chart: null`，不得为了有图而改变问题。
+1. **逐维度检查事实门槛。** 只接收当前轮 `ready` 事实包中已验证、同口径、同范围的数字。某维度只有一个数字、比较对象不一致、缺少分母或必要时间点时，在文字中说明该维度的可确认结果与成图缺口，保留其他合格维度。没有合格维度或用户明确只要文字时返回 `chart: null`。图内不得出现电话、邮箱、凭据、客户跟进原文。
+2. **先覆盖完整问题，再选择图形。** 合并当前问题和仍有效的连续追问，按经营含义计数，不能按数据域、句号或关键词数代替维度数。两个及以上维度必须出综合图；“今天业绩怎么样”等宽泛经营问题也必须出图，先分析同期间总体与分公司贡献等直接必要证据，不只报一个金额。只有明确单一对象、期间和指标的标量问题（如“某分公司今天业绩多少”）或用户明确要求文字时可免图。总体、趋势、分公司比较是三个维度，即使只查询业绩域。多个合格维度生成一张 `composite`，分别用独立 `panels` 呈现；只有一个合格维度使用单图并说明其他缺口。不能用重复数据仅改标题凑数。
+   “趋势是什么”“其次哪个分公司业绩好”“图表呈现出来”“综合一点”等追问承接原问题仍有效的期间、对象和维度，明确缩小范围时才删减；新轮次旧数字必须重新查询。每个子图的标题直接说明所答维度，顺序与文字分析一致。发布前逐项核对“用户子问题 → 文字分析 → 子图或缺数说明”，不得遗漏中间子问题。
+   例如“今年公司的业绩怎么样，趋势是什么，其次哪个分公司业绩好”：同一次查询取得 `performance.total`、`performance.trend`、`performance.ranking`。总体可用月度累计曲线表达年度规模，末值须与总额一致；趋势展示每月发生额、峰谷和同口径变化，累计增加不能当作月度增长；公司图展示同期间排名、领先差额和完整分母下的集中度。也可用完整公司贡献构成及中心合计表达总体；截断榜单不可作为全集团分母。不得为凑图另查课程/咨询构成、目标、同比或利润。“今天”必须使用单日事实，不拿本月代替，不能为画趋势擅自扩大日期。
+   **先分析，再选择关系及证据。** 每维度依次检查规模、比较、变化、集中度和异常中哪些有数据支撑，形成具体结论、数字和边界；随后选图。用 `findings` 输出0–4条互补关系，证据充分时通常2–4条；首条为主发现，`finding` 可为 `null` 由首条归一化，或与首条完全一致。选择差值、期间变化、极值、占比、头部集中度或阶段流失，引用图内数据，由确定性程序计算并显示证据注释。不要把同一结论改写四遍，不默认最大值总是重点。不能确认的因果、目标达成或预测不进入图；合理解释在文字中明示依据与不确定性。没有可信关系时允许无发现的真实图，但不得伪造结论。
+   **主发现直接回答本维度。** 累计曲线自然递增后的期末最高值只能作规模读数，分析优先说明有意义的阶段新增或可比差异。问分公司表现时，主强调应落在可识别分公司的领先者与差距；“其他组”、未知或待归属统计桶的规模另行说明，不能当作分公司冠军。
+3. **按分析关系选图。** 使用下表，可组合不同图形表达互补维度；不能满足门槛时换更简单的真实图或说明缺口。思维导图、树状图只适合有明确层级或可追溯关系的问题，不是分析深度的象征；当前合同仅支持下列六类及综合图，不输出未支持类型或用泛泛节点文案代替数值证据。
 
 | 比较关系 | 首选 | 数据门槛与退路 |
 | --- | --- | --- |
@@ -30,15 +34,15 @@ description: Turn already-validated live XBB executive facts into at most one tr
 
 4. **整理数据而不改写事实。** 排名按主指标降序；时间和漏斗保持业务顺序；默认只保留前 10。只有事实包已经提供“其他”或能从同一组完整事实做确定性求和时才可合并“其他”。缺失不是零，不补点、不插值、不把比例当金额。一个坐标轴只放一种单位和口径。
    年度或跨月图直接使用所选域的 `monthlyTrend`、排名或结构字段，并用 `scope.months` / `scope.range` 标注期间；逐月 `provenance` 审计明细、原始日趋势和逐条业务列表都不是成图前提。`detailCoverage.aggregationComplete=true` 时，不得因下钻候选被压缩而拒绝本可生成的管理图。
-5. **建立手机端信息层级。** `title` 说明对象和指标，建议不超过 20 个中文字；`subtitle` 说明期间、范围、截至时间以及必要分母；`note` 保留会改变理解的必要口径限制，不为缩短卡片而删掉。标题保持中性，程序生成的 `insight` 承担“图内可计算的发现”，`focus` 指向所选关系的主体。单系列不制造图例，多系列最多 4 个；颜色、字体和强调样式由渲染器控制，规格不得提供 `color`、样式、SVG、HTML 或脚本。
-6. **按类型输出最小规格。** 阅读 [chart-contract.md](references/chart-contract.md)，只输出该图形需要的字段，不输出其他图形的空数组或空字符串。每种图均输出 `finding` 和 `focus`；建议模型固定填写 `insight: "由finding生成"`、`focus: null`，由程序生成文案和重点。`finding` 引用必须包含 `series`、`category`、`axis`；非系列图使用空字符串 `series`，散点只允许同一 `x` 或 `y` 坐标比较。百分比统一使用百分点，例如 `37.5` 表示 `37.5%`；百分比差值用“个百分点”，不能混为相对增长率。`percent` 构成的 `share` 必须精确合计 100，不能将舍入差作为真实分母；其他构成分母由图内全部相应组成项求和。`money` 数值统一使用元且 `unit` 留空。零分母、负增长基准、无效引用或不适用于该图的关系不发布。
+5. **建立手机端信息层级。** `title` 说明对象和指标，建议不超过20个中文字；`subtitle` 说明期间、范围、截至时间和必要分母；`note` 保留会改变理解的口径限制。图内主发现和证据注释由已验证关系生成，`focus` 指向首条关系主体；兼容概述不能冒充发现。综合图统一主标题和编号，每区有明确问题、图形、精确读数及短证据注释。单系列不制造图例，多系列最多4个；颜色、字体和布局由渲染器控制，不传样式或绘图代码。
+6. **按类型输出最小规格。** 阅读 [chart-contract.md](references/chart-contract.md)，只输出该图形需要的字段，不输出其他图形的空数组或空字符串。每个单图或子图均输出 `finding` 和 `focus`，composite 外层只输出 type、title、subtitle、note、panels；建议模型固定填写 `insight: "由finding生成"`、`focus: null`，由程序生成文案和重点。`finding` 引用必须包含 `series`、`category`、`axis`；非系列图使用空字符串 `series`，散点只允许同一 `x` 或 `y` 坐标比较。百分比统一使用百分点，例如 `37.5` 表示 `37.5%`；百分比差值用“个百分点”，不能混为相对增长率。`percent` 构成的 `share` 必须精确合计 100，不能将舍入差作为真实分母；其他构成分母由图内全部相应组成项求和。`money` 数值统一使用元且 `unit` 留空。零分母、负增长基准、无效引用或不适用于该图的关系不发布。
 7. **发布前复核来源与口径。** 逐项对照事实包检查数值、标签、排序、期间、单位、分母及 `finding` 的引用是否一致；确认条形图从零开始、折线时间顺序正确、构成分母完整、漏斗属于同一批对象且非递增、敏感信息未进入规格。程序只能证明图内引用与计算一致；期间关系只检查图示位置先后，不能证明标签是真实日期、漏斗是同一批对象或数字已绑定完整事实源。这些仍是主 Skill 的事实门槛，不得因合同通过而省略。任何一项无法确认就返回 `chart: null`，保留真实文字答复。
 
 ## 输出与渲染
 
-- 企业微信模式：在主 Agent 的结构化结果中返回 `chart` 对象或 `null`。模型不运行图表脚本；桥接层按同一合同在内存中生成 PNG。
+- 企业微信模式：子 Agent 完成整张图后调用 `validate_xbb_chart`，修正具体错误并检查工具返回的390px手机预览；子 Agent 未暴露该工具时由主 Agent 调用。通过后主 Agent 最终 `chart` 直接使用工具返回的 `{type:"validated",id:...}` 引用，避免复制规格时改变数字或单位。引用仅在当前请求、事实版本和追问版本有效；改图或改范围后重新校验。模型不运行图表脚本；桥接层在内存生成PNG并解析有效引用。
 - Codex 对话模式：把同一最小规格写入 run-scoped JSON，调用主 Skill 规定的 `scripts/render-chart.ps1`，检查实际 SVG 后删除规格文件。
-- 经营图渲染失败时保留文字结论，并由桥接层依次退到结论速览图和不含经营数字的内置安全占位图；不得改用样例、旧图、远程图表服务或自由生成的经营位图。
+- 经营图渲染失败时保留文字结论并简短说明图表暂未生成，不生成文字图片或占位图；不得改用样例、旧图、远程图表服务或自由生成的经营位图。
 - 历史规格可以缺少 `finding` / `focus`，但未经验证的自由 `insight` 不会原样发布：它会被“兼容概述”覆盖，旧重点清空。明确提供却无效的 `finding` 不走兼容路径，整张图降级为 `null`。
 
 外部方案的取舍和许可记录见 [research-basis.md](references/research-basis.md)。该文件只用于维护本 Skill，不参与每轮经营判断。

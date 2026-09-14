@@ -2,7 +2,11 @@
 param(
     [string[]]$Month,
 
+    [string]$Date,
+
     [string[]]$Domains = @('all'),
+
+    [string[]]$Metrics,
 
     [string]$Company,
 
@@ -242,7 +246,7 @@ if (-not [string]::IsNullOrWhiteSpace($IsolationToken)) {
 }
 
 if ($RequestFromStdin) {
-    foreach ($businessParameter in @('Month', 'Domains', 'Company', 'Person', 'ForceRefresh')) {
+    foreach ($businessParameter in @('Month', 'Date', 'Domains', 'Metrics', 'Company', 'Person', 'ForceRefresh')) {
         if ($PSBoundParameters.ContainsKey($businessParameter)) {
             throw 'RequestFromStdin cannot be combined with business-scope command-line parameters.'
         }
@@ -254,6 +258,16 @@ if ($RequestFromStdin) {
     }
     try { $request = $requestText | ConvertFrom-Json } catch { throw 'Runner stdin request is not valid JSON.' }
     $expectedRequestProperties = @('company', 'domains', 'forceRefresh', 'months', 'person')
+    if ($request.PSObject.Properties.Name -contains 'date') {
+        $expectedRequestProperties = @($expectedRequestProperties + 'date' | Sort-Object)
+        if ($request.date -isnot [string] -or $request.date -notmatch '^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$') { throw 'Date must be a canonical YYYY-MM-DD string.' }
+        $Date = [string]$request.date
+    }
+    if ($request.PSObject.Properties.Name -contains 'metrics') {
+        $expectedRequestProperties = @($expectedRequestProperties + 'metrics' | Sort-Object)
+        if ($request.metrics -isnot [Array] -or @($request.metrics).Count -eq 0) { throw 'Metrics must be a nonempty array.' }
+        $Metrics = @($request.metrics | ForEach-Object { [string]$_ })
+    }
     $actualRequestProperties = @($request.PSObject.Properties.Name | Sort-Object)
     if (($actualRequestProperties -join "`n") -cne ($expectedRequestProperties -join "`n") -or
         $request.months -is [string] -or $request.domains -is [string] -or
@@ -272,8 +286,15 @@ if ($RequestFromStdin) {
     $requestText = $null
 }
 
+if (-not [string]::IsNullOrWhiteSpace($Date)) {
+    try { $queryDay = [DateTime]::ParseExact($Date, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) }
+    catch { throw '单日日期必须是有效的 YYYY-MM-DD 自然日。' }
+    $queryZone = [TimeZoneInfo]::FindSystemTimeZoneById('China Standard Time')
+    $currentShanghaiDate = [TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $queryZone).ToString('yyyy-MM-dd')
+    if ($Date -gt $currentShanghaiDate) { throw '不能查询晚于当前上海日期的单日。' }
+}
 $months = @($Month | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-if ($months.Count -eq 0) { $months = @(Get-ShanghaiMonth) }
+if ($months.Count -eq 0) { $months = @(if ([string]::IsNullOrWhiteSpace($Date)) { Get-ShanghaiMonth } else { $Date.Substring(0, 7) }) }
 $months = @($months | ForEach-Object { $_.Split(',') } | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)
 $currentShanghaiMonth = Get-ShanghaiMonth
 if ($months.Count -gt $maximumMonths) { throw "At most $maximumMonths months may be queried in one invocation." }
@@ -289,10 +310,15 @@ $allowedDomains = @('all', 'performance', 'product-sales', 'courses', 'delivery'
 $invalidDomains = @($domainList | Where-Object { $_ -notin $allowedDomains })
 if ($invalidDomains.Count -gt 0) { throw "不支持的数据域：$($invalidDomains -join ', ')" }
 if ($domainList -contains 'all' -and $domainList.Count -ne 1) { throw 'all 不能与其他数据域同时使用。' }
+if (-not [string]::IsNullOrWhiteSpace($Date)) {
+    if ($domainList.Count -ne 1 -or $domainList[0] -ne 'performance') { throw '单日查询当前仅支持业绩，不能改查整月或其他数据域。' }
+    if ($months.Count -ne 1 -or $months[0] -ne $Date.Substring(0, 7)) { throw '单日查询的月份必须且只能是该日期所属月份。' }
+}
 $requiresOrderData = $domainList -contains 'all' -or $domainList -contains 'performance' -or $domainList -contains 'product-sales'
 if ($requiresOrderData -and @($months | Where-Object { $_ -lt $performanceDataStartMonth }).Count -gt 0) {
     throw "业绩订单和 OPP 订单的已确认数据范围从 $performanceDataStartMonth 开始。"
 }
+$metricList = @($Metrics | ForEach-Object { ([string]$_).Split(',') } | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object -Unique)
 $domainArgument = $domainList -join ','
 
 $xbbCredentialPath = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Codex\xbb-openapi\credentials.json'
@@ -346,7 +372,10 @@ try {
         $sourcePath = Join-Path $runDir "source-$periodFileToken.json"
         $factPath = Join-Path $runDir "facts-$periodFileToken.json"
         $cacheDomainKey = (($domainList | Sort-Object) -join '-') -replace '[^a-z-]', ''
-        $cachePath = Join-Path $cacheRoot "source-v6-$tenantFingerprint-$cacheDomainKey-$selectedMonth.dpapi"
+        $demandMaterial = [ordered]@{ domains = @($domainList | Sort-Object); date = $Date; metrics = @($metricList); company = $Company; person = $Person } | ConvertTo-Json -Compress
+        $demandHasher = [Security.Cryptography.SHA256]::Create()
+        try { $demandKey = (($demandHasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($demandMaterial)) | ForEach-Object { $_.ToString('x2') }) -join '') } finally { $demandHasher.Dispose() }
+        $cachePath = Join-Path $cacheRoot "source-v7-$tenantFingerprint-$demandKey-$selectedMonth.dpapi"
         $cacheHit = $false
 
         if (-not $ForceRefresh -and [IO.File]::Exists($cachePath)) {
@@ -375,7 +404,11 @@ try {
         if (-not $cacheHit) {
             $exportArguments = @{
                 Month = $selectedMonth
+                Date = $Date
                 Domains = $domainList
+                Metrics = $metricList
+                Company = $Company
+                Person = $Person
                 OutputPath = $sourcePath
             }
             if (-not [string]::IsNullOrWhiteSpace($IsolationToken)) { $exportArguments['IsolationToken'] = $IsolationToken }
@@ -402,11 +435,13 @@ try {
 
         $arguments = @($builder, '--source', $sourcePath, '--output', $factPath, '--request-stdin')
         if (-not [string]::IsNullOrWhiteSpace($IsolationToken)) { $arguments += @('--isolation-token', $IsolationToken) }
-        $builderRequest = [ordered]@{
+        $builderScope = [ordered]@{
             domains = @($domainList)
             company = if ([string]::IsNullOrWhiteSpace($Company)) { $null } else { $Company }
             person = if ([string]::IsNullOrWhiteSpace($Person)) { $null } else { $Person }
-        } | ConvertTo-Json -Depth 4 -Compress
+        }
+        if (-not [string]::IsNullOrWhiteSpace($Date)) { $builderScope['date'] = $Date }
+        $builderRequest = $builderScope | ConvertTo-Json -Depth 4 -Compress
         $previousOutputEncoding = $OutputEncoding
         try {
             $OutputEncoding = [Text.UTF8Encoding]::new($false)

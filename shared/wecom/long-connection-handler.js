@@ -7,7 +7,7 @@ const { MAX_USER_QUESTION_BYTES } = require("../codex/context-policy.js");
 const { authorize, AccessDeniedError } = require("../security/access-control.js");
 const { routeSkill } = require("../rag/skill-router.js");
 const { chartTypeLabel, formatDuration } = require("../xbb/query-progress.js");
-const { createWecomAnswerImage, createWecomChartImage, createWecomEmergencyImage } = require("./chart-image.js");
+const { createWecomChartImage } = require("./chart-image.js");
 const { MessageStore, MessageStoreCapacityError } = require("./message-store.js");
 const { createRequestMetrics } = require("../observability/request-metrics.js");
 const { DeliveryTimeoutError, createDeliveryDeadline, validateBudget, withinBudget } = require("./delivery-budget.js");
@@ -227,8 +227,6 @@ function createLongConnectionHandler({
   statusWriter = () => {},
   heartbeatMs = 45000,
   chartRenderer = createWecomChartImage,
-  answerRenderer = createWecomAnswerImage,
-  emergencyImageFactory = createWecomEmergencyImage,
   retryWait = delay,
   renderAttempts = 2,
   // SDK upload chunks already retry three times. Do not multiply whole uploads.
@@ -254,7 +252,6 @@ function createLongConnectionHandler({
   if (typeof monotonicNow !== "function") throw new Error("请求单调时钟无效。");
   // 应急图在启动阶段只生成和校验一次。运行时拒绝/渲染故障只复用这个不可变项，
   // 避免未授权消息触发 Sharp CPU 开销，也消除最后一级兜底再次抛错的窗口。
-  const emergencyRender = normalizeRenderedImage(emergencyImageFactory());
   const lastRouteByUser = new Map();
   const rememberRoute = (userId, routeMode) => {
     lastRouteByUser.delete(userId);
@@ -290,13 +287,13 @@ function createLongConnectionHandler({
           begun = messageStore.begin({ messageId, userId, streamId: streamIdFactory(), content });
         } catch (storeError) {
           if (!(storeError instanceof MessageStoreCapacityError)) throw storeError;
-          const items = inferredRoute === "xbb" ? [emergencyRender.item] : [];
+          const items = [];
           return withinBudget(() => client.replyStream(frame, streamIdFactory(), "当前请求已触发并发保护，系统仍在处理已接收的任务；本条未读取销帮帮，也未生成任何经营数字。", true, items), replyBudgetMs);
         }
         const { state, isNew } = begun;
         if (isNew) {
           // 授权拒绝不是经营分析结果，且不得让未登记用户以不同 msgid 并发触发 Sharp。
-          const items = inferredRoute === "xbb" ? [emergencyRender.item] : [];
+          const items = [];
           messageStore.complete(messageId, content, items);
         }
         return withinBudget(() => client.replyStream(frame, state.streamId, state.content, true, state.msgItem), replyBudgetMs);
@@ -310,7 +307,7 @@ function createLongConnectionHandler({
         begun = messageStore.begin({ messageId, userId, streamId: streamIdFactory(), content: initialContent });
       } catch (storeError) {
         if (!(storeError instanceof MessageStoreCapacityError)) throw storeError;
-        const items = inferredRoute === "xbb" ? [emergencyRender.item] : [];
+        const items = [];
         return withinBudget(() => client.replyStream(frame, streamIdFactory(), "当前请求已触发并发保护，系统仍在处理已接收的任务；本条未读取销帮帮，也未生成任何经营数字。", true, items), replyBudgetMs);
       }
       const { state, isNew } = begun;
@@ -332,7 +329,7 @@ function createLongConnectionHandler({
       );
       writeStatus({ status: "message_received" });
       if (!question || oversized) {
-        const items = inferredRoute === "xbb" ? [emergencyRender.item] : [];
+        const items = [];
         messageStore.complete(messageId, initialContent, items);
         let reply;
         try { reply = await replyStream(initialContent, true, items); }
@@ -363,7 +360,6 @@ function createLongConnectionHandler({
       let activePreview = null;
       let previewDispatches = 0;
       let previewAttempted = false;
-      let usePrebuiltOperationalImage = false;
       try {
         let latestStage = initialContent;
         progressPublisher = createProgressPublisher({
@@ -421,17 +417,16 @@ function createLongConnectionHandler({
           signal,
           remainingMs
         }), requestBudgetMs, analysisReserveMs));
-        answer = typeof result === "string" ? result : result.answer;
+        answer = typeof result === "string" ? result : result?.answer;
+        if (typeof answer !== "string" || !answer.trim()) throw new Error("Codex Agent 最终答复缺少文字答复。");
         chart = typeof result === "object" && result ? result.chart : null;
         if (result?.routeMode === "xbb" || result?.routeMode === "general") routeMode = result.routeMode;
-        usePrebuiltOperationalImage = isXbbOperationalHandoff(result);
       } catch (error) {
         outcome = "failed";
         failureClass = error?.code === "REQUEST_DEADLINE_EXCEEDED" ? "deadline_exceeded" : error?.code === "REQUEST_CANCELLED" ? "cancelled" : error instanceof AgentTurnTimeoutError ? "analysis_timeout" : "analysis_failed";
         answer = operationalFailure(error);
         if (previewAttempted) answer = `本轮未完成，之前显示的正文预览不是完整结果，请以本条状态为准。\n\n${answer}`;
         if (error?.routeMode === "xbb") routeMode = "xbb";
-        usePrebuiltOperationalImage = routeMode === "xbb";
       } finally {
         previewOpen = false;
         if (heartbeat) clearInterval(heartbeat);
@@ -443,13 +438,12 @@ function createLongConnectionHandler({
         }
       }
       rememberRoute(userId, routeMode);
-      const requiresImage = routeMode === "xbb";
       let answerVisible = false;
-      if (requiresImage || chart) {
+      if (chart) {
         // Send a complete readable answer before rasterization or upload. This
         // remains the same stream; the final packet still includes an image or
         // follows successful standalone delivery. No generic progress replaces it.
-        const visible = `${answer}\n\n${chart ? `正在制作：${chartTypeLabel(chart.type)}` : "正在准备结论辅助图"}，图片随后补齐。`;
+        const visible = `${answer}\n\n正在制作：${chartTypeLabel(chart.type)}，图片随后补齐。`;
         messageStore.update(messageId, visible);
         try {
           await replyStream(visible, false);
@@ -459,7 +453,6 @@ function createLongConnectionHandler({
       }
       let msgItem = [];
       let imageBuffer = null;
-      let imageRender = null;
       if (chart) {
         try {
           const rendered = normalizeRenderedImage(await metrics.measure("renderMs", () => deadline.run((isOpen) => retryTransient(() => chartRenderer(chart), {
@@ -474,35 +467,7 @@ function createLongConnectionHandler({
         } catch {
           if (outcome === "success") outcome = "degraded";
           writeStatus({ status: "chart_failed" });
-          answer = appendVisualNotice(answer, "（数据图生成暂时异常，已自动改用结论速览图；文字口径不变。）");
-        }
-      }
-      if (requiresImage && !msgItem.length) {
-        if (usePrebuiltOperationalImage) {
-          imageRender = emergencyRender;
-          msgItem = [emergencyRender.item];
-          // 交接/恢复答复可能在洪泛收敛时批量产生。直接内嵌启动期预构建图片，
-          // 不为每条消息并发调用 Sharp，也不重复上传同一张占位图。
-          imageBuffer = null;
-        } else {
-          try {
-            imageRender = normalizeRenderedImage(await metrics.measure("renderMs", () => deadline.run((isOpen) => retryTransient(() => answerRenderer(answer), {
-              canAttempt: isOpen,
-              attempts: renderAttempts,
-              wait: retryWait,
-              shouldRetry: (error) => isOpen() && isTransientRenderError(error)
-            }), renderBudgetMs, finalReplyReserveMs)));
-            msgItem = [imageRender.item];
-            imageBuffer = imageRender.buffer;
-            writeStatus({ status: "chart_generated" });
-          } catch {
-            if (outcome === "success") outcome = "degraded";
-            imageRender = emergencyRender;
-            msgItem = [emergencyRender.item];
-            imageBuffer = emergencyRender.buffer;
-            answer = appendVisualNotice(answer, "（可视化引擎暂时异常，已附安全占位图；本条文字结论仍按原口径保留。）");
-            writeStatus({ status: "chart_failed" });
-          }
+          answer = appendVisualNotice(answer, "（图表暂未生成，文字结论已保留。）");
         }
       }
       let uploadedMediaId = null;

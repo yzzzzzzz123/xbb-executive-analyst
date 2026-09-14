@@ -3,10 +3,10 @@
 // Pure, chart-local arithmetic. This does not authenticate a fact pack, prove
 // that a cohort is the same, or establish causality / source completeness.
 const RELATIONS_BY_TYPE = Object.freeze({
-  bar: Object.freeze(["difference", "period-change"]),
+  bar: Object.freeze(["difference", "period-change", "maximum", "minimum", "share", "top-share"]),
   "stacked-bar": Object.freeze(["difference", "share"]),
-  line: Object.freeze(["difference", "period-change"]),
-  donut: Object.freeze(["difference", "share"]),
+  line: Object.freeze(["difference", "period-change", "maximum", "minimum"]),
+  donut: Object.freeze(["difference", "share", "top-share"]),
   scatter: Object.freeze(["difference"]),
   funnel: Object.freeze(["difference", "retention", "loss"])
 });
@@ -69,6 +69,7 @@ function numericText(value, significantDigits = 8) {
 }
 
 function format(value, valueFormat, unit, { difference = false } = {}) {
+  if (valueFormat === "money" && magnitude(value).n >= 10000n * value.d) return `${numericText(divide(value, decimal(10000)))}万元`;
   const suffix = valueFormat === "money" ? "元" : valueFormat === "percent" ? difference ? "个百分点" : "%" : unit;
   return `${numericText(value)}${suffix}`;
 }
@@ -121,14 +122,14 @@ function compatibilityOverview(spec) {
     const series = spec.series[0];
     const first = { series: series.name, category: spec.categories[0] };
     const last = { series: series.name, category: spec.categories.at(-1) };
-    return `兼容概述：图内${label(first, spec)}为${format(decimal(series.values[0]), spec.valueFormat, spec.unit)}；${label(last, spec)}为${format(decimal(series.values.at(-1)), spec.valueFormat, spec.unit)}。`;
+    return `${label(first, spec)}为${format(decimal(series.values[0]), spec.valueFormat, spec.unit)}；${label(last, spec)}为${format(decimal(series.values.at(-1)), spec.valueFormat, spec.unit)}。`;
   }
   if (spec.items) {
     const first = spec.items[0], last = spec.items.at(-1);
-    return `兼容概述：图内${label({ series: "", category: first.name }, spec)}为${format(decimal(first.value), spec.valueFormat, spec.unit)}；${label({ series: "", category: last.name }, spec)}为${format(decimal(last.value), spec.valueFormat, spec.unit)}。`;
+    return `${label({ series: "", category: first.name }, spec)}为${format(decimal(first.value), spec.valueFormat, spec.unit)}；${label({ series: "", category: last.name }, spec)}为${format(decimal(last.value), spec.valueFormat, spec.unit)}。`;
   }
   const point = spec.points[0];
-  return `兼容概述：图内${spec.points.length}个点；${label({ series: "", category: point.label }, spec)}的x轴（${clip(spec.xLabel)}）为${format(decimal(point.x), spec.xFormat, spec.xUnit)}，y轴（${clip(spec.yLabel)}）为${format(decimal(point.y), spec.yFormat, spec.yUnit)}。`;
+  return `${spec.points.length}个点；${label({ series: "", category: point.label }, spec)}的x轴（${clip(spec.xLabel)}）为${format(decimal(point.x), spec.xFormat, spec.xUnit)}，y轴（${clip(spec.yLabel)}）为${format(decimal(point.y), spec.yFormat, spec.yUnit)}。`;
 }
 
 function normalizeFinding(value, spec) {
@@ -139,15 +140,35 @@ function normalizeFinding(value, spec) {
   const relation = value.relation;
   let baseline = null;
   let insight;
-  if (relation === "share") {
-    if (value.baseline !== null) fail("share.baseline 必须为 null，分母由全部可见组成项计算");
+  if (relation === "maximum" || relation === "minimum") {
+    if (value.baseline !== null) fail(`${relation}.baseline 必须为 null`);
+    const values = spec.series.find((entry) => entry.name === subject.ref.series).values;
+    const extreme = (relation === "maximum" ? Math.max : Math.min)(...values);
+    if (subject.number !== extreme) fail(`${relation}.subject 必须是该系列的${relation === "maximum" ? "最大" : "最小"}值`);
+    if (new Set(values).size < 2) fail("相等序列不存在可强调的峰谷");
+    const tied = values.filter((number) => number === extreme).length > 1;
+    insight = `${label(subject.ref, spec)}为所示${values.length}项中的${tied ? "并列" : ""}${relation === "maximum" ? "最高" : "最低"}值：${format(subject.value, subject.valueFormat, subject.unit)}。`;
+  } else if (relation === "share" || relation === "top-share") {
+    if (value.baseline !== null) fail(`${relation}.baseline 必须为 null，分母由全部可见组成项计算`);
+    if (relation === "top-share" && spec.type === "bar" && spec.series.length !== 1) fail("top-share 的条形图必须只有一个系列");
     const values = spec.type === "donut" ? spec.items.map((item) => item.value)
-      : spec.series.map((series) => series.values[subject.position]);
+      : spec.type === "bar" ? spec.series.find((entry) => entry.name === subject.ref.series).values
+        : spec.series.map((series) => series.values[subject.position]);
     const denominator = finiteResult(values.map(decimal).reduce(add, ZERO));
     if (denominator.n <= 0n) fail("构成分母必须大于零");
     if (subject.valueFormat === "percent" && !equal(denominator, HUNDRED)) fail("share 的 percent 构成必须精确合计 100，不能把舍入差当作真实分母");
-    const percent = finiteResult(multiply(divide(subject.value, denominator), HUNDRED));
-    insight = `图内计算：${label(subject.ref, spec)}占${spec.type === "donut" ? "图示合计" : "该类别图示合计"}${numericText(percent, 4)}%（分母${format(denominator, subject.valueFormat, subject.unit)}）。`;
+    let numerator = subject.value;
+    let name = label(subject.ref, spec);
+    if (relation === "top-share") {
+      const ranked = [...values].sort((a, b) => b - a);
+      const count = ranked.indexOf(subject.number) + 1;
+      if (count < 2 || count > 3 || count >= values.length) fail("top-share.subject 必须指向前2或前3项的最后一项，并保留其他项");
+      if (ranked[count] === subject.number) fail("top-share 的排名边界存在并列，不能任意截断");
+      numerator = finiteResult(ranked.slice(0, count).map(decimal).reduce(add, ZERO));
+      name = `前${count}项（第${count}为${label(subject.ref, spec)}）合计${format(numerator, subject.valueFormat, subject.unit)}，`;
+    }
+    const percent = finiteResult(multiply(divide(numerator, denominator), HUNDRED));
+    insight = `${name}占${spec.type === "stacked-bar" ? "该类别所示合计" : spec.type === "bar" ? "该系列所示合计" : "所示合计"}${numericText(percent, 4)}%（合计${format(denominator, subject.valueFormat, subject.unit)}）。`;
   } else {
     baseline = resolveRef(value.baseline, spec, "baseline");
     if (JSON.stringify(subject.ref) === JSON.stringify(baseline.ref)) fail("subject 与 baseline 不能是同一数据位置");
@@ -156,24 +177,29 @@ function normalizeFinding(value, spec) {
     const delta = format(magnitude(difference), subject.valueFormat, subject.unit, { difference: true });
     if (relation === "difference") {
       const axis = spec.type === "scatter" ? `${subject.ref.axis}轴（${clip(spec[`${subject.ref.axis}Label`])}）上，` : "";
-      insight = difference.n === 0n ? `图内计算：${axis}${label(subject.ref, spec)}与${label(baseline.ref, spec)}相同，差值为${delta}。`
-        : `图内计算：${axis}${label(subject.ref, spec)}比${label(baseline.ref, spec)}${difference.n > 0n ? "高" : "低"}${delta}。`;
+      insight = difference.n === 0n ? `${axis}${label(subject.ref, spec)}与${label(baseline.ref, spec)}相同，差值为${delta}。`
+        : `${axis}${label(subject.ref, spec)}比${label(baseline.ref, spec)}${difference.n > 0n ? "高" : "低"}${delta}。`;
     } else if (relation === "period-change") {
       if (subject.ref.series !== baseline.ref.series || subject.position <= baseline.position) fail("期间变化必须为同一系列，baseline 位于 subject 之前");
+      // Scope this guard to the two referenced endpoints. Other categories,
+      // subtitles or notes may legitimately disclose a separate MTD point.
+      if ([subject.ref, baseline.ref].some((endpoint) => /[Mm][Tt][Dd]|截至|未完月|月累计/u.test(endpoint.category))) {
+        fail("period-change 的 subject 或 baseline 标记为未完整期间；须选择两个完整月份，图中其他 MTD 点不影响比较");
+      }
       const direction = difference.n > 0n ? "增加" : difference.n < 0n ? "减少" : "变化";
       const change = `从${label(baseline.ref, spec)}到${label(subject.ref, spec)}${direction}${delta}`;
-      if (subject.valueFormat === "percent") insight = `图内计算：${change}。`;
+      if (subject.valueFormat === "percent") insight = `${change}。`;
       else {
         if (baseline.value.n <= 0n) fail("相对期间变化的基准必须大于零，零或负基准不计算增长率");
         const percent = finiteResult(multiply(divide(difference, baseline.value), HUNDRED));
-        insight = `图内计算：${change}，相对基准变化${numericText(percent, 4)}%。`;
+        insight = `${change}，变化率${numericText(percent, 4)}%。`;
       }
     } else {
       if (subject.position <= baseline.position || baseline.value.n <= 0n) fail("阶段关系必须从较早的正值阶段到较晚阶段");
       if (subject.number > baseline.number) fail("阶段留存不能大于前序阶段");
       const numerator = relation === "retention" ? subject.value : subtract(baseline.value, subject.value);
       const percent = finiteResult(multiply(divide(numerator, baseline.value), HUNDRED));
-      insight = `图内计算：从${label(baseline.ref, spec)}到${label(subject.ref, spec)}，${relation === "retention" ? "保留" : "流失"}${numericText(percent, 4)}%。`;
+      insight = `从${label(baseline.ref, spec)}到${label(subject.ref, spec)}，${relation === "retention" ? "保留" : "流失"}${numericText(percent, 4)}%。`;
     }
   }
   return {

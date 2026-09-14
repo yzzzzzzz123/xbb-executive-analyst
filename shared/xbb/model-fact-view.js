@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const { assertNoSensitiveFactValues } = require("../security/fact-privacy.js");
+const { projectFacts } = require("./data-demand.js");
 
 const MAX_MODEL_FACT_VIEW_BYTES = 96 * 1024;
 const MIN_MODEL_FACT_VIEW_BYTES = 16 * 1024;
@@ -148,13 +149,17 @@ function buildModelFactView(pack, options = {}) {
   const periods = Array.isArray(provenance.periods)
     ? provenance.periods.map((period) => ({ month: period.month, sourceRefreshedAt: period.sourceRefreshedAt || null }))
     : undefined;
+  const identity = (value) => value && Object.fromEntries(["id", "name", "company"].filter((key) => Object.hasOwn(value, key)).map((key) => [key, value[key]]));
+  const resolution = options.metrics ? Object.fromEntries(Object.entries(pack.entityResolution || {}).map(([key, value]) => [key, {
+    status: value.status, input: value.input, resolved: identity(value.resolved), candidates: (value.candidates || []).map(identity)
+  }])) : pack.entityResolution || {};
   const view = {
     schemaVersion: "1.0",
     skill: "xbb-executive-analyst",
     mode: "xbb-live-readonly-model-fact-view",
     status: pack.status,
-    scope: compactClone(pack.scope || {}),
-    entityResolution: compactClone(pack.entityResolution || {}),
+    scope: compactClone({ ...pack.scope, ...(options.metrics ? { metrics: options.metrics, person: identity(pack.scope?.person) } : {}) }),
+    entityResolution: compactClone(resolution),
     provenance: {
       live: provenance.live === true,
       readOnly: provenance.readOnly === true,
@@ -166,7 +171,7 @@ function buildModelFactView(pack, options = {}) {
       telephoneFieldsExported: false,
       credentialFieldsExported: false
     },
-    facts: compactClone(pack.facts || {}),
+    facts: compactClone(options.metrics ? projectFacts(pack.facts || {}, options.metrics) : pack.facts || {}),
     limitations: compactClone(pack.limitations || []),
     sourceFactPackSha256: pack.integrity?.factPackSha256 || null,
     sourceCompaction: compactClone(pack.compaction || null),

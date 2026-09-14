@@ -46,14 +46,18 @@ try {
     }
     if (-not $WecomOnly) {
         $result['modelProvider'] = 'codex-app-server'
-        $result['codexModel'] = 'gpt-5.6-sol'
-        $result['codexReasoningEffort'] = if ($stored.PSObject.Properties.Name -contains 'codexReasoningEffort') { [string]$stored.codexReasoningEffort } else { 'medium' }
+        $result['codexModel'] = if ($stored.PSObject.Properties.Name -contains 'codexModel') { [string]$stored.codexModel } else { 'gpt-6-astra' }
+        $result['codexReasoningEffort'] = if ($stored.PSObject.Properties.Name -contains 'codexReasoningEffort') { [string]$stored.codexReasoningEffort } else { 'xhigh' }
+        $result['codexContextWindow'] = if ($stored.PSObject.Properties.Name -contains 'codexContextWindow') { [int]$stored.codexContextWindow } else { 872000 }
+        $result['codexAutoCompactTokenLimit'] = if ($stored.PSObject.Properties.Name -contains 'codexAutoCompactTokenLimit') { [int]$stored.codexAutoCompactTokenLimit } else { 750000 }
         $result['agentTurnTimeoutMs'] = if ($stored.PSObject.Properties.Name -contains 'agentTurnTimeoutMs') { [int]$stored.agentTurnTimeoutMs } else { 300000 }
         $result['generalTurnTimeoutMs'] = if ($stored.PSObject.Properties.Name -contains 'generalTurnTimeoutMs') { [int]$stored.generalTurnTimeoutMs } else { 900000 }
         $result['agentStatePath'] = if ($stored.PSObject.Properties.Name -contains 'agentStatePath') { [string]$stored.agentStatePath } else { Join-Path ([IO.Path]::GetDirectoryName($resolved)) 'agent-state.json' }
         $result['statusLogPath'] = if ($stored.PSObject.Properties.Name -contains 'statusLogPath') { [string]$stored.statusLogPath } else { Join-Path ([IO.Path]::GetDirectoryName($resolved)) 'status.jsonl' }
         $result['serviceLeasePath'] = if ($stored.PSObject.Properties.Name -contains 'serviceLeasePath') { [string]$stored.serviceLeasePath } else { Join-Path ([IO.Path]::GetDirectoryName($resolved)) 'service-lease.json' }
         $result['accessPolicyPath'] = [string]$stored.accessPolicyPath
+        if ($stored.PSObject.Properties.Name -contains 'codexProxyUrl') { $result['codexProxyUrl'] = [string]$stored.codexProxyUrl }
+        if ($stored.PSObject.Properties.Name -contains 'codexCommand') { $result['codexCommand'] = [string]$stored.codexCommand }
     }
     $result | ConvertTo-Json -Compress
 } finally {

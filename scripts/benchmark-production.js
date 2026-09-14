@@ -42,12 +42,12 @@ function readProbeConfig() {
   const configPath = process.env.XBB_BOT_CONFIG_PATH || path.join(runtimeRoot(), "bot-config.json");
   const configured = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, "utf8").replace(/^\uFEFF/, "")) : {};
   // Do not decrypt or copy the bot secret, credentials, policy, or production state.
-  const codexModel = configured.codexModel || "gpt-5.6-sol";
-  const codexReasoningEffort = configured.codexReasoningEffort || "medium";
+  const codexModel = configured.codexModel || "gpt-6-astra";
+  const codexReasoningEffort = configured.codexReasoningEffort || "xhigh";
   if (!/^[a-zA-Z0-9._-]{1,128}$/.test(codexModel) || !["none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(codexReasoningEffort)) throw new Error("本机模型配置不合法。");
   const productionStatePath = process.env.XBB_AGENT_STATE_PATH || configured.agentStatePath || path.join(runtimeRoot(), "agent-state.json");
   if (!path.isAbsolute(productionStatePath)) throw new Error("生产状态文件必须是绝对路径。");
-  return { codexModel, codexReasoningEffort, productionStatePath };
+  return { codexModel, codexReasoningEffort, codexProxyUrl: configured.codexProxyUrl, codexCommand: configured.codexCommand, strictDataDemand: true, productionStatePath };
 }
 
 async function liveProbe(options) {

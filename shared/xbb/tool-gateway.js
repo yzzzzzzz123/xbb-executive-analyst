@@ -10,7 +10,7 @@ const util = require("node:util");
 const { enforceCompany } = require("../security/access-control.js");
 const { assertNoSensitiveFactValues } = require("../security/fact-privacy.js");
 const { MAX_AGGREGATE_BYTES } = require("./aggregate-multi-period.js");
-const { MAX_QUERY_MONTHS, PERFORMANCE_DATA_START_MONTH, validateRequestedMonths } = require("./fast-query-plan.js");
+const { MAX_QUERY_MONTHS, PERFORMANCE_DATA_START_MONTH, validateRequestedMonths, validateDateScope } = require("./fast-query-plan.js");
 const { normalizeRunnerProgressEvent } = require("./query-progress.js");
 const {
   RUNNER_ISOLATION_ERROR_CODE,
@@ -315,7 +315,7 @@ function normalizeList(value, label, max) {
 
 function validateRequest(input, now = new Date()) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("查询参数必须是对象。");
-  const extra = Object.keys(input).filter((key) => !["months", "domains", "company", "person", "forceRefresh"].includes(key));
+  const extra = Object.keys(input).filter((key) => !["months", "date", "domains", "metrics", "company", "person", "forceRefresh"].includes(key));
   if (extra.length) throw new Error(`查询包含不支持的参数：${extra.join(", ")}`);
   const months = validateRequestedMonths(normalizeList(input.months, "月份", MAX_QUERY_MONTHS), now);
   const domains = normalizeList(input.domains, "数据域", 5);
@@ -328,7 +328,9 @@ function validateRequest(input, now = new Date()) {
   const company = typeof input.company === "string" ? input.company.trim() : "";
   const person = typeof input.person === "string" ? input.person.trim() : "";
   if (Buffer.byteLength(company, "utf8") > 360 || Buffer.byteLength(person, "utf8") > 360) throw new Error("公司或人员名称过长。");
-  return { months, domains, company: company || undefined, person: person || undefined, forceRefresh: input.forceRefresh === true };
+  const metrics = input.metrics === undefined ? undefined : require("./data-demand.js").validateMetrics(input.metrics, domains);
+  const date = validateDateScope(input.date, months, domains, now);
+  return { months, domains, ...(date ? { date } : {}), ...(metrics ? { metrics } : {}), company: company || undefined, person: person || undefined, forceRefresh: input.forceRefresh === true };
 }
 
 function hashCanonical(value) {
@@ -465,7 +467,9 @@ function createToolGateway(options = {}, testOnlyCapability) {
         if (progressPath) baseArgs.push("-ProgressPath", progressPath);
         const requestStdin = `${JSON.stringify({
           months: input.months,
+          ...(input.date ? { date: input.date } : {}),
           domains: input.domains,
+          ...(input.metrics ? { metrics: input.metrics } : {}),
           company: company || null,
           person: input.person || null,
           forceRefresh: input.forceRefresh === true
@@ -527,13 +531,14 @@ function createToolGateway(options = {}, testOnlyCapability) {
           const pack = JSON.parse(fs.readFileSync(outputPath, "utf8"));
           await emitProgress(progressCallback, { stage: "validating", completed: input.months.length, total: input.months.length });
           attemptPack = assertSafeFactPack(pack);
+          if ((pack.scope?.date || null) !== (input.date || null)) throw new Error("事实包日期与所请求日期不一致，不能使用月累计代替单日。");
         } catch (error) {
           preserveIsolationMarker = error?.code === PROCESS_TREE_UNCONFIRMED_CODE || error?.code === RUNNER_ISOLATION_ERROR_CODE;
           if (error?.code === PROCESS_TREE_UNCONFIRMED_CODE || error?.code === RUNNER_ISOLATION_ERROR_CODE) throw error;
           if (isAbortError(error, signal)) throw signal?.reason instanceof Error ? signal.reason : abortError();
           lastError = error;
           const message = String(error?.message || "");
-          const permanent = /事实包|查询参数|月份|数据域|公司|人员|授权|隐私|完整性|哈希|不支持|安全上限/.test(message);
+          const permanent = /事实包|查询参数|月份|日期|单日|数据域|公司|人员|授权|隐私|完整性|哈希|不支持|安全上限/.test(message);
           if (attempt > 0 || permanent) throw error;
           shouldRetry = true;
         } finally {

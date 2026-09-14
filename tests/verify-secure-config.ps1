@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 
 $ErrorActionPreference = 'Stop'
@@ -33,8 +33,9 @@ try {
     if ([string]$full.wecomBotId -ne 'aibot_secure_test') { throw 'Bot ID round trip failed.' }
     if ([string]$full.wecomBotSecret -ne 'dummy-bot-secret-for-test') { throw 'Bot secret DPAPI round trip failed.' }
     if ([string]$full.modelProvider -ne 'codex-app-server') { throw 'Codex App Server provider round trip failed.' }
-    if ([string]$full.codexModel -ne 'gpt-5.6-sol') { throw 'Local Codex model round trip failed.' }
-    if ([string]$full.codexReasoningEffort -ne 'medium') { throw 'Local Codex reasoning effort round trip failed.' }
+    if ([string]$full.codexModel -ne 'gpt-6-astra') { throw 'Local Codex model round trip failed.' }
+    if ([string]$full.codexReasoningEffort -ne 'xhigh') { throw 'Local Codex reasoning effort round trip failed.' }
+    if ([int]$full.codexContextWindow -ne 872000 -or [int]$full.codexAutoCompactTokenLimit -ne 750000) { throw 'Large context config round trip failed.' }
     if ([int]$full.agentTurnTimeoutMs -ne 300000) { throw 'Codex Agent timeout round trip failed.' }
     if ([int]$full.generalTurnTimeoutMs -ne 900000) { throw 'Codex general turn timeout round trip failed.' }
     if ([string]$full.agentStatePath -ne [IO.Path]::GetFullPath((Join-Path $testRoot 'agent-state.json'))) { throw 'Codex Agent state path round trip failed.' }
@@ -44,6 +45,16 @@ try {
     $transport = (& $reader -Path $configPath -WecomOnly) | ConvertFrom-Json
     if ($transport.PSObject.Properties.Name -contains 'modelApiKey') { throw 'Transport-only read exposed the model key.' }
     if ([string]$transport.wecomBotSecret -ne 'dummy-bot-secret-for-test') { throw 'Transport-only DPAPI read failed.' }
+
+    $stored | Add-Member -NotePropertyName codexProxyUrl -NotePropertyValue 'http://127.0.0.1:18080'
+    $stored | Add-Member -NotePropertyName codexCommand -NotePropertyValue 'D:\synthetic\codex.exe'
+    [IO.File]::WriteAllText($configPath, (($stored | ConvertTo-Json -Depth 10) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+    $withProxy = (& $reader -Path $configPath) | ConvertFrom-Json
+    if ([string]$withProxy.codexProxyUrl -ne 'http://127.0.0.1:18080') { throw 'App-specific proxy round trip failed.' }
+    if ([string]$withProxy.codexCommand -ne 'D:\synthetic\codex.exe') { throw 'Isolated Codex runtime round trip failed.' }
+    $transportWithProxy = (& $reader -Path $configPath -WecomOnly) | ConvertFrom-Json
+    if ($transportWithProxy.PSObject.Properties.Name -contains 'codexProxyUrl') { throw 'Model proxy leaked into transport-only config.' }
+    if ($transportWithProxy.PSObject.Properties.Name -contains 'codexCommand') { throw 'Model runtime leaked into transport-only config.' }
 
     $updatedSecret = ConvertTo-SecureString 'updated-bot-secret-for-test' -AsPlainText -Force
     & $configure `
@@ -101,7 +112,7 @@ try {
     if ([string]$policy.users.'*'.scope -ne 'all') { throw 'Any-user access policy was not persisted as an explicit read-only wildcard.' }
     if (@(Get-ChildItem -LiteralPath $testRoot -File | Where-Object { $_.Name -like 'access-policy.json.tmp-*' -or $_.Name -like 'access-policy.json.bak-*' }).Count -ne 0) { throw 'Atomic access policy replacement left temporary files.' }
 
-    Write-Output ([ordered]@{ success = $true; checks = 29; schemaVersion = '4.0'; dpapi = 'CurrentUser'; modelProvider = 'codex-app-server'; codexModel = 'gpt-5.6-sol'; reasoning = 'medium'; atomicReplace = 'passed'; migration = '3.0-and-early-4.0-passed'; anyUserAccess = 'passed' } | ConvertTo-Json -Compress)
+    Write-Output ([ordered]@{ success = $true; checks = 29; schemaVersion = '4.0'; dpapi = 'CurrentUser'; modelProvider = 'codex-app-server'; codexModel = 'gpt-6-astra'; reasoning = 'xhigh'; atomicReplace = 'passed'; migration = '3.0-and-early-4.0-passed'; anyUserAccess = 'passed' } | ConvertTo-Json -Compress)
 } finally {
     if ([IO.Directory]::Exists($testRoot)) {
         $verified = [IO.Path]::GetFullPath($testRoot)

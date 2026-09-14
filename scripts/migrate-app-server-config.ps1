@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$Path = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Codex\xbb-executive-analyst\bot-config.json')
 )
@@ -15,8 +15,10 @@ if ([string]::IsNullOrWhiteSpace([string]$stored.wecomBotSecretDpapi)) { throw '
 $parent = [IO.Path]::GetDirectoryName($resolved)
 $stored.schemaVersion = '4.0'
 $stored.modelProvider = 'codex-app-server'
-$stored.codexModel = 'gpt-5.6-sol'
-$stored.codexReasoningEffort = 'medium'
+$stored.codexModel = 'gpt-6-astra'
+$stored.codexReasoningEffort = 'xhigh'
+if ($stored.PSObject.Properties.Name -notcontains 'codexContextWindow') { $stored | Add-Member -NotePropertyName codexContextWindow -NotePropertyValue 872000 }
+if ($stored.PSObject.Properties.Name -notcontains 'codexAutoCompactTokenLimit') { $stored | Add-Member -NotePropertyName codexAutoCompactTokenLimit -NotePropertyValue 750000 }
 if ($stored.PSObject.Properties.Name -contains 'modelTimeoutMs') { $stored.PSObject.Properties.Remove('modelTimeoutMs') }
 if ($stored.PSObject.Properties.Name -contains 'modelEndpoint') { $stored.PSObject.Properties.Remove('modelEndpoint') }
 if ($stored.PSObject.Properties.Name -contains 'modelName') { $stored.PSObject.Properties.Remove('modelName') }
