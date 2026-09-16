@@ -28,6 +28,18 @@ shared/wecom → USERID 访问控制 → 能力路由
 
 机器人进程主动连接 `wss://openws.work.weixin.qq.com`。不需要企业管理后台、自建应用、公网 IP、域名、HTTPS 回调、Nginx、Token、EncodingAESKey 或入站端口。
 
+## LangGraph 与 LangChain 的代码位置
+
+此项目包含主 Agent 与原生 `xbb_chart` 子 Agent，采用 LangGraph 协调完成结果，内部使用 LangChain 组件。
+
+- `shared/codex/agent-graph.js`：实际运行的 StateGraph；等待主 Thread 结果并检查文字交付。完成子图先解析回答，再按是否有图进入子 Agent 完成校验，最后检查当前追问与事实版本是否仍有效。
+- `shared/rag/skill-retriever.js`：BaseRetriever、Document、RunnableSequence 与 RunnableBranch，只检索本地 Skill 规则，普通问题跳过经营规则。
+- `shared/codex/turn-prompt.js`：PromptTemplate 与分支提示链，按变量注入问题、规则和事实，JSON 花括号不会被再次解析。
+- `shared/xbb/langchain-query-tool.js`：DynamicStructuredTool 校验正式 query_xbb Schema，授权、取消信号和进度回调由可信代码绑定，数据仍只经 bundled runner 读取。
+- `shared/codex/response-parser.js`：BaseOutputParser 复用严格文字与图表合同；`shared/langchain/local-execution.js` 隔离回调与追踪上下文，禁止经营内容进入环境继承的 LangSmith tracing。
+
+请求接管仍在原生会话队列同步登记，避免框架异步调度让旧范围查询抢先执行。Codex App Server 继续拥有持久 Thread、turn/steer、动态工具事件和原生子 Agent 委派；LangGraph 不另起模型循环，也不保存第二套业务 checkpoint。图规格未获子 Agent 完成确认时只保留文字并说明缺口。
+
 ## 前置条件
 
 - 国内版企业微信桌面客户端已更新到当前版本。

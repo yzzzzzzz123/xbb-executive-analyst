@@ -8,6 +8,12 @@ const { AccessDeniedError } = require("../security/access-control.js");
 const { sanitizeAgentText } = require("../security/output-sanitizer.js");
 const { SOURCE_FILES, SkillKnowledgeBase } = require("../rag/skill-knowledge-base.js");
 const { routeSkill } = require("../rag/skill-router.js");
+const { createRuleContextChain } = require("../rag/skill-retriever.js");
+const { assertLocalExecution, invokeLocal } = require("../langchain/local-execution.js");
+const { invokeQueryTool } = require("../xbb/langchain-query-tool.js");
+const { createAgentGraph, createCompletionGraph } = require("./agent-graph.js");
+const { AgentResponseParser } = require("./response-parser.js");
+const { buildTurnPrompt } = require("./turn-prompt.js");
 const {
   GATEWAY_FAIL_CLOSED_CODE,
   PROCESS_TREE_UNCONFIRMED_CODE,
@@ -26,7 +32,7 @@ const { ChartAgentTracker } = require("./chart-agent-tracker.js");
 const { VALIDATE_CHART_TOOL, validateChartPreview } = require("./chart-validation-tool.js");
 const { classifyModelError, safeModelErrorCode } = require("./model-error.js");
 const { buildVerifiedFallbackAnswer, falseTechnicalRefusalReason, hasUsableFacts } = require("./recovery-answer.js");
-const { GENERAL_RESPONSE_SCHEMA, WECOM_RESPONSE_SCHEMA, parseAgentResponse, responseContractHash } = require("./response-contract.js");
+const { GENERAL_RESPONSE_SCHEMA, WECOM_RESPONSE_SCHEMA, responseContractHash } = require("./response-contract.js");
 const { loadAgentState, saveAgentState } = require("./state-store.js");
 const { buildThreadInstructions } = require("./thread-instructions.js");
 const {
@@ -309,6 +315,8 @@ class PersistentCodexAgent extends EventEmitter {
     this.projectRoot = config.projectRoot || path.resolve(__dirname, "..", "..");
     this.threadConfig = Object.freeze({ ...this.modelContext, ...CHART_AGENT_CONFIG });
     this.knowledgeBase = options.knowledgeBase || new SkillKnowledgeBase(this.projectRoot);
+    this.ruleContextChain = createRuleContextChain(this.knowledgeBase);
+    this.agentGraph = createAgentGraph();
     this.instructions = options.instructions || buildThreadInstructions(this.projectRoot);
     this.hostFactory = options.hostFactory || LocalAppServerHost;
     this.clientFactory = options.clientFactory || ((host) => new AppServerClient({ endpoint: host.endpoint, token: host.token }));
@@ -330,7 +338,7 @@ class PersistentCodexAgent extends EventEmitter {
       effort: config.codexReasoningEffort,
       modelContext: this.modelContext,
       chartAgent: { config: CHART_AGENT_CONFIG, instructions: chartAgentContract(this.projectRoot) },
-      interaction: "bounded-task-context-recoverable-xbb-skill-v5",
+      interaction: "langgraph-native-codex-and-chart-v1",
       knowledge: this.knowledgeBase.digest,
       sandbox: "read-only",
       approvalPolicy: "never"
@@ -449,7 +457,18 @@ class PersistentCodexAgent extends EventEmitter {
   }
 
   async answer({ question, access, principalKey, messageId, onProgress, onTiming, onAnswerPreview, signal, remainingMs }) {
-    return this._enqueue({ question, access, principalKey, messageId, onProgress, onTiming, onAnswerPreview, signal, remainingMs });
+    assertLocalExecution();
+    const pending = this._enqueue({
+      question, access, principalKey, messageId, onProgress, onTiming, onAnswerPreview, signal, remainingMs
+    });
+    // Observe immediate admission failures while the graph schedules its first node.
+    pending.catch(() => {});
+    const completed = await invokeLocal(this.agentGraph, { completion: () => pending });
+    return completed.result;
+  }
+
+  _queryWithTool(args, access, options) {
+    return invokeQueryTool(this.queryXbb, args, access, options, { strictDataDemand: this.config.strictDataDemand === true });
   }
 
   _assertOperational() {
@@ -811,10 +830,12 @@ class PersistentCodexAgent extends EventEmitter {
       // Strict production queries let the model resolve named entities before
       // any business records are read. The gateway still enforces the demand.
       const fastPlan = requiresDynamicEntityQuery || this.config.strictDataDemand ? null : semanticPlan;
-      const retrieved = businessMode ? this.knowledgeBase.retrieve(question, {
+      const retrieved = await invokeLocal(this.ruleContextChain, { question, businessMode, options: {
         domains: semanticPlan?.domains || [],
         periodCount: semanticPlan?.months?.length || 1
-      }) : null;
+      } });
+      waiter.lifecycle?.throwIfStopped();
+      if (session.active !== active || active.abortController.signal.aborted) return;
       active.queryPlan = semanticPlan;
       active.question = question;
       const continuation = !warmup && (Boolean(preStartContext) || isTaskContinuation(question, session.taskContext, route.mode, route.reason));
@@ -851,7 +872,7 @@ class PersistentCodexAgent extends EventEmitter {
           if (this._handoffSupersededPrefetch(session, active)) return;
           if (subscription.signal.aborted) throw subscription.signal.reason || active.abortController.signal.reason || abortError();
           const queryOutcome = Promise.resolve()
-            .then(() => this.queryXbb(fastPlan, access, {
+            .then(() => this._queryWithTool(fastPlan, access, {
               signal: subscription.signal,
               schedulingProgress: true,
               onTiming: this._queryTimingCallback(session, active, subscription.signal),
@@ -903,49 +924,13 @@ class PersistentCodexAgent extends EventEmitter {
       }
       const continuity = continuation && priorTaskContext && !preStartContext ? [formatTaskContext(priorTaskContext)] : [];
       const taskGuidance = buildComplexTaskGuidance(question, active.taskContext);
-      const text = businessMode
-        ? [
-            "$xbb-executive-analyst",
-            "$xbb-executive-chart",
-            "【能力路由】销帮帮经营 Skill",
-            "需要出图时必须实际调用原生 xbb_chart 子 Agent：model=gpt-6-astra、reasoning_effort=ultra、fork_turns=none。先拿到本轮 ready 事实，再把完整有效问题、必要事实与日期分母覆盖边界、图 Skill 与合同交给它；等待逐项分析及图规格，主 Agent 复核后统一答复。不得仅自行出图却声称已委派；子 Agent 不查询业务或再委派。",
-            "出图前由子 Agent 或你调用 validate_xbb_chart 校验完整图并检查返回的手机预览，按具体错误修正直到通过。money的unit必须为空字符串。最终chart直接使用工具返回的validated引用，不再复制完整规格；子 Agent 未暴露校验工具时由你校验它返回的规格，不能跳过。",
-            "本轮必须交付可独立阅读的文字答复，需要出图时同时交付合格经营图；answer 逐项写明结论、关键数字、依据及限制，图中有数字也不能删减正文，不能只写见图或图表已生成。先合并原问题和仍有效追问，按语义识别全部维度并逐项回答，不按数据域或句号数计数。两个及以上维度必须综合出图，宽泛问题也出图：例如‘今天业绩怎么样’应检查同日总体与公司贡献；明确某公司某日单一金额可免图。总体、时间趋势、分公司比较是三个维度，即使只查询 performance。多个合格维度必须在 composite 分别呈现；缺数维度单独说明，不拖累其他面板。用户明确只要文字时尊重要求。要求图表呈现或综合一点时保留全部原意图。",
-            "查询必须明确 months、domains、metrics，并按用户指定填写 company/person。问今天或明确单日业绩时必须传入上海 date=YYYY-MM-DD，months 仅该日期所属月；月累计不能充当今日值。宽泛业绩分析可取同期间 total 与 ranking，明确总额或某公司单标量只取 total；未问跨期不擅加趋势。只拿回答所需指标、表单与关联记录，不扩大期间或对象。分析深度来自比较、口径复核与证据解释；无目标、同比、利润或因果证据时说明边界。",
-            "【销帮帮 Skill RAG 适用规则】",
-            retrieved.text,
-            ...(prefetchedFactView ? [
-              "【本轮 query_xbb 实时预取事实包】",
-              JSON.stringify(prefetchedFactView),
-              "这是完整事实包经过确定性预算投影后的模型视图，summary、月度趋势、核心排名及覆盖元数据已保留。它已按授权范围实时查询并通过完整性与隐私校验；不要重复查询相同范围。"
-            ] : []),
-            ...(preStartContext ? [
-              "【本轮启动前仍有效的意图链（按出现顺序应用，后续修正优先）】",
-              formatTaskContext(preStartContext),
-              prefetchedFactView
-                ? "以下最新问题优先；较早问题中已被覆盖的期间或范围仅是语义上下文，不得沿用。经营事实只能使用本轮最新范围的预取事实包。"
-                : "以下最新问题优先；较早问题中已被覆盖的期间、公司或人员范围不得沿用，也不得使用旧范围事实。"
-            ] : []),
-            ...(requiresDynamicEntityQuery ? [
-              "【最新实体范围必须动态查询】",
-              "本轮因公司或销售人员范围修正而未注入宽范围事实。必须合并上述意图链中的仍有效期间和业务域，并在给出经营数字或结论前调用 query_xbb：最新消息明确点名实体时才传入准确 company/person；若只是各公司或销售人员的分组维度，则按当前授权集团范围查询。只有用户明确要求单一实体但名称无法唯一识别时才做最小澄清，不得猜名或沿用旧事实。"
-            ] : []),
-            ...continuity,
-            "【可信运行元数据】",
-            `上海日期：${shanghaiDateLabel()}`,
-            `授权范围：${accessLabel(access)}`,
-            "【用户问题】",
-            formatUserMessage(question)
-          ].join("\n")
-        : [
-            "【能力路由】通用 Codex",
-            "本轮不是销帮帮经营查询，不注入经营或辅助图 Skill，不得调用 query_xbb，chart 固定为 null。请直接使用通用能力回答用户。",
-            ...continuity,
-            ...(taskGuidance ? [taskGuidance] : []),
-            ...(active.taskCheckpoint ? [formatTaskCheckpoint(active.taskCheckpoint)] : []),
-            "【用户问题】",
-            formatUserMessage(question)
-          ].join("\n");
+      const text = await buildTurnPrompt({
+        businessMode, question, retrieved, prefetchedFactView, preStartContext,
+        requiresDynamicEntityQuery, continuity, taskGuidance,
+        taskCheckpoint: active.taskCheckpoint, date: shanghaiDateLabel(), scope: accessLabel(access)
+      });
+      waiter.lifecycle?.throwIfStopped();
+      if (session.active !== active || active.abortController.signal.aborted) return;
       const input = [{ type: "text", text, text_elements: [] }];
       if (businessMode) {
         input.push({
@@ -1662,7 +1647,7 @@ class PersistentCodexAgent extends EventEmitter {
       const subscription = this._beginActiveQuery(active);
       let result;
       try {
-        result = await this.queryXbb(args, session.access, {
+        result = await this._queryWithTool(args, session.access, {
           signal: subscription.signal,
           schedulingProgress: true,
           onTiming: this._queryTimingCallback(session, active, subscription.signal, factGeneration),
@@ -1899,25 +1884,26 @@ class PersistentCodexAgent extends EventEmitter {
     const rawAnswer = active.finalText || utf8Prefix(finalItem?.text || "", MAX_AGENT_MESSAGE_BYTES) || active.lastText || "";
     if (turn?.status === "completed" && rawAnswer) {
       try {
-        let answer = parseAgentResponse(rawAnswer, {
+        const responseParser = new AgentResponseParser({
           onChartInvalid: () => this._emit("activity", { status: "chart_failed" }),
           resolveChart: (id) => {
             const chart = active.validatedCharts.get(id);
             return chart && chart.factGeneration === active.factGeneration && chart.revision === active.steerCount ? chart.spec : null;
           }
         });
-        if (active.businessMode && answer.chart) {
-          const revision = active.steerCount;
-          const generation = active.factGeneration;
-          const verified = await active.chartAgents?.completedFor({ parentThreadId: session.threadId, factGeneration: generation, revision });
-          if (session.active !== active || active.abortController.signal.aborted || active.turnId !== turn.id
-              || active.steerCount !== revision || active.factGeneration !== generation) return;
-          if (active.steerInFlight) { active.pendingCompletion = turn; return; }
-          if (!verified) {
-            this._emit("activity", { status: "chart_agent_failed" });
-            answer = { answer: `${answer.answer}\n\n本次图表未通过专职 ultra 子 Agent 完成校验，暂未生成；以上为已核验的数据分析。`, chart: null };
-          }
-        }
+        const revision = active.steerCount;
+        const generation = active.factGeneration;
+        const reviewed = await invokeLocal(createCompletionGraph({
+          parse: (text) => invokeLocal(responseParser, text),
+          businessMode: active.businessMode,
+          verifyChartAgent: () => active.chartAgents?.completedFor({ parentThreadId: session.threadId, factGeneration: generation, revision }),
+          isCurrent: () => session.active === active && !active.abortController.signal.aborted
+            && active.turnId === turn.id && active.steerCount === revision && active.factGeneration === generation,
+          onUnverified: () => this._emit("activity", { status: "chart_agent_failed" })
+        }), { rawAnswer });
+        if (reviewed.stale) return;
+        if (active.steerInFlight) { active.pendingCompletion = turn; return; }
+        let answer = reviewed.answer;
         const refusalReason = active.businessMode ? falseTechnicalRefusalReason(answer.answer, active.latestFactView) : null;
         if (refusalReason) {
           if (this._resolveVerifiedFallback(session, active, refusalReason)) {

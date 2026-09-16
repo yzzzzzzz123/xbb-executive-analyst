@@ -10,6 +10,7 @@ const PROJECT_ROOT = path.resolve(__dirname, "..");
 const SUITES = Object.freeze({
   unit: Object.freeze([
     "verify-project-boundaries.js",
+    "verify-agent-framework.js",
     "verify-context-policy.js",
     "verify-task-checkpoint.js",
     "verify-answer-preview.js",

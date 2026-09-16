@@ -14,15 +14,18 @@ const ALLOWED_LAYERS = {
   config: new Set(),
   security: new Set(),
   observability: new Set(["security"]),
-  xbb: new Set(["security", "observability", "chart-contract"]),
-  rag: new Set(["security", "observability"]),
-  codex: new Set(["security", "observability", "xbb", "rag", "chart-contract"]),
+  langchain: new Set(),
+  xbb: new Set(["security", "observability", "langchain", "chart-contract"]),
+  rag: new Set(["security", "observability", "langchain"]),
+  codex: new Set(["security", "observability", "langchain", "xbb", "rag", "chart-contract"]),
   wecom: new Set(["config", "security", "observability", "xbb", "rag", "codex"]),
   "chart-contract": new Set(),
 };
 const ALLOWED_PACKAGES = {
-  xbb: new Set(["sharp"]),
-  codex: new Set(["ws"]),
+  langchain: new Set(["@langchain/core/singletons", "langsmith/run_trees", "langsmith/traceable"]),
+  xbb: new Set(["sharp", "@langchain/core/tools"]),
+  rag: new Set(["@langchain/core/retrievers", "@langchain/core/documents", "@langchain/core/runnables"]),
+  codex: new Set(["ws", "@langchain/langgraph", "@langchain/core/output_parsers", "@langchain/core/prompts", "@langchain/core/runnables"]),
   wecom: new Set(["@wecom/aibot-node-sdk", "sharp"]),
 };
 // Transport may format/render a result and recover orphaned workers at startup.
@@ -39,6 +42,7 @@ const CODEX_XBB_MODULES = new Set([
   "shared/xbb/runner-isolation.js",
   "shared/xbb/model-fact-view.js",
   "shared/xbb/query-tool.js",
+  "shared/xbb/langchain-query-tool.js",
   "shared/xbb/fast-query-plan.js",
   "shared/xbb/query-progress.js",
 ]);
@@ -85,7 +89,7 @@ for (const file of files) {
   for (const [, , specifier] of imports) {
     dependencies += 1;
     if (BUILTINS.has(specifier)) {
-      if (["security", "observability", "rag", "chart-contract"].includes(sourceLayer)) {
+      if (["security", "observability", "langchain", "rag", "chart-contract"].includes(sourceLayer)) {
         assert.ok(!/^(?:node:)?(?:https?|http2|net|tls|dgram|child_process|worker_threads)$/.test(specifier), `Foundation layer starts network/process work: ${relative(file)} -> ${specifier}`);
       }
       continue;

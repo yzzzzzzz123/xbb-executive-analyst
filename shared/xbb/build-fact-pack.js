@@ -282,10 +282,6 @@ function userMap(source) {
   return new Map((source.records.user || []).map((user) => [asText(user.userId), user]));
 }
 
-function productFor(record, attr, products) {
-  return products.get(relationId(field(record, attr)));
-}
-
 function evidenceRefs(rows) {
   return unique(rows.map((row) => asText(row && row.evidenceRef)));
 }
