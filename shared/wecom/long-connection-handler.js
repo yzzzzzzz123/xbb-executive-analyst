@@ -9,6 +9,7 @@ const { routeSkill } = require("../rag/skill-router.js");
 const { chartTypeLabel, formatDuration } = require("../xbb/query-progress.js");
 const { createWecomChartImage } = require("./chart-image.js");
 const { MessageStore, MessageStoreCapacityError } = require("./message-store.js");
+const { splitMarkdownText } = require("./text-delivery.js");
 const { createRequestMetrics } = require("../observability/request-metrics.js");
 const { DeliveryTimeoutError, createDeliveryDeadline, validateBudget, withinBudget } = require("./delivery-budget.js");
 
@@ -439,17 +440,46 @@ function createLongConnectionHandler({
       }
       rememberRoute(userId, routeMode);
       let answerVisible = false;
+      let standaloneText = "";
+      let standaloneTextReply;
+      const target = message.chattype === "group" ? String(message.chatid || "") : userId;
+      const deliverStandaloneText = async (content, streamError) => {
+        if (!target || typeof client.sendMessage !== "function") throw streamError || new Error("企业微信独立文字通道不可用。");
+        // A render failure may append a notice after the original answer was
+        // delivered. Send only that addition; never resend successful chunks.
+        const unsent = standaloneText && content.startsWith(standaloneText) ? content.slice(standaloneText.length) : content;
+        for (const part of splitMarkdownText(unsent)) {
+          standaloneTextReply = await deadline.run(() => client.sendMessage(target, {
+            msgtype: "markdown", markdown: { content: part }
+          }), replyBudgetMs);
+        }
+        standaloneText = content;
+        if (!answerVisible) metrics.mark("answerVisibleMs");
+        answerVisible = true;
+        writeStatus({ status: "text_standalone_delivered" });
+        return standaloneTextReply;
+      };
       if (chart) {
-        // Send a complete readable answer before rasterization or upload. This
-        // remains the same stream; the final packet still includes an image or
-        // follows successful standalone delivery. No generic progress replaces it.
+        // No image may be dispatched without an ACK for the complete answer.
+        // Long analysis can outlive the passive stream; active Markdown uses
+        // a fresh request ID and the same authorized conversation target.
         const visible = `${answer}\n\n正在制作：${chartTypeLabel(chart.type)}，图片随后补齐。`;
         messageStore.update(messageId, visible);
         try {
           await replyStream(visible, false);
           answerVisible = true;
           metrics.mark("answerVisibleMs");
-        } catch { /* Final reply retains the complete answer and image for replay. */ }
+        } catch (streamError) {
+          writeStatus({ status: "text_stream_failed" });
+          try { await deliverStandaloneText(answer, streamError); }
+          catch (error) {
+            messageStore.complete(messageId, answer, []);
+            writeStatus({ status: "text_delivery_failed" });
+            failureClass = error?.code === "REQUEST_DEADLINE_EXCEEDED" ? "deadline_exceeded" : error instanceof DeliveryTimeoutError ? "delivery_timeout" : "transport_failed";
+            finishMetrics(routeMode, "none", "failed");
+            throw error;
+          }
+        }
       }
       let msgItem = [];
       let imageBuffer = null;
@@ -471,7 +501,6 @@ function createLongConnectionHandler({
         }
       }
       let uploadedMediaId = null;
-      const target = message.chattype === "group" ? String(message.chatid || "") : userId;
       if (imageBuffer && target && typeof client.uploadMedia === "function" && typeof client.sendMediaMessage === "function") {
         try {
           const uploaded = await metrics.measure("uploadMs", () => deadline.run((isOpen) => retryTransient(
@@ -505,15 +534,31 @@ function createLongConnectionHandler({
           writeStatus({ status: "chart_media_delivery_failed" });
         }
       }
-      const inlineItems = standaloneDelivered ? [] : msgItem;
+      const inlineItems = standaloneDelivered ? [] : [...msgItem];
       // 首次若已用独立 media 消息送图，正文不重复内嵌；缓存仍保存完整图片项，
       // 让企业微信重放同一 msgid 时也不会只收到文字。
       messageStore.complete(messageId, answer, msgItem);
       let reply;
       try {
-        reply = await replyStream(answer, true, inlineItems);
+        if (standaloneText && !inlineItems.length) {
+          reply = standaloneText === answer ? standaloneTextReply : await deliverStandaloneText(answer);
+        } else {
+          try { reply = await replyStream(answer, true, inlineItems); }
+          catch (error) {
+            writeStatus({ status: "text_stream_failed" });
+            reply = standaloneText === answer ? standaloneTextReply : await deliverStandaloneText(answer, error);
+            // A failed inline packet is not an image delivery. The independent
+            // text remains usable even if both image transports are unavailable.
+            if (inlineItems.length) {
+              inlineItems.length = 0;
+              if (outcome === "success") outcome = "degraded";
+              writeStatus({ status: "chart_failed" });
+            }
+          }
+        }
         if (!answerVisible) metrics.mark("answerVisibleMs");
       } catch (error) {
+        writeStatus({ status: "text_delivery_failed" });
         failureClass = error?.code === "REQUEST_DEADLINE_EXCEEDED" ? "deadline_exceeded" : error instanceof DeliveryTimeoutError ? "delivery_timeout" : "transport_failed";
         finishMetrics(routeMode, standaloneDelivered ? "standalone" : msgItem.length ? "failed" : "none", "failed");
         throw error;
@@ -523,7 +568,7 @@ function createLongConnectionHandler({
         writeStatus({ status: "chart_delivered" });
       }
       writeStatus({ status: "reply_completed", elapsedMs: Date.now() - receivedAtMs });
-      finishMetrics(routeMode, standaloneDelivered ? "standalone" : inlineItems.length ? "inline" : "none");
+      finishMetrics(routeMode, standaloneDelivered ? "standalone" : inlineItems.length ? "inline" : msgItem.length ? "failed" : "none");
       return reply;
     }
   });

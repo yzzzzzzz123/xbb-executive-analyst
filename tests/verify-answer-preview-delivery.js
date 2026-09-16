@@ -239,5 +239,110 @@ function previews(replies) { return replies.filter((reply) => reply.content.star
     assert.deepEqual(missing.replies.at(-1).items, []);
     assert.equal(missing.statuses.at(-1).outcome, "failed", "不能把只有图片的结果标为成功");
   }
-  console.log(JSON.stringify({ success: true, synthetic: true, scenarios: 18, realMessagesSent: 0 }));
+  // Reproduce the production failure at the transport boundary: analysis
+  // succeeds after ten minutes, passive replies fail, active images still work.
+  const { MARKDOWN_PART_BYTES, splitMarkdownText } = require("../shared/wecom/text-delivery.js");
+  const completeText = "离线虚构验收：公司甲100元，课程60%、咨询40%；公司乙80元，课程25%、咨询75%。\n".repeat(70) + "口径与缺口：仅为测试，不是真实业绩。😀";
+  assert.equal(splitMarkdownText(completeText).join(""), completeText);
+  assert.equal(splitMarkdownText("😀".repeat(1400)).join(""), "😀".repeat(1400));
+  for (const mode of ["expired-single", "expired-group", "text-only", "final-only", "text-rejected", "text-timeout", "deadline", "image-rejected", "render-rejected"]) {
+    let now = 0;
+    const events = [];
+    const markdown = [];
+    let analysisComplete = false;
+    let renders = 0;
+    const useChart = mode !== "text-only";
+    const result = fixture(`fallback-${mode}`, async () => {
+      analysisComplete = true;
+      now = 610000;
+      return { answer: completeText, chart: useChart ? { type: "bar" } : null, routeMode: useChart ? "xbb" : "general" };
+    }, {
+      monotonicNow: () => now, replyBudgetMs: 30,
+      chartRenderer: async () => {
+        renders += 1;
+        if (mode !== "final-only") assert.equal(markdown.join(""), completeText, "完整文字须先获得回执，才能出图");
+        if (mode === "render-rejected") throw new Error("synthetic render rejection");
+        events.push("render"); return { item: chartItem, buffer: Buffer.from("synthetic image") };
+      }
+    });
+    if (useChart) result.frame.body.text.content = "对集团业绩按照公司名称排名，区分课程和咨询占比";
+    if (mode === "expired-group") {
+      result.frame.body.chattype = "group";
+      result.frame.body.chatid = "synthetic-group";
+    }
+    const destination = mode === "expired-group" ? "synthetic-group" : "synthetic-preview-user";
+    const originalReply = result.client.replyStream;
+    result.client.replyStream = async (...args) => {
+      if (analysisComplete && (mode !== "final-only" || args[3])) {
+        if (mode === "deadline") now = 20 * 60 * 1000;
+        throw new Error("synthetic passive reply expired");
+      }
+      return originalReply(...args);
+    };
+    result.client.sendMessage = async (target, body) => {
+      assert.equal(target, destination, "补发必须留在原授权会话，群聊不能变成私聊");
+      assert.equal(body.msgtype, "markdown");
+      assert.ok(Buffer.byteLength(body.markdown.content, "utf8") <= MARKDOWN_PART_BYTES);
+      assert.doesNotMatch(body.markdown.content, /\uFFFD/);
+      if (mode === "text-rejected") throw new Error("synthetic text rejection");
+      if (mode === "text-timeout") return new Promise(() => {});
+      markdown.push(body.markdown.content); events.push("text");
+      return { errcode: 0 };
+    };
+    result.client.uploadMedia = async () => ({ media_id: "synthetic-image" });
+    result.client.sendMediaMessage = async (target) => {
+      assert.equal(target, destination);
+      if (mode === "image-rejected") throw new Error("synthetic media rejection");
+      events.push("image"); return { errcode: 0 };
+    };
+    if (["text-rejected", "text-timeout", "deadline"].includes(mode)) {
+      await assert.rejects(() => result.handler.handleMessage(result.frame, result.client));
+      assert.equal(renders, 0, "文字未确认交付，不得出图或只发图片");
+      assert.equal(events.includes("image"), false);
+      assert.equal(result.statuses.at(-1).outcome, "failed");
+      assert.equal(Object.hasOwn(result.statuses.at(-1).timings, "answerVisibleMs"), false);
+    } else {
+      await result.handler.handleMessage(result.frame, result.client);
+      assert.ok(markdown.join("").startsWith(completeText), "排名、占比、口径和缺口均须保留");
+      if (mode !== "render-rejected") assert.equal(markdown.join(""), completeText, "不能重复补发已经确认送达的正文");
+      else assert.match(markdown.join(""), /图表暂未生成/);
+      const metric = result.statuses.at(-1);
+      assert.ok(Number.isInteger(metric.timings.answerVisibleMs));
+      assert.equal(metric.outcome, ["image-rejected", "render-rejected"].includes(mode) ? "degraded" : "success");
+      if (["expired-single", "expired-group"].includes(mode)) {
+        assert.ok(events.lastIndexOf("text") < events.indexOf("image"));
+        assert.equal(events.filter((event) => event === "image").length, 1);
+        assert.equal(metric.imageDelivery, "standalone");
+      }
+      if (mode === "image-rejected") assert.equal(metric.imageDelivery, "failed");
+      assert.equal(result.store.messages.get(result.frame.body.msgid).content.startsWith(completeText), true, "重放缓存必须保留完整文字");
+    }
+    assert.doesNotMatch(JSON.stringify(result.statuses), /公司甲|synthetic-preview-user|synthetic-group|synthetic passive/);
+  }
+  // Exercise the installed official SDK's payload and fresh req_id construction
+  // without connecting to WeCom or sending a real user any test message.
+  const { WSClient } = require("@wecom/aibot-node-sdk");
+  const sdk = new WSClient({ botId: "synthetic", secret: "synthetic", logger: { debug() {}, info() {}, warn() {}, error() {} } });
+  const sdkPackets = [];
+  let sdkAnalysisComplete = false;
+  sdk.wsManager.sendReply = async (reqId, body, command = "aibot_respond_msg") => {
+    sdkPackets.push({ reqId, body, command });
+    if (sdkAnalysisComplete && command === "aibot_respond_msg") throw { errcode: 400, errmsg: "synthetic expired request" };
+    return { errcode: 0 };
+  };
+  const sdkFixture = fixture("official-sdk", async () => {
+    sdkAnalysisComplete = true;
+    return { answer: completeText, chart: null, routeMode: "general" };
+  });
+  await sdkFixture.handler.handleMessage(sdkFixture.frame, sdk);
+  const activePackets = sdkPackets.filter((packet) => packet.command === "aibot_send_msg");
+  assert.ok(activePackets.length > 1);
+  assert.equal(activePackets.map((packet) => packet.body.markdown.content).join(""), completeText);
+  assert.equal(new Set(activePackets.map((packet) => packet.reqId)).size, activePackets.length);
+  for (const packet of activePackets) {
+    assert.notEqual(packet.reqId, sdkFixture.frame.headers.req_id);
+    assert.equal(packet.body.chatid, sdkFixture.frame.body.from.userid);
+    assert.equal(packet.body.msgtype, "markdown");
+  }
+  console.log(JSON.stringify({ success: true, synthetic: true, scenarios: 28, realMessagesSent: 0 }));
 })().catch((error) => { console.error(error); process.exitCode = 1; }).finally(() => clearInterval(keepAlive));
