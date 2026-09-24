@@ -63,6 +63,10 @@ assert.equal(isBusinessFollowUp("为什么"), true);
 assert.equal(isBusinessFollowUp("真实的说"), true);
 assert.equal(isBusinessFollowUp("只看风险"), true);
 assert.equal(isBusinessFollowUp("为什么天空是蓝色的"), false);
+for (const question of ["上个月呢", "那8月呢？", "去年呢", "是没有这个数据吗？"]) {
+  assert.deepEqual(routeSkill(question, "xbb"), { mode: "xbb", reason: "business-follow-up" });
+  assert.equal(routeSkill(question, "general").mode, "general");
+}
 assert.deepEqual(routeSkill("全年业绩", null), { mode: "xbb", reason: "explicit-business-intent" });
 assert.deepEqual(routeSkill("继续", "xbb"), { mode: "xbb", reason: "business-follow-up" });
 assert.deepEqual(routeSkill("继续", "general"), { mode: "general", reason: "general-intent" });

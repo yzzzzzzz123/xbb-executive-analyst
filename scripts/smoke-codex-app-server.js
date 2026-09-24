@@ -38,7 +38,7 @@ async function runSmoke() {
     codexAutoCompactTokenLimit: runtime.codexAutoCompactTokenLimit || 750000,
     codexProxyUrl: runtime.codexProxyUrl,
     codexCommand: runtime.codexCommand,
-    strictDataDemand: true
+    modelDrivenQueries: true
   };
   verifyCodexChatGptLogin(config);
   const codexVersion = readCodexVersion(config);

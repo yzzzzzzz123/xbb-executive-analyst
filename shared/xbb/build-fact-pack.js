@@ -430,7 +430,14 @@ function resolveEntity(input, candidates, type) {
   }
   if (matches.length === 1) return { status: "resolved", input: asText(input), resolved: matches[0], candidates: matches };
   if (matches.length > 1) return { status: "needs_disambiguation", input: asText(input), resolved: null, candidates: matches.slice(0, 12) };
-  return { status: "not_found", input: asText(input), resolved: null, candidates: candidates.slice(0, 12), entityType: type };
+  // Similar names are suggestions only. Never silently turn a one-character
+  // typo into authorization to query another person's records.
+  const suggestions = type === "person" ? candidates.filter((candidate) => {
+    const name = normalizeName(candidate.name);
+    return requested.length >= 2 && name.length === requested.length
+      && Array.from(name).filter((character, index) => character !== requested[index]).length === 1;
+  }) : candidates;
+  return { status: "not_found", input: asText(input), resolved: null, candidates: suggestions.slice(0, 12), entityType: type };
 }
 
 function buildPerformance(source, products, company) {

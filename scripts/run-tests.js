@@ -29,6 +29,8 @@ const SUITES = Object.freeze({
     "verify-watchdog-launcher.js",
   ]),
   integration: Object.freeze([
+    "verify-web-experience.js",
+    "verify-web-supervisor.js",
     "verify-facts.js",
     "verify-query-scheduling.js",
     "verify-multi-period-consumers.js",
@@ -42,6 +44,7 @@ const SUITES = Object.freeze({
     "verify-wecom-long-connection.js",
   ]),
   windows: Object.freeze([
+    "verify-runner-utf8.js",
     "verify-secure-config.ps1",
     "verify-hidden-task.ps1",
   ]),

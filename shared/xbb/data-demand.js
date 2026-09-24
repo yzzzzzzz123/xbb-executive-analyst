@@ -1,7 +1,7 @@
 "use strict";
 
 // One request contract controls source dependencies and the model-facing view.
-// Metrics are capabilities, not permission to load an entire business domain.
+// Metrics are optional projections; omitting them returns the complete authorized domain.
 const METRICS = Object.freeze({
   "performance.total": "performance", "performance.ranking": "performance", "performance.mix": "performance", "performance.trend": "performance",
   "tickets.ranking": "product-sales", "tickets.mix": "product-sales",
@@ -13,85 +13,11 @@ const METRICS = Object.freeze({
 
 function validateMetrics(metrics, domains) {
   if (!Array.isArray(metrics) || !metrics.length || metrics.length > Object.keys(METRICS).length
-      || metrics.some((metric) => typeof metric !== "string" || !Object.hasOwn(METRICS, metric))) throw new Error("必须明确指定本次需要的有效指标，不能扩大取数范围。");
+      || metrics.some((metric) => typeof metric !== "string" || !Object.hasOwn(METRICS, metric))) throw new Error("metrics 投影包含无效指标；可省略 metrics 查询所选数据域的完整事实。");
   const unique = [...new Set(metrics)].sort();
   const selected = [...new Set(unique.map((metric) => METRICS[metric]))].sort();
-  if (domains && JSON.stringify(selected) !== JSON.stringify([...new Set(domains)].sort())) throw new Error("指标与数据域必须完全对应，不能顺带查询其他数据域。");
+  if (domains && JSON.stringify(selected) !== JSON.stringify([...new Set(domains)].sort())) throw new Error("指定 metrics 投影时，指标与数据域必须完全对应；跨域完整查询可省略 metrics。");
   return unique;
-}
-
-function specifiedCompany(question) {
-  const named = [...String(question || "").matchAll(/([\p{Script=Han}A-Za-z0-9]{0,30}(?:分公司|公司))/gu)].at(-1)?.[1];
-  const generic = /^(?:(?:请|查询|看下|看看|今年|本年|本月|这个月|当月|今天|今日|昨天|昨日|目前|的|\d{4}年|\d{1,2}月|\d{1,2}[日号]))*公司$/u.test(named || "");
-  return named && !generic && !/集团|各个|各分|各公司|全部|所有|我们|咱们|哪个|哪家|按公司/u.test(named) ? named : null;
-}
-
-function inferMetrics(question, domains, scope = {}) {
-  const text = String(question || "").replace(/\s+/g, "")
-    .replace(/(?:不要|不用|无需|不需要|不看|不查)(?:查询|读取|分析|看)?(?:商机)?(?:跟进(?:记录|内容|质量)?|质量|激活(?:建议)?|预计成交金额|金额|阶段|占比|趋势)/gu, "");
-  const selected = [];
-  const add = (metric, condition = true) => { if (condition) selected.push(metric); };
-  const rank = /排名|排行|各(?:个)?(?:分)?公司|哪个公司|哪个分公司|谁最高|哪家/u.test(text)
-    || /分公司/u.test(text) && !specifiedCompany(question) && !scope.company && !scope.person;
-  const mix = /占比|构成|结构|区分|拆分/u.test(text);
-  if (domains.includes("performance")) {
-    const broadPerformance = /业绩(?:情况|表现)?(?:怎么样|如何)|业绩(?:情况|表现|分析)(?:[。？！!?]|$)|(?:分析|看看|看下).{0,10}业绩(?:[。？！!?]|$)/u.test(text)
-      && !/金额|数量|多少|几单|总数|总额|总量|只(?:要|看)|仅(?:要|看)/u.test(text)
-      && !specifiedCompany(question) && !scope.company && !scope.person;
-    add("performance.ranking", rank || broadPerformance);
-    add("performance.total", !rank || /集团.{0,8}(?:怎么样|总|累计)|公司(?:的)?业绩怎么样|整体|总体/u.test(text));
-    add("performance.mix", mix || /课程.{0,6}咨询|咨询.{0,6}课程/u.test(text));
-    add("performance.trend", /趋势|走势|逐月|每月|月度|环比|同比|增长|回落/u.test(text));
-  }
-  if (domains.includes("product-sales")) {
-    for (const [prefix, pattern] of [["tickets", /门票|开源产品/u], ["commercial", /商业操盘/u]]) {
-      if (pattern.test(text)) { add(`${prefix}.ranking`); add(`${prefix}.mix`, mix); }
-    }
-  }
-  if (domains.includes("courses")) {
-    add("courses.count", /多少.{0,3}课|开课|堂课|场次|课程数/u.test(text));
-    add("courses.bosses", /老板/u.test(text));
-    add("courses.positions", /职位|岗位/u.test(text));
-    add("courses.amount", /金额|收入|业绩|回款/u.test(text));
-    add("courses.conversion", /成(?:交|家)率|转化率/u.test(text));
-  }
-  if (domains.includes("opportunities")) {
-    add("opportunities.count", /多少|数量|个数|计数|创建/u.test(text) && (!/赢单/u.test(text) || /创建|新增/u.test(text)));
-    add("opportunities.amount", /金额|预计成交/u.test(text));
-    add("opportunities.wins", /赢单/u.test(text));
-    add("opportunities.stages", /阶段|分布|漏斗/u.test(text));
-    add("opportunities.quality", /质量|跟进|遗忘|激活|风险|有效|建议|诊断/u.test(text));
-  }
-  if (domains.includes("delivery")) {
-    add("delivery.invitations", /邀约|受邀|到场|交付/u.test(text));
-    add("delivery.amount", /金额|回款|业绩分配/u.test(text));
-  }
-  return validateMetrics(selected, domains);
-}
-
-function bindQueryDemand(input, question, authoritativePlan = null) {
-  const { routeDomains, planFastQuery } = require("./fast-query-plan.js");
-  const allowedDomains = authoritativePlan?.domains || routeDomains(question);
-  if ((input.domains || []).some((domain) => !allowedDomains.includes(domain))) throw new Error("不能查询问题未涉及的数据域。");
-  const periodPlan = authoritativePlan || planFastQuery(question);
-  if (!periodPlan || (input.months || []).some((month) => !periodPlan.months.includes(month))) throw new Error("查询月份超出用户所问范围。");
-  if ((input.date || null) !== (periodPlan.date || null)) throw new Error("查询日期必须与用户所问单日完全一致，不能遗漏日期后改查整月。");
-  let allowed = inferMetrics(question, input.domains || [], input);
-  for (const correction of String(question).split("\n").slice(1)) {
-    if (!/只看|仅看|只要|仅要|改看|改为/u.test(correction)) continue;
-    // A restrictive metric correction replaces the older metric intent when
-    // it can be understood in the already authorized domain.
-    try { allowed = inferMetrics(correction, input.domains || [], input); } catch { /* period/presentation correction only */ }
-  }
-  const metrics = input.metrics ? validateMetrics(input.metrics, input.domains) : allowed;
-  if (metrics.some((metric) => !allowed.includes(metric))) throw new Error("查询超出用户所问指标，请只获取当前问题明确需要的数据。");
-  if (specifiedCompany(question) && !input.company) {
-    throw new Error("用户指定了公司，必须先确定 company 再查询；不得扩大为集团。");
-  }
-  if (input.company && !String(question).includes(input.company) && !String(question).includes(input.company.replace(/(?:区域)?(?:分)?公司$/u, ""))) throw new Error("公司筛选不属于当前用户问题，不能另查其他公司。");
-  if (input.person && !String(question).includes(input.person)) throw new Error("销售人员筛选不属于当前用户问题。");
-  if (!input.person && /销售(?:员|人员)?[：:]?[\p{Script=Han}]{2,4}(?:这个月|本月|当月|创建)|[\p{Script=Han}]{2,4}(?:这个月|本月|当月)创建.{0,5}商机/u.test(String(question)) && !/集团|公司|各个|所有/u.test(String(question))) throw new Error("用户指定了销售，必须先明确 person；不得读取集团商机。");
-  return { ...input, metrics };
 }
 
 function sourceCollections(metrics) {
@@ -189,4 +115,4 @@ function projectFacts(facts, metrics) {
   return result;
 }
 
-module.exports = { METRICS, validateMetrics, inferMetrics, bindQueryDemand, sourceCollections, sourceFields, projectFacts };
+module.exports = { METRICS, validateMetrics, sourceCollections, sourceFields, projectFacts };

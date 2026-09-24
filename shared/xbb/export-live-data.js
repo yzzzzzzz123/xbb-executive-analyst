@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { validateMetrics, sourceCollections, sourceFields } = require("./data-demand.js");
 const { validateRequestedDate, validateDateScope } = require("./fast-query-plan.js");
+const { resolveEntity } = require("./build-fact-pack.js");
 
 const API_BASE = String(process.env.XBB_API_BASE || "").replace(/\/$/, "");
 const CORPID = String(process.env.XBB_CORPID || "");
@@ -688,8 +689,19 @@ async function buildLiveDataset(month, domains = "all", demand = {}) {
   const metadata = await loadMetadata(required);
   let resolvedCompany = null;
   const identityUsers = demand.person ? await loadUserDirectory() : [];
-  const personMatches = demand.person ? identityUsers.filter((user) => user.name === demand.person) : [];
-  if (demand.person && personMatches.length !== 1) throw new Error("指定销售未能唯一识别，请提供准确姓名；未读取集团商机。");
+  const personResolution = resolveEntity(demand.person, identityUsers.map((user) => ({ ...user, id: user.userId })), "person");
+  const personMatches = personResolution.status === "resolved"
+    ? identityUsers.filter((user) => user.userId === personResolution.resolved.id) : [];
+  if (demand.person && personResolution.status !== "resolved") {
+    // Return directory evidence for clarification before reading any business
+    // records. A misspelled/ambiguous name is not a transport failure or zero sales.
+    const candidateIds = new Set(personResolution.candidates.map((user) => user.id));
+    return {
+      month, ...(date ? { date } : {}), range, loadedAt: new Date().toISOString(), metadata, metrics,
+      collections: Object.fromEntries([...required].filter((name) => name !== "user").map((name) => [name, []])),
+      users: identityUsers.filter((user) => candidateIds.has(user.userId))
+    };
+  }
   if (demand.person && !required.has("opportunity")) throw new Error("当前数据口径不支持按此销售筛选，未扩大查询。");
   let organizerCondition = null;
   let knownDepartments = [];

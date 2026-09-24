@@ -119,7 +119,9 @@ $htmlFiles = @(
     Get-ChildItem -LiteralPath (Join-Path $projectRoot 'skills') -Filter '*.html' -File -Recurse -ErrorAction SilentlyContinue
     Get-ChildItem -LiteralPath (Join-Path $projectRoot 'shared') -Filter '*.html' -File -Recurse -ErrorAction SilentlyContinue
 )
-if ($htmlFiles.Count -ne 0) { throw "HTML is forbidden in the formal Skill/runtime: $($htmlFiles.FullName -join ', ')" }
+$webEntry = Join-Path $projectRoot 'shared\web\assets\index.html'
+$forbiddenHtml = @($htmlFiles | Where-Object { $_.FullName -ne $webEntry })
+if ($forbiddenHtml.Count -ne 0) { throw "HTML is only allowed in the invited web chat entry: $($forbiddenHtml.FullName -join ', ')" }
 
 $forbiddenRuntime = @(Find-ProjectTextMatch -Pattern 'serve-published|publish-codex-analysis|xbb-visual-shell|销帮帮经营分析-老板驾驶舱Demo' -Roots @($projectRoot) -ExcludedFileNames @('verify-skill.ps1'))
 if ($forbiddenRuntime.Count -gt 0) { throw "Legacy Demo runtime remains: $($forbiddenRuntime -join [Environment]::NewLine)" }
@@ -132,7 +134,7 @@ if ($forbiddenModelLoop.Count -gt 0) { throw "Legacy model loop remains: $($forb
 Write-Output ([ordered]@{
     success = $true
     skills = @('xbb-executive-analyst', 'xbb-executive-chart')
-    htmlFiles = 0
+    htmlFiles = $htmlFiles.Count
     projectTests = 'separate: npm test (or npm run verify:production for the complete gate)'
     quickValidate = 'passed'
     javascriptFiles = $javascriptFiles.Count

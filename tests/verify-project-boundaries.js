@@ -19,6 +19,7 @@ const ALLOWED_LAYERS = {
   rag: new Set(["security", "observability", "langchain"]),
   codex: new Set(["security", "observability", "langchain", "xbb", "rag", "chart-contract"]),
   wecom: new Set(["config", "security", "observability", "xbb", "rag", "codex"]),
+  web: new Set(["config", "security", "codex", "xbb"]),
   "chart-contract": new Set(),
 };
 const ALLOWED_PACKAGES = {
@@ -27,6 +28,7 @@ const ALLOWED_PACKAGES = {
   rag: new Set(["@langchain/core/retrievers", "@langchain/core/documents", "@langchain/core/runnables"]),
   codex: new Set(["ws", "@langchain/langgraph", "@langchain/core/output_parsers", "@langchain/core/prompts", "@langchain/core/runnables"]),
   wecom: new Set(["@wecom/aibot-node-sdk", "sharp"]),
+  web: new Set(["sharp"]),
 };
 // Transport may format/render a result and recover orphaned workers at startup.
 // It must never compile facts or invoke the business query gateway directly.
@@ -83,7 +85,7 @@ for (const file of files) {
   assert.ok(!/\bimport\s*\(/.test(source), `Dynamic import is not covered by CommonJS boundary checks: ${relative(file)}`);
   const imports = [...source.matchAll(/\brequire\s*\(\s*(["'])([^"']+)\1\s*\)/g)];
   assert.equal(imports.length, [...source.matchAll(/\brequire\s*\(/g)].length, `Computed require is not covered by boundary checks: ${relative(file)}`);
-  if (["codex", "wecom", "rag"].includes(sourceLayer)) {
+  if (["codex", "wecom", "web", "rag"].includes(sourceLayer)) {
     assert.ok(!/credentials\.json|process\.env\.XBB_(?:API_BASE|API_TOKEN|CORPID)\b/.test(source), `Business credentials bypass the approved runner: ${relative(file)}`);
   }
   for (const [, , specifier] of imports) {
@@ -107,6 +109,9 @@ for (const file of files) {
     }
     if (sourceLayer === "codex" && targetLayer === "xbb") {
       assert.ok(CODEX_XBB_MODULES.has(relative(target)), `Agent bypasses its governed business interface: ${relative(file)} -> ${relative(target)}`);
+    }
+    if (sourceLayer === "web" && targetLayer === "xbb") {
+      assert.equal(relative(target), "shared/xbb/render-chart.js", `Web transport directly invokes business internals: ${relative(file)} -> ${relative(target)}`);
     }
     graph.get(file).push(target);
   }

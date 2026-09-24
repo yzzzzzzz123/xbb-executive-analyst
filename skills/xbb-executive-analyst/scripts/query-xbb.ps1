@@ -251,7 +251,10 @@ if ($RequestFromStdin) {
             throw 'RequestFromStdin cannot be combined with business-scope command-line parameters.'
         }
     }
-    $requestText = [Console]::In.ReadToEnd()
+    # Node writes UTF-8 to this pipe. Console.In inherits the Windows console
+    # code page (often GBK), which silently corrupts Chinese entity names.
+    $requestReader = [IO.StreamReader]::new([Console]::OpenStandardInput(), [Text.UTF8Encoding]::new($false, $true), $false, 1024, $true)
+    try { $requestText = $requestReader.ReadToEnd() } finally { $requestReader.Dispose() }
     if ([string]::IsNullOrWhiteSpace($requestText) -or
         [Text.UTF8Encoding]::new($false).GetByteCount($requestText) -gt 8192) {
         throw 'Runner stdin request is missing or exceeds the safe size limit.'

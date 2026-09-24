@@ -9,6 +9,11 @@
   },
   "scripts": {
     "start": "node shared/wecom/server.js",
+    "start:web": "node shared/web/server.js",
+    "web:start": "node scripts/web-experience.js start",
+    "web:local": "node scripts/web-experience.js local",
+    "web:status": "node scripts/web-experience.js status",
+    "web:stop": "node scripts/web-experience.js stop",
     "smoke:app-server": "node scripts/smoke-codex-app-server.js",
     "smoke:business": "node scripts/smoke-codex-app-server.js --business",
     "test": "node scripts/run-tests.js",

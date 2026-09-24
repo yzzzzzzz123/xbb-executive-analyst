@@ -47,7 +47,7 @@ function readProbeConfig() {
   if (!/^[a-zA-Z0-9._-]{1,128}$/.test(codexModel) || !["none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(codexReasoningEffort)) throw new Error("本机模型配置不合法。");
   const productionStatePath = process.env.XBB_AGENT_STATE_PATH || configured.agentStatePath || path.join(runtimeRoot(), "agent-state.json");
   if (!path.isAbsolute(productionStatePath)) throw new Error("生产状态文件必须是绝对路径。");
-  return { codexModel, codexReasoningEffort, codexProxyUrl: configured.codexProxyUrl, codexCommand: configured.codexCommand, strictDataDemand: true, productionStatePath };
+  return { codexModel, codexReasoningEffort, codexProxyUrl: configured.codexProxyUrl, codexCommand: configured.codexCommand, modelDrivenQueries: true, productionStatePath };
 }
 
 async function liveProbe(options) {

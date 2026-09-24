@@ -1837,83 +1837,98 @@ class FakeAppServerClient extends EventEmitter {
     assert.match((await overSteerBudget).answer, /新 Turn/);
     await boundsAgent.close();
 
-    const preciseClient = new FakeAppServerClient();
-    const preciseCalls = [];
-    const preciseAgent = isolatedAgent("precise-gpt6", preciseClient, {
-      config: { strictDataDemand: true, codexModel: "gpt-6-astra", codexReasoningEffort: "xhigh" },
-      queryXbb: async (args) => {
-        preciseCalls.push(args);
+    const autonomousClient = new FakeAppServerClient();
+    const autonomousCalls = [];
+    const autonomousAgent = isolatedAgent("autonomous-gpt6", autonomousClient, {
+      config: { modelDrivenQueries: true, codexModel: "gpt-6-astra", codexReasoningEffort: "xhigh" },
+      queryXbb: async (args, trustedAccess) => {
+        assert.equal(trustedAccess, access);
+        autonomousCalls.push(args);
+        if (args.company === "合成歧义公司") return { ...readyPerformancePack(), status: "needs_disambiguation",
+          scope: { month: args.months[0], domains: args.domains }, facts: {}, entityResolution: { candidates: [] } };
         return { ...readyPerformancePack(), scope: { month: args.months[0], domains: args.domains },
-          facts: { opportunities: { summary: { createdCount: 2, expectedAmount: 999, followCount: 7 }, opportunities: [{ name: "unasked-secret-sentinel" }] } } };
+          facts: { opportunities: { summary: { createdCount: 2, wins: 1, expectedAmount: 999, followCount: 7 },
+            stages: [{ stage: "赢单", count: 1 }], opportunities: [{ name: "synthetic-current-fact" }] } } };
       }
     });
-    await preciseAgent.start();
-    const precisePrincipal = principalKeyFromUserId("precise-synthetic", access);
-    const preciseAnswer = preciseAgent.answer({ question: "2026年9月集团创建多少商机", access, principalKey: precisePrincipal, messageId: "precise-1" });
-    await waitUntil(() => preciseClient.startTurnCalls.length === 1, "精确查询应先启动模型规划");
-    assert.equal(preciseCalls.length, 0, "生产禁止粗数据域预取");
-    assert.equal(preciseClient.startTurnCalls[0].params.model, "gpt-6-astra");
-    assert.equal(preciseClient.startTurnCalls[0].params.effort, "xhigh");
-    const preciseCall = async (id, arguments_) => {
-      preciseClient.emit("serverRequest", { id, method: "item/tool/call", params: { threadId: "thread-1", turnId: "turn-1", tool: "query_xbb", arguments: arguments_ } });
-      await waitUntil(() => preciseClient.responses.some((response) => response.id === id), "查询响应未完成");
-      return preciseClient.responses.find((response) => response.id === id).result;
+    await autonomousAgent.start();
+    const autonomousPrincipal = principalKeyFromUserId("autonomous-synthetic", access);
+    const turn = async (question) => {
+      const count = autonomousClient.startTurnCalls.length;
+      const answer = autonomousAgent.answer({ question, access, principalKey: autonomousPrincipal });
+      await waitUntil(() => autonomousClient.startTurnCalls.length > count, "自主经营查询未启动");
+      const call = autonomousClient.startTurnCalls.at(-1);
+      assert.equal(call.params.model, "gpt-6-astra");
+      assert.equal(call.params.effort, "xhigh");
+      return { answer, call };
     };
-    const extra = await preciseCall(1001, { months: ["2026-09"], domains: ["opportunities"], metrics: ["opportunities.quality"] });
-    assert.equal(extra.success, false);
-    assert.equal(preciseCalls.length, 0, "拒绝读取未问的跟进质量数据");
-    const exact = await preciseCall(1002, { months: ["2026-09"], domains: ["opportunities"], metrics: ["opportunities.count"] });
-    assert.equal(exact.success, true);
-    assert.equal(preciseCalls.length, 1);
-    assert.doesNotMatch(JSON.stringify(exact), /unasked-secret-sentinel|expectedAmount|followCount/);
-    preciseClient.complete("thread-1", "turn-1", JSON.stringify({ answer: "合成验证数据：创建商机 2 个。", chart: null }));
-    await preciseAnswer;
-    const preciseFollowup = preciseAgent.answer({ question: "图表呈现出来", access, principalKey: precisePrincipal, messageId: "precise-2" });
-    await waitUntil(() => preciseClient.startTurnCalls.length === 2, "追问应继续原问题");
-    assert.equal(preciseClient.startTurnCalls[1].params.threadId, "thread-2", "只继承意图，不携带旧业务事实");
-    assert.match(preciseClient.startTurnCalls[1].params.input[0].text, /创建多少商机/);
-    assert.doesNotMatch(preciseClient.startTurnCalls[1].params.input[0].text, /unasked-secret-sentinel|createdCount/);
-    preciseClient.complete("thread-2", "turn-2", JSON.stringify({ answer: "仅有一个数量指标，不适合比较图。", chart: null }));
-    await preciseFollowup;
-    await preciseAgent.close();
-
-    const intentClient = new FakeAppServerClient();
-    const intentAgent = isolatedAgent("multidimensional-intent", intentClient, {
-      config: { strictDataDemand: true, codexModel: "gpt-6-astra", codexReasoningEffort: "xhigh" },
-      queryXbb: async () => readyPerformancePack()
-    });
-    await intentAgent.start();
-    const intentPrincipal = principalKeyFromUserId("intent-synthetic", access);
-    const intentTurn = async (question, check) => {
-      const count = intentClient.startTurnCalls.length;
-      const pending = intentAgent.answer({ question, access, principalKey: intentPrincipal });
-      await waitUntil(() => intentClient.startTurnCalls.length > count, "经营追问未启动");
-      const call = intentClient.startTurnCalls.at(-1);
-      check(intentAgent.sessions.get(intentPrincipal).active, call.params.input[0].text);
-      intentClient.complete(call.params.threadId, call.id, JSON.stringify({ answer: "仅验证意图续接的合成轮次。", chart: null }));
-      await pending;
+    let requestId = 1000;
+    const query = async (call, args) => {
+      const id = ++requestId;
+      await autonomousAgent._handleServerRequest({ id, method: "item/tool/call", params: {
+        threadId: call.params.threadId, turnId: call.id, tool: "query_xbb", arguments: args
+      } });
+      const response = autonomousClient.responses.find(item => item.id === id);
+      assert.equal(response.result.success, true, JSON.stringify(response));
+      return JSON.parse(response.result.contentItems[0].text);
     };
-    await intentTurn("2026年8月集团业绩怎么样？", (active) => assert.deepEqual(active.demandPlan.months, ["2026-08"]));
-    await intentTurn("趋势是什么？", (active, text) => {
-      assert.deepEqual(active.demandPlan.months, ["2026-08"]);
-      assert.match(text, /2026年8月集团业绩/);
-    });
-    await intentTurn("其次哪个分公司业绩好？", (active, text) => {
-      assert.deepEqual(active.demandPlan.domains, ["performance"]);
-      assert.match(text, /趋势是什么/);
-      assert.match(text, /2026年8月集团业绩/);
-    });
-    await intentTurn("另外开了多少课？", (active) => assert.deepEqual([...active.demandPlan.domains].sort(), ["courses", "performance"], "新增业务维度保留此前业绩维度"));
-    await intentTurn("只看今天集团业绩多少", (active) => {
-      assert.deepEqual(active.demandPlan.domains, ["performance"]);
-      assert.match(active.demandPlan.date, /^\d{4}-\d{2}-\d{2}$/);
-      assert.deepEqual(active.demandPlan.months, [active.demandPlan.date.slice(0, 7)]);
-    });
-    await intentTurn("改为2026年8月", (active) => {
-      assert.equal(active.demandPlan.date, undefined, "从今日改为整月必须清除旧单日范围");
-      assert.deepEqual(active.demandPlan.months, ["2026-08"]);
-    });
-    await intentAgent.close();
+    const finish = async ({ answer, call }) => {
+      autonomousClient.complete(call.params.threadId, call.id, JSON.stringify({ answer: "合成验证结果，非真实经营数据。", chart: null }));
+      await answer;
+    };
+    const conversion = await turn("本月集团的商机转化情况如何？");
+    assert.equal(autonomousCalls.length, 0, "由模型先规划，不强制预取");
+    const fullFacts = await query(conversion.call, { months: ["2026-09"], domains: ["opportunities"] });
+    assert.equal(fullFacts.facts.opportunities.summary.createdCount, 2);
+    assert.equal(fullFacts.facts.opportunities.summary.wins, 1);
+    assert.equal(fullFacts.facts.opportunities.stages.length, 1);
+    const ambiguous = await query(conversion.call, { months: ["2026-09"], domains: ["opportunities"], company: "合成歧义公司" });
+    assert.equal(ambiguous.status, "needs_disambiguation");
+    const evidenceActive = autonomousAgent.sessions.get(autonomousPrincipal).active;
+    assert.equal(evidenceActive.lastReadyFactGeneration, evidenceActive.factGeneration, "下钻消歧不能抹除同题已核验的集团事实");
+    // Comparisons, extra domains and drill-downs are model decisions. There is
+    // no keyword veto or four-call ceiling, and per-response bounds remain.
+    const plans = [
+      { months: ["2026-08"], domains: ["opportunities"] },
+      { months: ["2026-07"], domains: ["opportunities"], company: "合成甲公司" },
+      { months: ["2026-06"], domains: ["performance"] },
+      { months: ["2026-05"], domains: ["all"] },
+      { months: ["2026-04"], domains: ["opportunities"], metrics: ["opportunities.count"] }
+    ];
+    const currentActive = autonomousAgent.sessions.get(autonomousPrincipal).active;
+    currentActive.factBytesSent = 128 * 1024;
+    for (const plan of plans) await query(conversion.call, plan);
+    assert.equal(autonomousCalls.length, 7);
+    await query(conversion.call, { months: ["2026-09"], domains: ["opportunities"] });
+    assert.equal(autonomousCalls.length, 8, "补充比较后仍可重新核验原期间");
+    assert.equal(currentActive.lastReadyFactGeneration, currentActive.factGeneration);
+    const invalidChartId = ++requestId;
+    await autonomousAgent._validateChartRequest({ id: invalidChartId, params: {
+      threadId: conversion.call.params.threadId, turnId: conversion.call.id, arguments: {}
+    } });
+    const invalidChartResponse = autonomousClient.responses.find(item => item.id === invalidChartId);
+    assert.equal(invalidChartResponse.error, undefined, "多次补查不能使当前经营图失去取数资格");
+    assert.equal(invalidChartResponse.result.success, false, "格式错误的图仍须被校验拒绝");
+    await finish(conversion);
+    const previousMonth = await turn("上个月呢");
+    assert.notEqual(previousMonth.call.params.threadId, conversion.call.params.threadId);
+    assert.match(previousMonth.call.params.input[0].text, /本月集团的商机转化/);
+    assert.doesNotMatch(previousMonth.call.params.input[0].text, /synthetic-current-fact|createdCount/);
+    await query(previousMonth.call, { months: ["2026-08"], domains: ["opportunities"] });
+    await finish(previousMonth);
+    const missingData = await turn("是没有这个数据吗？");
+    assert.match(missingData.call.params.input[0].text, /本月集团的商机转化/);
+    assert.match(missingData.call.params.input[0].text, /上个月呢/);
+    await query(missingData.call, { months: ["2026-08"], domains: ["opportunities"], forceRefresh: true });
+    await finish(missingData);
+    const ranking = await turn("对集团各个公司当月成交的门票及商业操盘数量进行排名，汇总公司开源产品成交情况");
+    await query(ranking.call, { months: ["2026-09"], domains: ["product-sales"] });
+    assert.equal(autonomousCalls.at(-1).company, undefined);
+    await finish(ranking);
+    const parserMiss = await turn("本周业绩情况如何？");
+    assert.match(parserMiss.call.params.input[0].text, /本周业绩/);
+    await finish(parserMiss);
+    await autonomousAgent.close();
 
     process.stdout.write(`${JSON.stringify({ success: true, checks: 235, runtime: "persistent-steerable-general-codex-with-xbb-skill" })}\n`);
   } finally {

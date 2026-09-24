@@ -114,7 +114,7 @@ function loadConfig(options = {}) {
     codexReasoningEffort: validateReasoningEffort(envValue(env, "XBB_CODEX_REASONING_EFFORT", stored.codexReasoningEffort || "xhigh")),
     codexContextWindow: parseInteger(envValue(env, "XBB_CODEX_CONTEXT_WINDOW", stored.codexContextWindow ?? 872000), "Codex 上下文窗口", 32768, 872000),
     codexAutoCompactTokenLimit: parseInteger(envValue(env, "XBB_CODEX_AUTO_COMPACT_TOKEN_LIMIT", stored.codexAutoCompactTokenLimit ?? 750000), "Codex 自动压缩阈值", 16384, 784800),
-    strictDataDemand: true,
+    modelDrivenQueries: true,
     agentTurnTimeoutMs: parseInteger(envValue(env, "XBB_AGENT_TURN_TIMEOUT_MS", stored.agentTurnTimeoutMs || 300000), "Codex Agent 单轮超时", 30000, 1800000),
     generalTurnTimeoutMs: parseInteger(envValue(env, "XBB_GENERAL_TURN_TIMEOUT_MS", stored.generalTurnTimeoutMs || 900000), "Codex 通用问答单轮超时", 60000, 3600000),
     agentStatePath: requireOutsideProject(envValue(env, "XBB_AGENT_STATE_PATH", stored.agentStatePath || path.join(localRoot, "agent-state.json")), "Codex Agent 状态文件"),

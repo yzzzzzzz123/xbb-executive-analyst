@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <meta name="color-scheme" content="light">
+  <title>销帮帮 · 经营分析助手</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <section id="login-screen" class="login-screen" aria-label="受邀体验登录">
+    <div class="login-story">
+      <a class="brand brand-light" href="/" aria-label="销帮帮经营分析助手首页"><span class="brand-mark">析</span><span>销帮帮<span class="brand-sub">经营分析助手</span></span></a>
+      <div class="story-copy"><span class="eyebrow">让数据，回应每一个经营问题</span><h1>从一个问题，<br>看清业务全貌。</h1><p>问业绩、看趋势、找差异。<br>用一场对话，获得有依据的经营洞察。</p></div>
+      <div class="story-visual" aria-hidden="true"><div class="visual-grid"></div><div class="visual-bar b1"></div><div class="visual-bar b2"></div><div class="visual-bar b3"></div><div class="visual-bar b4"></div><div class="visual-bar b5"></div><div class="visual-bar b6"></div><span class="visual-caption">从数据，到理解。</span></div>
+      <span class="story-footer">XBB BUSINESS INTELLIGENCE</span>
+    </div>
+    <main class="login-panel">
+      <div class="login-card"><span class="pill">受邀体验</span><h2>欢迎来聊聊你的业务</h2><p class="login-description">输入邀请人提供的访问码，开始经营分析。</p>
+        <form id="login-form"><label for="access-code">访问码</label><input id="access-code" name="code" type="password" placeholder="请输入访问码" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="256" required aria-describedby="login-error"><p id="login-error" class="error-text" role="alert"></p><button id="login-submit" class="primary-button" type="submit">进入体验 <span aria-hidden="true">↗</span></button></form>
+        <div class="access-note"><span class="small-dot"></span><p>获邀客户可查看集团全部公司的只读数据。<br>访问码请仅在受邀范围内使用。</p></div>
+      </div><div class="login-footer">真实业务数据 · 只读分析 · 独立对话</div>
+    </main>
+  </section>
+
+  <div id="workspace" class="workspace" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="/"><span class="brand-mark">析</span><span>销帮帮<span class="brand-sub">经营分析助手</span></span></a>
+      <div class="sidebar-section"><span class="sidebar-label">你的分析空间</span><div class="nav-item"><span aria-hidden="true">◌</span> 经营问答 <span class="nav-dot"></span></div></div>
+      <div class="sidebar-guide"><span class="guide-title">一个好问题，从范围开始</span><p>带上时间、公司或指标，<br>让分析更贴近你的关注点。</p><span class="guide-example">例如：上个月哪家公司的<br>业绩增长最快？</span></div>
+      <div class="sidebar-bottom"><div class="scope-box"><span class="scope-icon" aria-hidden="true">✓</span><span>集团全部公司<small>已授权 · 只读访问</small></span></div><button id="logout" type="button" class="quiet-button">退出体验 <span aria-hidden="true">↗</span></button></div>
+    </aside>
+    <main class="chat-main">
+      <header class="chat-header"><div><span class="header-title">经营问答</span><span class="header-tag">客户体验版</span></div><div class="connection"><span id="connection-dot" class="small-dot"></span><span id="connection-text">正在连接</span></div></header>
+      <div id="notice" class="notice" role="status" hidden></div>
+      <div id="chat-scroll" class="chat-scroll">
+        <section id="welcome" class="welcome">
+          <span class="welcome-mark" aria-hidden="true">✳</span><span class="eyebrow">你的经营分析伙伴</span><h1>把经营问题，问清楚。</h1><p class="welcome-description">告诉我你想了解什么。<br class="mobile-break">我会结合真实数据，给出文字分析与经营图。</p>
+          <div class="suggestions" aria-label="提问示例">
+            <button type="button" data-question="本月集团各公司的业绩表现如何？"><span class="suggestion-top"><span class="suggestion-icon" aria-hidden="true">▥</span> 业绩对比 <span class="arrow" aria-hidden="true">↗</span></span><span>本月各公司的<br>业绩表现如何？</span></button>
+            <button type="button" data-question="最近三个月集团的业绩趋势如何？"><span class="suggestion-top"><span class="suggestion-icon" aria-hidden="true">↗</span> 趋势洞察 <span class="arrow" aria-hidden="true">↗</span></span><span>最近三个月的业绩<br>有什么变化？</span></button>
+            <button type="button" data-question="本月集团的商机转化情况如何？"><span class="suggestion-top"><span class="suggestion-icon" aria-hidden="true">◎</span> 商机分析 <span class="arrow" aria-hidden="true">↗</span></span><span>本月的商机<br>转化情况如何？</span></button>
+          </div>
+          <p class="welcome-tip">也可以直接输入你关心的问题，再继续追问细节。</p>
+        </section>
+        <div id="messages" class="messages" aria-label="对话内容" aria-live="polite" aria-relevant="additions"></div>
+      </div>
+      <div class="composer-area"><form id="chat-form" class="composer"><label for="question" class="sr-only">输入经营问题</label><textarea id="question" rows="2" maxlength="4000" placeholder="问问业绩、趋势，或你关心的经营问题…"></textarea><div class="composer-bottom"><span class="composer-hint">Enter 发送 <span>· Shift + Enter 换行</span></span><button id="stop" class="stop-button" type="button" hidden><span aria-hidden="true">■</span> 停止分析</button><button id="send" class="send-button" type="submit" aria-label="发送问题" disabled>↑</button></div></form><p class="composer-footer">基于授权数据分析，重要决策请结合实际业务核实。<span>临时体验 · 服务电脑在线时可用</span></p></div>
+    </main>
+  </div>
+  <dialog id="chart-dialog" aria-label="经营图大图"><div class="dialog-top"><span>经营分析图</span><button id="close-chart" class="quiet-button" type="button">关闭 ✕</button></div><img id="chart-large" alt="经营分析图大图"></dialog>
+</body>
+</html>

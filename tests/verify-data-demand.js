@@ -2,45 +2,17 @@
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
-const { inferMetrics, validateMetrics, bindQueryDemand, sourceCollections, projectFacts } = require("../shared/xbb/data-demand.js");
+const { validateMetrics, sourceCollections, projectFacts } = require("../shared/xbb/data-demand.js");
 const { buildModelFactView } = require("../shared/xbb/model-fact-view.js");
 const { validateRequest, createToolGatewayForTest } = require("../shared/xbb/tool-gateway.js");
 const { buildFactPack } = require("../shared/xbb/build-fact-pack.js");
 const { parseDate, parseMonths, planFastQuery, shanghaiDate } = require("../shared/xbb/fast-query-plan.js");
 
 async function run() {
-  const cases = [
-    ["今天业绩怎么样", ["performance"], ["performance.total", "performance.ranking"], ["performance"]],
-    ["今天业绩如何", ["performance"], ["performance.total", "performance.ranking"], ["performance"]],
-    ["本月业绩怎么样及走势", ["performance"], ["performance.total", "performance.ranking", "performance.trend"], ["performance"]],
-    ["佛山公司今天业绩怎么样", ["performance"], ["performance.total"], ["performance"]],
-    ["佛山分公司今天业绩怎么样", ["performance"], ["performance.total"], ["performance"]],
-    ["佛山分公司今天业绩多少", ["performance"], ["performance.total"], ["performance"]],
-    ["今天业绩金额怎么样", ["performance"], ["performance.total"], ["performance"]],
-    ["今天业绩数量怎么样", ["performance"], ["performance.total"], ["performance"]],
-    ["今天业绩怎么样，只要总数", ["performance"], ["performance.total"], ["performance"]],
-    ["集团本月业绩按公司排名并区分课程和咨询占比", ["performance"], ["performance.ranking", "performance.mix"], ["performance"]],
-    ["集团各公司当月门票数量排名", ["product-sales"], ["tickets.ranking"], ["oppOrder"]],
-    ["集团各公司当月商业操盘和复训数量排名", ["product-sales"], ["commercial.ranking"], ["performance", "product"]],
-    ["佛山公司这个月开了多少堂课", ["courses"], ["courses.count"], ["course"]],
-    ["佛山公司这个月开了多少堂课，参课老板多少，成交金额多少", ["courses"], ["courses.count", "courses.bosses", "courses.amount"], ["course", "booking", "courseOrders"]],
-    ["集团本月创建多少商机", ["opportunities"], ["opportunities.count"], ["opportunity"]],
-    ["集团本月赢单商机数量是多少，不要跟进", ["opportunities"], ["opportunities.wins"], ["opportunity"]],
-    ["集团本月商机跟进质量和重新激活建议", ["opportunities"], ["opportunities.quality"], ["opportunity", "follow"]]
-  ];
-  for (const [question, domains, expected, collections] of cases) {
-    const metrics = inferMetrics(question, domains);
-    assert.deepEqual(metrics, [...expected].sort());
-    assert.deepEqual([...sourceCollections(metrics)].sort(), [...collections].sort());
-  }
   assert.throws(() => validateMetrics(["tickets.ranking"], ["product-sales", "performance"]), /完全对应/);
-  const input = { months: ["2026-09"], domains: ["opportunities"], metrics: ["opportunities.quality"] };
-  assert.throws(() => bindQueryDemand(input, "2026年9月集团创建多少商机"), /超出用户所问/);
-  assert.throws(() => bindQueryDemand({ ...input, months: ["2026-08"], metrics: ["opportunities.count"] }, "2026年9月集团创建多少商机"), /月份/);
-  assert.throws(() => bindQueryDemand({ months: ["2026-09"], domains: ["performance"] }, "2026年9月佛山公司业绩"), /指定了公司/);
-  assert.deepEqual(bindQueryDemand({ months: ["2026-09"], domains: ["performance"] }, "今年公司的业绩怎么样").metrics, ["performance.ranking", "performance.total"]);
-  assert.throws(() => bindQueryDemand({ months: ["2026-09"], domains: ["opportunities"], metrics: ["opportunities.count"] }, "2026年9月集团创建多少商机\n改成8月", { months: ["2026-08"], domains: ["opportunities"] }), /月份/);
-  assert.throws(() => bindQueryDemand(input, "2026年9月集团创建多少商机并分析跟进质量\n只要创建数量"), /指标/);
+  assert.equal(validateRequest({ months: ["2026-09"], domains: ["opportunities"] }).metrics, undefined);
+  assert.deepEqual(validateRequest({ months: ["2026-09"], domains: ["all"] }).domains, ["all"]);
+  assert.deepEqual([...sourceCollections(["opportunities.count", "opportunities.wins", "opportunities.stages"])], ["opportunity"]);
   assert.deepEqual(validateRequest({ months: ["2026-09"], domains: ["product-sales"], metrics: ["tickets.ranking"] }).metrics, ["tickets.ranking"]);
   const dateNow = new Date("2026-09-13T16:00:00Z");
   const dayPlan = { months: ["2026-09"], domains: ["performance"], date: "2026-09-14" };
@@ -55,13 +27,6 @@ async function run() {
   assert.throws(() => planFastQuery("今天商机创建数量", dateNow), /仅支持业绩/);
   assert.equal(validateRequest(dayPlan, dateNow).date, dayPlan.date);
   for (const invalid of [{ ...dayPlan, date: "2026-09-15" }, { ...dayPlan, months: ["2026-08"] }, { ...dayPlan, domains: ["courses"] }]) assert.throws(() => validateRequest(invalid, dateNow), /日期|单日/);
-  assert.throws(() => bindQueryDemand({ months: ["2026-09"], domains: ["performance"] }, "今天业绩怎么样", dayPlan), /遗漏日期/);
-  assert.throws(() => bindQueryDemand({ ...dayPlan, date: "2026-09-13" }, "今天业绩怎么样", dayPlan), /日期/);
-  assert.throws(() => bindQueryDemand(dayPlan, "本月业绩怎么样", { months: ["2026-09"], domains: ["performance"] }), /日期/);
-  assert.deepEqual(bindQueryDemand(dayPlan, "今天业绩怎么样", dayPlan).metrics, ["performance.ranking", "performance.total"]);
-  assert.deepEqual(bindQueryDemand({ ...dayPlan, company: "佛山公司" }, "佛山公司今天业绩怎么样", dayPlan).metrics, ["performance.total"]);
-  assert.deepEqual(bindQueryDemand({ ...dayPlan, company: "佛山分公司", metrics: ["performance.total"] }, "佛山分公司今天业绩怎么样", dayPlan).metrics, ["performance.total"]);
-  assert.throws(() => bindQueryDemand({ ...dayPlan, company: "佛山公司", metrics: ["performance.total", "performance.ranking"] }, "佛山公司今天业绩怎么样", dayPlan), /指标/);
   const facts = { productSales: { ticketRanking: [{ company: "合成甲公司", ticketCount: 3 }], commercialRanking: [{ company: "合成乙公司", commercialCount: 7 }], companyProductMix: [], summary: {} },
     opportunities: { summary: { createdCount: 4, expectedAmount: 999, followCount: 2 }, opportunities: [{ followEvidence: [{ excerpt: "unrequested-content-sentinel" }] }] } };
   assert.deepEqual(projectFacts(facts, ["tickets.ranking"]).productSales.ticketRanking, [{ company: "合成甲公司", ticketCount: 3 }]);
@@ -196,6 +161,41 @@ async function run() {
     const counts = buildSourceBundle(await buildLiveDataset("2026-09", ["courses"], { metrics: ["courses.count"], company: "合成甲公司" }));
     assert.deepEqual(Object.keys(counts.records).sort(), ["course", "user"]);
     assert.equal(calls.some((call) => [7642173, 5614255, 7452855].includes(call.body.formId)), false);
+    // A spelling mismatch must produce real directory candidates without reading
+    // anybody's opportunities; exact matches still support verified zero activity.
+    let directory = [{ userId: 601, name: "李楷", departmentList: [{ id: 1, name: "合成甲公司" }] }];
+    calls.length = 0;
+    global.fetch = async (url, options) => {
+      const body = JSON.parse(options.body); calls.push({ path: new URL(url).pathname, body });
+      let result;
+      if (url.endsWith("/form/get")) result = { explainList: [] };
+      else if (url.endsWith("/user/list")) result = { userList: directory, totalCount: directory.length };
+      else if (url.endsWith("/opportunity/list")) result = { list: [], totalCount: 0 };
+      else throw new Error("Unexpected person lookup dependency");
+      return { ok: true, status: 200, json: async () => ({ success: true, result }) };
+    };
+    const personDemand = { metrics: ["opportunities.count"], person: "李凯" };
+    const misspelledSource = buildSourceBundle(await buildLiveDataset("2026-09", ["opportunities"], personDemand));
+    const misspelled = buildFactPack(misspelledSource, { domains: ["opportunities"], person: "李凯" });
+    assert.equal(misspelled.status, "needs_disambiguation");
+    assert.equal(misspelled.entityResolution.person.status, "not_found");
+    assert.deepEqual(misspelled.entityResolution.person.candidates.map((person) => person.name), ["李楷"]);
+    assert.deepEqual(misspelled.facts, {});
+    assert.equal(calls.some((call) => call.path.endsWith("/opportunity/list")), false);
+    directory.push({ userId: 602, name: "李楷", departmentList: [{ id: 2, name: "合成乙公司" }] });
+    const ambiguousPerson = buildFactPack(buildSourceBundle(await buildLiveDataset("2026-09", ["opportunities"], { ...personDemand, person: "李楷" })), { domains: ["opportunities"], person: "李楷" });
+    assert.equal(ambiguousPerson.entityResolution.person.status, "needs_disambiguation");
+    assert.equal(ambiguousPerson.entityResolution.person.candidates.length, 2);
+    assert.deepEqual(ambiguousPerson.facts, {});
+    assert.equal(calls.some((call) => call.path.endsWith("/opportunity/list")), false);
+    directory = directory.slice(0, 1);
+    const matchedPerson = buildFactPack(buildSourceBundle(await buildLiveDataset("2026-09", ["opportunities"], { ...personDemand, person: "李楷" })), { domains: ["opportunities"], person: "李楷" });
+    assert.equal(matchedPerson.status, "ready");
+    assert.equal(matchedPerson.scope.person.name, "李楷");
+    assert.equal(matchedPerson.facts.opportunities.summary.createdCount, 0);
+    const personCalls = calls.filter((call) => call.path.endsWith("/opportunity/list"));
+    assert.equal(personCalls.length, 1);
+    assert.equal(String(personCalls[0].body.conditions.find((condition) => condition.attr === "creatorId").value[0]), "601");
   } finally {
     global.fetch = before.fetch;
     for (const [key, value] of [["XBB_API_BASE", before.base], ["XBB_CORPID", before.corp], ["XBB_API_TOKEN", before.token]]) {
@@ -203,6 +203,6 @@ async function run() {
     }
     delete require.cache[modulePath];
   }
-  process.stdout.write(JSON.stringify({ success: true, synthetic: true, demandCases: cases.length, scopeAndProjection: true, actualExporterCallsVerified: true }) + "\n");
+  process.stdout.write(JSON.stringify({ success: true, synthetic: true, optionalProjection: true, actualExporterCallsVerified: true }) + "\n");
 }
 run().catch((error) => { process.stderr.write(`${error.stack}\n`); process.exitCode = 1; });

@@ -44,7 +44,13 @@ async function main() {
   const invocation = { signal: controller.signal };
   assert.equal((await invokeQueryTool(gateway, args, access, invocation)).status, "ready");
   await assert.rejects(invokeQueryTool(gateway, { ...args, access: { scope: "all" } }, access, invocation));
-  await assert.rejects(invokeQueryTool(gateway, { months: args.months, domains: args.domains }, access, invocation));
+  await assert.rejects(invokeQueryTool(gateway, { domains: args.domains }, access, invocation));
+  const complete = await invokeQueryTool(async (input, trustedAccess) => {
+    assert.deepEqual(input, { months: args.months, domains: ["all"] });
+    assert.equal(trustedAccess, access);
+    return { status: "ready" };
+  }, { months: args.months, domains: ["all"] }, access, invocation);
+  assert.equal(complete.status, "ready", "完整数据域查询无需固定指标投影");
   controller.abort(new Error("cancelled-query"));
   await assert.rejects(invokeQueryTool(gateway, args, access, invocation), /cancelled-query/);
   assert.equal(queries, 1);

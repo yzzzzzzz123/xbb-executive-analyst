@@ -21,7 +21,7 @@ const {
 } = require("../xbb/tool-gateway.js");
 const { RUNNER_ISOLATION_ERROR_CODE } = require("../xbb/runner-isolation.js");
 const { MAX_MODEL_FACT_VIEW_BYTES, buildModelFactView } = require("../xbb/model-fact-view.js");
-const { QUERY_XBB_DYNAMIC_TOOL, queryToolContractHash, bindQueryDemand } = require("../xbb/query-tool.js");
+const { QUERY_XBB_DYNAMIC_TOOL, queryToolContractHash } = require("../xbb/query-tool.js");
 const { chooseTurnEffort, hasExplicitPeriod, parseDate, planFastQuery, validateRequestedMonths } = require("../xbb/fast-query-plan.js");
 const { formatContextAnalysisProgress, formatGeneralAnalysisProgress, formatQueryProgress } = require("../xbb/query-progress.js");
 const { AppServerClient } = require("./app-server-client.js");
@@ -52,7 +52,6 @@ const { extractAnswerPreview } = require("./answer-preview.js");
 const MAX_SESSION_ESTIMATED_INPUT_BYTES = 256 * 1024;
 const MAX_SESSION_TURNS = 24;
 const CONTEXT_ROTATION_RATIO = 0.9;
-const MAX_TURN_FACT_BYTES = 128 * 1024;
 const MAX_STEER_COUNT = 8;
 const MAX_STEER_INPUT_BYTES = 64 * 1024;
 const MAX_AGENT_MESSAGE_ITEMS = 32;
@@ -248,6 +247,16 @@ function inheritedCorrectionPlan(question, activePlan) {
   if (requestedDate) corrected.date = requestedDate;
   else if (hasPeriodCorrection) delete corrected.date;
   return Object.freeze(corrected);
+}
+
+function queryPlanHint(question, modelDriven) {
+  try { return planFastQuery(question); }
+  catch (error) {
+    // An incomplete language parser must not veto an authorized model query.
+    // The runner still validates actual dates, source coverage and access.
+    if (!modelDriven) throw error;
+    return null;
+  }
 }
 
 function createSession(principalKey, stored = {}) {
@@ -468,7 +477,7 @@ class PersistentCodexAgent extends EventEmitter {
   }
 
   _queryWithTool(args, access, options) {
-    return invokeQueryTool(this.queryXbb, args, access, options, { strictDataDemand: this.config.strictDataDemand === true });
+    return invokeQueryTool(this.queryXbb, args, access, options);
   }
 
   _assertOperational() {
@@ -825,11 +834,11 @@ class PersistentCodexAgent extends EventEmitter {
     try {
       const hasFastPlanOverride = Object.hasOwn(request, "fastPlanOverride");
       const semanticPlan = businessMode && !warmup
-        ? (hasFastPlanOverride ? fastPlanOverride : planFastQuery(question))
+        ? (hasFastPlanOverride ? fastPlanOverride : queryPlanHint(question, this.config.modelDrivenQueries))
         : null;
-      // Strict production queries let the model resolve named entities before
-      // any business records are read. The gateway still enforces the demand.
-      const fastPlan = requiresDynamicEntityQuery || this.config.strictDataDemand ? null : semanticPlan;
+      // Production lets the model plan queries; deterministic parsing only
+      // selects relevant rules. Authorization remains enforced by the gateway.
+      const fastPlan = requiresDynamicEntityQuery || this.config.modelDrivenQueries ? null : semanticPlan;
       const retrieved = await invokeLocal(this.ruleContextChain, { question, businessMode, options: {
         domains: semanticPlan?.domains || [],
         periodCount: semanticPlan?.months?.length || 1
@@ -841,13 +850,6 @@ class PersistentCodexAgent extends EventEmitter {
       const continuation = !warmup && (Boolean(preStartContext) || isTaskContinuation(question, session.taskContext, route.mode, route.reason));
       const priorTaskContext = preStartContext || (continuation ? session.taskContext : null);
       active.taskContext = warmup ? null : updateTaskContext(priorTaskContext, question, { mode: route.mode, continuation });
-      active.demandPlan = semanticPlan;
-      if (businessMode && this.config.strictDataDemand && active.taskContext) {
-        active.demandPlan = planFastQuery(active.taskContext.goal);
-        for (const correction of [...(active.taskContext.corrections || []), question]) {
-          active.demandPlan = inheritedCorrectionPlan(correction, active.demandPlan);
-        }
-      }
       active.taskCheckpoint = this._checkpointForContext(session, businessMode, active.taskContext, question, continuation);
       session.taskCheckpoint = active.taskCheckpoint;
       const turnEffort = warmup ? (this.config.codexModel.startsWith("gpt-6") ? "low" : "none")
@@ -1017,7 +1019,7 @@ class PersistentCodexAgent extends EventEmitter {
     if (!active.turnId) throw new AgentTurnFailureError("Codex 活动 Turn 尚未就绪，无法追加追问。", active.businessMode ? "xbb" : "general");
     // Reject an invalid/future scope before sending a steer or transferring the
     // answer owner. A rejected correction must leave the original turn intact.
-    const incomingPlan = active.businessMode ? planFastQuery(request.question) : null;
+    const incomingPlan = active.businessMode ? queryPlanHint(request.question, this.config.modelDrivenQueries) : null;
     request.waiter.lifecycle?.limitDeadline(active.deadlineAtMs);
     request.waiter.lifecycle?.throwIfStopped();
     this._markSessionStarted(request.waiter);
@@ -1060,7 +1062,6 @@ class PersistentCodexAgent extends EventEmitter {
           active.successfulFactQueryCount = 0;
         }
         active.queryPlan = incomingPlan;
-        if (active.businessMode && this.config.strictDataDemand) active.demandPlan = inheritedCorrectionPlan(request.question, active.demandPlan);
         active.question = request.question;
         active.taskContext = request.taskContext || updateTaskContext(active.taskContext, request.question, {
           mode: active.businessMode ? "xbb" : "general", continuation: true
@@ -1301,7 +1302,7 @@ class PersistentCodexAgent extends EventEmitter {
   _shouldRotateThread(session, upcomingBytes, options = {}) {
     if (!session.threadId || options.warmup) return false;
     // Carry bounded user intent, never a previous question's business facts.
-    if (this.config.strictDataDemand && options.businessMode && (session.turnCount > 0 || session.resumed)) return true;
+    if (this.config.modelDrivenQueries && options.businessMode && (session.turnCount > 0 || session.resumed)) return true;
     if (session.resumed && options.businessMode && options.hasFacts) return true;
     const usage = session.tokenUsage;
     const last = usage?.last || usage;
@@ -1413,6 +1414,7 @@ class PersistentCodexAgent extends EventEmitter {
       prefetchedFactAvailable: false,
       prefetchedFactView: null,
       latestFactView: null,
+      lastReadyFactGeneration: null,
       factGeneration: 0,
       chartAgents: null,
       validatedCharts: new Map(),
@@ -1548,15 +1550,6 @@ class PersistentCodexAgent extends EventEmitter {
       return;
     }
     const active = session.active;
-    if (this.config.strictDataDemand && active.allowTools) {
-      try {
-        const intent = [active.taskContext?.goal, ...(active.taskContext?.corrections || []), active.question].filter(Boolean).join("\n");
-        args = bindQueryDemand(args || {}, intent, active.demandPlan);
-      } catch (error) {
-        this.client.respond(request.id, { success: false, contentItems: [{ type: "inputText", text: JSON.stringify({ status: "error", message: error.message }) }] });
-        return;
-      }
-    }
     if (!active.allowTools) {
       const message = active.businessMode ? "后台预热不允许查询业务数据。" : "本轮不是销帮帮经营问题，不能调用 query_xbb。";
       this.client.respond(request.id, { success: false, contentItems: [{ type: "inputText", text: JSON.stringify({ status: "error", message }) }] });
@@ -1567,10 +1560,6 @@ class PersistentCodexAgent extends EventEmitter {
       return;
     }
     active.toolCalls += 1;
-    if (active.toolCalls > 4) {
-      this.client.respond(request.id, { success: false, contentItems: [{ type: "inputText", text: JSON.stringify({ status: "error", message: "工具调用轮次超过安全上限。" }) }] });
-      return;
-    }
     const toolQueryFingerprint = queryFingerprint(args);
     if (toolQueryFingerprint && active.supersededFactFingerprints.has(toolQueryFingerprint)) {
       this.client.respond(request.id, {
@@ -1587,10 +1576,15 @@ class PersistentCodexAgent extends EventEmitter {
     }
     const priorFallbackFingerprint = active.fallbackFactFingerprint;
     if (active.latestFactView && (!toolQueryFingerprint || toolQueryFingerprint !== priorFallbackFingerprint)) {
+      const hasCurrentFacts = active.latestFactView.status === "ready"
+        || active.lastReadyFactGeneration === active.factGeneration;
       void active.chartAgents?.stop();
-      if (priorFallbackFingerprint) active.supersededFactFingerprints.add(priorFallbackFingerprint);
       if (toolQueryFingerprint) active.supersededFactFingerprints.delete(toolQueryFingerprint);
       active.factGeneration += 1;
+      // Supplementary lookups do not erase already verified facts for the
+      // same user intent, including when a drill-down needs disambiguation.
+      // A user scope correction still invalidates them in _steerActiveTurn.
+      if (hasCurrentFacts) active.lastReadyFactGeneration = active.factGeneration;
       active.fallbackBlockedUntilFreshScope = true;
       active.requiredFallbackQueryFingerprint = toolQueryFingerprint;
       active.prefetchedQueryFingerprint = null;
@@ -1675,10 +1669,11 @@ class PersistentCodexAgent extends EventEmitter {
         this._emit("activity", { status: "tool_completed", elapsedMs: Date.now() - active.toolStartedAtMs });
         return;
       }
-      const remainingBytes = MAX_TURN_FACT_BYTES - active.factBytesSent;
-      if (remainingBytes < 16 * 1024) throw new Error("本轮事实预算已被当前查询占用；请使用已返回的完整汇总继续回答。");
-      const view = buildModelFactView(result, { maxBytes: Math.min(MAX_MODEL_FACT_VIEW_BYTES, remainingBytes), metrics: args.metrics });
+      // Bound each response for reliable transport, without spending a small
+      // cumulative quota that prevents later comparisons or drill-downs.
+      const view = buildModelFactView(result, { maxBytes: MAX_MODEL_FACT_VIEW_BYTES, metrics: args.metrics });
       const viewText = JSON.stringify(view);
+      if (view.status === "ready") active.lastReadyFactGeneration = factGeneration;
       const fallbackScopeMatches = !active.fallbackBlockedUntilFreshScope
         || (active.requiredFallbackQueryFingerprint && toolQueryFingerprint === active.requiredFallbackQueryFingerprint);
       if (session.active === active && active.factGeneration === factGeneration && fallbackScopeMatches) {
@@ -1736,7 +1731,8 @@ class PersistentCodexAgent extends EventEmitter {
       const active = session.active;
       active.chartAgents ||= new ChartAgentTracker(this.client);
       const stage = active.chartAgents.observe(params.item, { parentThreadId: session.threadId,
-        factGeneration: active.factGeneration, revision: active.steerCount, hasFacts: active.latestFactView?.status === "ready" });
+        factGeneration: active.factGeneration, revision: active.steerCount,
+        hasFacts: active.latestFactView?.status === "ready" || active.lastReadyFactGeneration === active.factGeneration });
       if (stage === "started") {
         this._pauseTurnTimeout(active);
         this._emit("activity", { status: "chart_agent_started" });
@@ -1847,7 +1843,8 @@ class PersistentCodexAgent extends EventEmitter {
     const scope = { parentThreadId: session?.threadId, factGeneration: active?.factGeneration, revision: active?.steerCount };
     const current = () => session?.active === active && !active.abortController.signal.aborted
       && active.factGeneration === scope.factGeneration && active.steerCount === scope.revision && !active.steerInFlight;
-    if (!active?.businessMode || !active.allowTools || active.latestFactView?.status !== "ready"
+    if (!active?.businessMode || !active.allowTools
+        || (active.latestFactView?.status !== "ready" && active.lastReadyFactGeneration !== active.factGeneration)
         || (session.threadId === threadId ? active.turnId !== turnId : !await active.chartAgents.accepts(threadId, scope)) || !current()) {
       this.client.reject(request.id, "未授权或已失效的图表校验请求。");
       return;

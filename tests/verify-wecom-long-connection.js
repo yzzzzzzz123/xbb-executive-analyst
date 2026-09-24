@@ -338,7 +338,7 @@ function frame(messageId, userId, msgtype, body) {
   assert.equal(config.modelProvider, "codex-app-server");
   assert.equal(config.codexModel, "gpt-6-astra");
   assert.equal(config.codexReasoningEffort, "xhigh");
-  assert.equal(config.strictDataDemand, true);
+  assert.equal(config.modelDrivenQueries, true);
   assert.equal(config.agentTurnTimeoutMs, 300000);
   assert.equal(config.generalTurnTimeoutMs, 900000);
   assert.equal(config.wecomWsUrl, "wss://openws.work.weixin.qq.com/");
